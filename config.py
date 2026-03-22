@@ -131,6 +131,7 @@ DISCOVERY_BETA_MAX = 2.5               # Maximum beta (relaxed for momentum play
 DISCOVERY_CORRELATION_THRESHOLD = 0.70 # Max correlation with existing holdings
 DISCOVERY_SECTOR_CONCENTRATION_MAX = 0.40  # Max sector weight before penalty (relaxed)
 DISCOVERY_USE_GLOBAL_UNIVERSE = True   # Enable yfinance-based global screening
+DISCOVERY_TIER2_DAYS = [0, 3]          # Days to screen mid-caps (0=Mon, 3=Thu)
 
 # Momentum screening (90-day cycle optimisation)
 DISCOVERY_MODE = "momentum_90d"        # "balanced" or "momentum_90d"

@@ -207,8 +207,13 @@ def _stage_universe_assembly(
             progress_callback("Loading global universe...", len(exchanges), len(exchanges) + 1)
 
         try:
-            from utils.global_universe import get_global_universe
-            global_tickers = get_global_universe(exclude_tickers=existing_tickers)
+            from utils.global_universe import get_universe_for_rotation
+            import datetime as _dt
+            _today = _dt.datetime.now().weekday()
+            global_tickers = get_universe_for_rotation(
+                day_of_week=_today,
+                exclude_tickers=existing_tickers,
+            )
 
             for ticker in global_tickers:
                 if ticker in seen_symbols:
