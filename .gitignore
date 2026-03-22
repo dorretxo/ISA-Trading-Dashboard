@@ -1,0 +1,45 @@
+# Secrets
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.db
+
+# Node
+node_modules/
+
+# Personal data — never commit real holdings or state
+portfolio.json
+forecast_store.json
+forecast_store.json.bak
+orchestrator_state.json
+orchestrator_log.jsonl
+orchestrator_output.log
+
+# Generated documents
+ISA_Dashboard_Architecture*.docx
+ISA_Dashboard_Architecture*.pdf
+ISAportfolioscreener.txt
+
+# Build / generation scripts (not needed in repo)
+generate_arch_doc.py
+generate_arch_v*.js
+fix_forecast_store.py
+
+# Node lockfile (regenerated from package.json)
+package-lock.json
+
+# Local workspace config
+.claude/settings.local.json
+.claude/launch.json
+
+# Stray pip artifacts
+=5.18.0
+
+# IDE / OS
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+Desktop.ini

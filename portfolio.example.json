@@ -1,0 +1,28 @@
+{
+    "currency": "GBP",
+    "account_type": "ISA",
+    "platform": "Your Broker",
+    "holdings": [
+        {
+            "ticker": "AAPL",
+            "name": "Apple Inc",
+            "avg_buy_price": 150.00,
+            "quantity": 50,
+            "currency": "USD"
+        },
+        {
+            "ticker": "SHEL.L",
+            "name": "Shell PLC",
+            "avg_buy_price": 2500.00,
+            "quantity": 200,
+            "currency": "GBX"
+        },
+        {
+            "ticker": "SAP.DE",
+            "name": "SAP SE",
+            "avg_buy_price": 120.00,
+            "quantity": 30,
+            "currency": "EUR"
+        }
+    ]
+}
