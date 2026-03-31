@@ -56,11 +56,11 @@ At a high level:
 
 Important entry points:
 
-- [`app.py`](/D:/David/OneDrive/Claude/Trading/app.py): Streamlit dashboard
-- [`daily_orchestrator.py`](/D:/David/OneDrive/Claude/Trading/daily_orchestrator.py): scheduled/background runner
-- [`config.py`](/D:/David/OneDrive/Claude/Trading/config.py): central configuration
-- [`engine/`](/D:/David/OneDrive/Claude/Trading/engine): scoring, forecasting, optimizer, discovery, exits, evaluation
-- [`utils/`](/D:/David/OneDrive/Claude/Trading/utils): cache/state/data/email helpers
+- [`app.py`](app.py): Streamlit dashboard
+- [`daily_orchestrator.py`](daily_orchestrator.py): scheduled/background runner
+- [`config.py`](config.py): central configuration
+- [`engine/`](engine/): scoring, forecasting, optimizer, discovery, exits, evaluation
+- [`utils/`](utils/): cache/state/data/email helpers
 
 ## Project Layout
 

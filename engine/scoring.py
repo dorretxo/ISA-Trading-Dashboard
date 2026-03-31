@@ -5,6 +5,7 @@ from engine import technical, fundamental, sentiment, stops
 from engine.forecasting import forecast_dual_horizon
 from engine.regime import get_regime_adjusted_weights
 from utils.data_fetch import get_current_price, get_daily_change
+from utils.safe_numeric import safe_float
 
 
 def analyse_holding(holding: dict) -> dict:
@@ -17,13 +18,15 @@ def analyse_holding(holding: dict) -> dict:
     fund = fundamental.analyse(ticker)
     sent = sentiment.analyse(ticker, company_name=name)
 
-    # Get price data
-    current_price = tech.get("current_price") or get_current_price(ticker)
-    daily_change = get_daily_change(ticker)
+    # Get price data — sanitise to prevent NaN propagation
+    current_price = safe_float(tech.get("current_price")) or safe_float(get_current_price(ticker))
+    daily_change = safe_float(get_daily_change(ticker))
 
-    # Calculate stop-loss and take-profit (pass SMA-200 for support level)
+    # Calculate stop-loss (support confluence model) and take-profit
     stop = stops.calculate_stop_loss(ticker, tech.get("atr"), current_price,
-                                     sma_200=tech.get("sma_200"))
+                                     sma_200=tech.get("sma_200"),
+                                     sma_50=tech.get("sma_50"),
+                                     bb_lower=tech.get("bb_lower"))
     target = stops.calculate_take_profit(ticker, current_price, stop["stop_loss"])
 
     # Run dual-horizon MoE price forecast and convert to -1..+1 scores
@@ -71,16 +74,17 @@ def analyse_holding(holding: dict) -> dict:
                 ],
             })
 
-        # Blended forecast score: 30% short-horizon + 70% long-horizon
+        # Blended forecast score: 15% short-horizon + 85% long-horizon
         # The long horizon (63 trading days ≈ 90 calendar days) aligns with
-        # the 90-day holding cycle — it should dominate the signal.
+        # the 90-day holding cycle and should dominate. The 5-day forecast
+        # is noise for a 3-month thesis — kept at 15% for near-term confirmation.
         score_short = max(-1.0, min(1.0, fc_short.pct_change / config.FORECAST_SCORE_SCALE))
         score_long_scale = getattr(config, "FORECAST_SCORE_SCALE_LONG", 15.0)
         score_long = (
             max(-1.0, min(1.0, fc_long.pct_change / score_long_scale))
             if fc_long is not None else score_short
         )
-        forecast_score = 0.30 * score_short + 0.70 * score_long
+        forecast_score = 0.15 * score_short + 0.85 * score_long
 
         # Unified 90-day expected return (used by optimizer and discovery)
         # Primary: long-horizon MoE forecast (already ≈90 calendar days)
@@ -107,8 +111,10 @@ def analyse_holding(holding: dict) -> dict:
                 forecast_reasons.append(f"90d outlook {fc_long.pct_change:.1f}%")
             else:
                 forecast_reasons.append(f"90d outlook {fc_long.pct_change:+.1f}%")
-    except Exception:
-        forecast_data = {"forecast_price": None, "expected_return_90d": 0.0}
+    except Exception as e:
+        import logging as _log
+        _log.getLogger(__name__).warning("Forecast failed for %s: %s", ticker, e)
+        forecast_data = {"forecast_price": None, "expected_return_90d": 0.0, "forecast_unavailable": True}
 
     # Get weights: prefer adaptive (backtest-driven) → regime-adjusted → config defaults
     adjusted_weights = None
@@ -140,6 +146,24 @@ def analyse_holding(holding: dict) -> dict:
     except Exception:
         pass
 
+    # Asymmetric / binary outcome flag (metadata only — no score impact)
+    # Detects stocks where risk profile is binary (big move in either direction),
+    # e.g. geopolitical trades priced above consensus with extreme technicals.
+    asymmetric_risk_flag = False
+    asymmetric_risk_reason = None
+
+    _analyst_upside = fund.get("analyst_upside")
+    _rsi = tech.get("rsi")
+    _is_parabolic = risk_overlay.is_parabolic if risk_overlay else False
+    _short_pct = fund.get("short_pct")
+
+    if _analyst_upside is not None and _analyst_upside < -15 and _rsi is not None and _rsi > 70:
+        asymmetric_risk_flag = True
+        asymmetric_risk_reason = f"Trading {abs(_analyst_upside):.0f}% above consensus at RSI {_rsi:.0f}"
+    elif _is_parabolic and _short_pct is not None and _short_pct > 0.10:
+        asymmetric_risk_flag = True
+        asymmetric_risk_reason = f"Parabolic move with {_short_pct:.0%} short interest"
+
     # Determine action
     if aggregate_score >= config.SCORE_STRONG_BUY_THRESHOLD:
         action = "STRONG BUY"
@@ -166,9 +190,18 @@ def analyse_holding(holding: dict) -> dict:
         "quantity": holding["quantity"],
         "currency": holding.get("currency", "GBP"),
         "action": action,
+        "base_action": action,
+        "final_action": action,
         "aggregate_score": round(aggregate_score, 3),
         "stop_loss": stop["stop_loss"],
+        "structural_stop_loss": stop["stop_loss"],
         "stop_method": stop["method"],
+        "structural_stop_method": stop["method"],
+        "stop_distance_pct": stop.get("stop_distance_pct"),
+        "support_levels": stop.get("support_levels", {}),
+        "regime_info": stop.get("regime", {}),
+        "trailing_exit_stop": None,
+        "trailing_exit_method": None,
         "take_profit": target["take_profit"],
         "target_method": target["method"],
         "why": why,
@@ -176,6 +209,9 @@ def analyse_holding(holding: dict) -> dict:
         "technical_score": round(tech["score"], 3),
         "fundamental_score": round(fund["score"], 3),
         "sentiment_score": round(sent["score"], 3),
+        "sentiment_confidence": sent.get("sentiment_confidence", 1.0),
+        "article_count": sent.get("article_count", 0),
+        "active_sources": sent.get("active_sources", 0),
         "forecast_score": round(forecast_score, 3),
         # Technical details
         "rsi": tech.get("rsi"),
@@ -237,6 +273,28 @@ def analyse_holding(holding: dict) -> dict:
         "cap_tier": risk_overlay.cap_tier if risk_overlay else "unknown",
         "confidence_discount": risk_overlay.confidence_discount if risk_overlay else 1.0,
         "max_weight_scale": risk_overlay.max_weight_scale if risk_overlay else 1.0,
+        # Dividend safety
+        "dividend_yield": fund.get("dividend_yield"),
+        "payout_ratio": fund.get("payout_ratio"),
+        "ex_dividend_date": fund.get("ex_dividend_date"),
+        "ex_dividend_days": fund.get("ex_dividend_days"),
+        "five_year_avg_yield": fund.get("five_year_avg_yield"),
+        # Balance sheet strength
+        "current_ratio": fund.get("current_ratio"),
+        "net_debt_ebitda": fund.get("net_debt_ebitda"),
+        "cash_to_debt": fund.get("cash_to_debt"),
+        "balance_sheet_grade": fund.get("balance_sheet_grade"),
+        # Governance red flag
+        "governance_flag": fund.get("governance_flag", False),
+        "governance_reasons": fund.get("governance_reasons", []),
+        # Asymmetric / binary outcome flag
+        "asymmetric_risk_flag": asymmetric_risk_flag,
+        "asymmetric_risk_reason": asymmetric_risk_reason,
+        # Placeholders: discovery candidates populate these; holdings get None
+        "entry_price": None,
+        "entry_method": None,
+        "sizing_method": None,
+        "kelly_cap_fraction": None,
     }
     result.update(forecast_data)
     return result

@@ -43,6 +43,7 @@ CREATE TABLE IF NOT EXISTS signal_backtest (
     -- Action & aggregate
     action              TEXT,                   -- STRONG BUY / BUY / KEEP / SELL / STRONG SELL
     aggregate_score     REAL,
+    final_rank          REAL,                   -- portfolio-aware discovery rank
 
     -- 4 pillar scores
     technical_score     REAL,
@@ -96,6 +97,15 @@ CREATE TABLE IF NOT EXISTS signal_backtest (
     tnx_level           REAL,                   -- 10Y yield at signal time
     optimal_weight      REAL,                   -- from portfolio optimizer
     pillar_weights_json TEXT,                   -- weights used (JSON: {"tech":0.3,...})
+    entry_lens          TEXT,                   -- momentum / value / quality
+    entry_price         REAL,                   -- planned limit entry
+    entry_method        TEXT,                   -- selected entry rule
+    fill_probability    REAL,                   -- estimated fill probability
+    planned_position_weight REAL,               -- planned weight from strategy layer
+    planned_risk_amount REAL,                   -- max loss at stop in base currency
+    position_sizing_method TEXT,                -- stop budget / Kelly-capped
+    kelly_cap_fraction  REAL,                   -- empirical half-Kelly cap used
+    r_r_ratio           REAL,                   -- target / stop reward-to-risk
 
     -- Context
     sector              TEXT,
@@ -181,6 +191,7 @@ CREATE TABLE IF NOT EXISTS discovery_pillar_stats AS SELECT * FROM pillar_effect
 
 
 _FEATURE_STORE_COLUMNS = [
+    ("final_rank", "REAL"),
     ("macd_signal", "REAL"), ("sma_50", "REAL"), ("sma_200", "REAL"),
     ("stoch_k", "REAL"), ("williams_r", "REAL"), ("obv_trend", "TEXT"),
     ("atr", "REAL"), ("profit_margin", "REAL"), ("fcf_yield", "REAL"),
@@ -192,6 +203,10 @@ _FEATURE_STORE_COLUMNS = [
     ("return_90d_prior", "REAL"), ("vol_20d", "REAL"),
     ("vix_percentile", "REAL"), ("tnx_level", "REAL"),
     ("optimal_weight", "REAL"), ("pillar_weights_json", "TEXT"),
+    ("entry_lens", "TEXT"), ("entry_price", "REAL"), ("entry_method", "TEXT"),
+    ("fill_probability", "REAL"), ("planned_position_weight", "REAL"),
+    ("planned_risk_amount", "REAL"), ("position_sizing_method", "TEXT"),
+    ("kelly_cap_fraction", "REAL"), ("r_r_ratio", "REAL"),
 ]
 
 
@@ -236,10 +251,12 @@ def _compute_prior_momentum(ticker: str) -> tuple[float | None, float | None, fl
         if data is None or len(data) < 20:
             return None, None, None, None
         closes = data["Close"]
+        if isinstance(closes, pd.DataFrame):
+            closes = closes.iloc[:, 0]
         ret_10d = float(closes.iloc[-1] / closes.iloc[-min(10, len(closes))] - 1) * 100 if len(closes) >= 10 else None
         ret_30d = float(closes.iloc[-1] / closes.iloc[-min(30, len(closes))] - 1) * 100 if len(closes) >= 30 else None
         ret_90d = float(closes.iloc[-1] / closes.iloc[-min(90, len(closes))] - 1) * 100 if len(closes) >= 90 else None
-        vol_20d = float(data["Close"].pct_change().tail(20).std() * np.sqrt(252) * 100) if len(closes) >= 20 else None
+        vol_20d = float(closes.pct_change().tail(20).std() * np.sqrt(252) * 100) if len(closes) >= 20 else None
         return ret_10d, ret_30d, ret_90d, vol_20d
     except Exception:
         return None, None, None, None
@@ -279,7 +296,10 @@ def record_portfolio_signals(
     try:
         tnx = yf.download("^TNX", period="5d", progress=False, auto_adjust=True)
         if tnx is not None and not tnx.empty:
-            tnx_level = float(tnx["Close"].iloc[-1])
+            _close = tnx["Close"]
+            if isinstance(_close, pd.DataFrame):
+                _close = _close.iloc[:, 0]
+            tnx_level = float(_close.iloc[-1])
     except Exception:
         pass
 
@@ -366,6 +386,17 @@ def record_discovery_picks(candidates: list) -> int:
                 tech, fund, sent, fcast = c.technical_score, c.fundamental_score, c.sentiment_score, c.forecast_score
                 mom, rank = c.momentum_score, c.final_rank
                 action, sector, exchange = c.action, c.sector, c.exchange
+                entry_lens = getattr(c, "entry_lens", "momentum")
+                entry_price = getattr(c, "entry_price", None)
+                entry_method = getattr(c, "entry_method", "")
+                fill_probability = getattr(c, "fill_probability", None)
+                planned_position_weight = getattr(c, "position_weight", None)
+                planned_risk_amount = getattr(c, "risk_amount", None)
+                position_sizing_method = getattr(c, "sizing_method", "")
+                kelly_cap_fraction = getattr(c, "kelly_cap_fraction", None)
+                rr_ratio = getattr(c, "r_r_ratio", None)
+                stop_loss = getattr(c, "stop_loss", None)
+                take_profit = getattr(c, "take_profit", None)
             else:
                 ticker = c.get("ticker", "")
                 name = c.get("name", "")
@@ -379,11 +410,27 @@ def record_discovery_picks(candidates: list) -> int:
                 action = c.get("action", "")
                 sector = c.get("sector", "")
                 exchange = c.get("exchange", "")
+                entry_lens = c.get("entry_lens", "momentum")
+                entry_price = c.get("entry_price")
+                entry_method = c.get("entry_method", "")
+                fill_probability = c.get("fill_probability")
+                planned_position_weight = c.get("position_weight")
+                planned_risk_amount = c.get("risk_amount")
+                position_sizing_method = c.get("sizing_method", "")
+                kelly_cap_fraction = c.get("kelly_cap_fraction")
+                rr_ratio = c.get("r_r_ratio")
+                stop_loss = c.get("stop_loss")
+                take_profit = c.get("take_profit")
 
-            # Get signal price
+            # Get signal price — guard against NaN (SQLite stores NaN as NULL)
             try:
-                data = yf.download(ticker, period="5d", progress=False, auto_adjust=True)
-                signal_price = float(data["Close"].iloc[-1]) if data is not None and not data.empty else 0
+                data = yf.download(ticker, period="5d", progress=False, auto_adjust=True, timeout=30)
+                if data is not None and not data.empty:
+                    import math
+                    raw = float(data["Close"].iloc[-1].item() if hasattr(data["Close"].iloc[-1], "item") else data["Close"].iloc[-1])
+                    signal_price = raw if not math.isnan(raw) else 0
+                else:
+                    signal_price = 0
             except Exception:
                 signal_price = 0
 
@@ -400,12 +447,18 @@ def record_discovery_picks(candidates: list) -> int:
             conn.execute(
                 """INSERT INTO signal_backtest
                    (run_date, ticker, name, source, signal_price,
-                    action, aggregate_score,
+                    action, aggregate_score, final_rank,
                     technical_score, fundamental_score, sentiment_score, forecast_score,
-                    momentum_score, sector, exchange)
-                   VALUES (?,?,?,?,?, ?,?, ?,?,?,?, ?,?,?)""",
+                    momentum_score, stop_loss, take_profit, sector, exchange,
+                    entry_lens, entry_price, entry_method, fill_probability,
+                    planned_position_weight, planned_risk_amount,
+                    position_sizing_method, kelly_cap_fraction, r_r_ratio)
+                   VALUES (?,?,?,?,?, ?,?,?, ?,?,?,?, ?,?,?,?,?, ?,?,?,?, ?,?,?,?,?)""",
                 (now, ticker, name, "discovery", signal_price,
-                 action, agg, tech, fund, sent, fcast, mom, sector, exchange),
+                 action, agg, rank, tech, fund, sent, fcast, mom, stop_loss, take_profit,
+                 sector, exchange, entry_lens, entry_price, entry_method, fill_probability,
+                 planned_position_weight, planned_risk_amount,
+                 position_sizing_method, kelly_cap_fraction, rr_ratio),
             )
             count += 1
 
@@ -780,6 +833,60 @@ def get_adaptive_discovery_weights() -> dict[str, float] | None:
     return get_adaptive_weights(source="discovery", horizon="90d")
 
 
+def get_kelly_fractions(source: str = "all") -> dict[str, float]:
+    """Compute half-Kelly fractions per action tier from backtest data.
+
+    Returns dict like {"STRONG BUY": 0.12, "BUY": 0.08, "KEEP": 0.05}
+    where values are half-Kelly position size caps (as fractions of portfolio).
+    Returns empty dict if insufficient data.
+    """
+    init_backtest_db()
+    try:
+        with _connect() as conn:
+            rows = conn.execute(
+                """SELECT action,
+                          COUNT(*) as n,
+                          AVG(CASE WHEN return_90d > 0 THEN 1.0 ELSE 0.0 END) as win_rate,
+                          AVG(CASE WHEN return_90d > 0 THEN return_90d ELSE NULL END) as avg_win,
+                          AVG(CASE WHEN return_90d <= 0 THEN ABS(return_90d) ELSE NULL END) as avg_loss
+                   FROM signal_backtest
+                   WHERE evaluated_90d = 1
+                     AND return_90d IS NOT NULL
+                     AND (source = ? OR ? = 'all')
+                     AND action IN ('STRONG BUY', 'BUY', 'KEEP')
+                   GROUP BY action
+                   HAVING COUNT(*) >= 20""",
+                (source, source),
+            ).fetchall()
+    except Exception as e:
+        logger.warning("Kelly fraction query failed: %s", e)
+        return {}
+
+    result = {}
+    for row in rows:
+        action = row[0]
+        win_rate = row[2]
+        avg_win = row[3]
+        avg_loss = row[4]
+
+        if avg_loss is None or avg_loss < 0.01 or avg_win is None:
+            continue
+
+        b = avg_win / avg_loss  # win/loss ratio
+        q = 1.0 - win_rate
+        kelly = (win_rate * b - q) / b  # Full Kelly
+
+        if kelly <= 0:
+            continue  # Negative Kelly = don't bet
+
+        half_kelly = kelly / 2.0
+        result[action] = min(half_kelly, 0.25)
+
+    if result:
+        logger.info("Kelly fractions (%s): %s", source, result)
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Query helpers for UI
 # ---------------------------------------------------------------------------
@@ -794,6 +901,9 @@ def get_pick_performance(limit: int = 100) -> list[dict]:
                       spy_return_90d, beat_market, action_correct,
                       forecast_error_5d, forecast_error_63d,
                       stop_hit, stop_hit_day, target_hit, target_hit_day,
+                      entry_method, entry_price, fill_probability,
+                      position_sizing_method, planned_position_weight,
+                      planned_risk_amount, r_r_ratio,
                       regime, sector
                FROM signal_backtest WHERE evaluated_90d = 1
                ORDER BY run_date DESC LIMIT ?""",
@@ -853,6 +963,48 @@ def get_stop_target_stats() -> dict:
             FROM signal_backtest WHERE evaluated_90d = 1
         """).fetchone()
     return dict(row) if row else {}
+
+
+def get_entry_plan_stats() -> list[dict]:
+    """Return evaluated entry-plan statistics by entry method."""
+    init_backtest_db()
+    with _connect() as conn:
+        rows = conn.execute("""
+            SELECT
+                COALESCE(entry_method, 'unknown') as entry_method,
+                COUNT(*) as signals,
+                AVG(CASE
+                        WHEN entry_price IS NOT NULL AND price_30d IS NOT NULL AND entry_price > 0
+                        THEN (price_30d - entry_price) / entry_price
+                    END) as avg_return_from_entry_30d,
+                AVG(CASE
+                        WHEN target_hit = 1
+                             AND (
+                                 stop_hit = 0
+                                 OR stop_hit IS NULL
+                                 OR (
+                                     target_hit_day IS NOT NULL
+                                     AND stop_hit_day IS NOT NULL
+                                     AND target_hit_day < stop_hit_day
+                                 )
+                             )
+                        THEN 1.0 ELSE 0.0
+                    END) as plan_hit_rate,
+                AVG(CASE
+                        WHEN entry_price IS NOT NULL
+                             AND stop_loss IS NOT NULL
+                             AND price_90d IS NOT NULL
+                             AND entry_price > stop_loss
+                        THEN (price_90d - entry_price) / (entry_price - stop_loss)
+                    END) as avg_realized_r_multiple
+            FROM signal_backtest
+            WHERE source = 'discovery'
+              AND evaluated_90d = 1
+              AND entry_price IS NOT NULL
+            GROUP BY COALESCE(entry_method, 'unknown')
+            ORDER BY signals DESC, entry_method
+        """).fetchall()
+    return [dict(r) for r in rows]
 
 
 def get_forecast_accuracy() -> list[dict]:

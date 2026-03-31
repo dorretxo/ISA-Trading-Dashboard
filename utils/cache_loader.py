@@ -63,6 +63,7 @@ class DashboardData:
 
     # Cached discovery (list of dicts)
     cached_discovery: list[dict] = field(default_factory=list)
+    cached_discovery_meta: dict = field(default_factory=dict)
 
     # Whether data came from cache or live
     from_cache: bool = False
@@ -146,6 +147,7 @@ def _load_from_cache(holdings: list[dict]) -> DashboardData | None:
 
     # Cached discovery
     cached_disc = state.get("cached_discovery", [])
+    cached_disc_meta = state.get("cached_discovery_meta") or {}
 
     return DashboardData(
         holdings=holdings,
@@ -160,6 +162,7 @@ def _load_from_cache(holdings: list[dict]) -> DashboardData | None:
         cached_optimizer=cached_opt,
         cached_exit_signals=exit_sigs,
         cached_discovery=cached_disc,
+        cached_discovery_meta=cached_disc_meta,
         from_cache=True,
     )
 
@@ -216,23 +219,21 @@ def _compute_live(holdings: list[dict]) -> DashboardData:
     except Exception as e:
         logger.warning("Live optimizer failed: %s", e)
 
-    # Run exit engine
+    # Run exit engine and reconcile final actions with risk overrides
     exit_sigs = None
     try:
-        from engine.exit_engine import assess_exits
+        from engine.exit_engine import assess_exits, reconcile_actions_with_exits, exit_signal_to_dict
         exits = assess_exits(results, holdings)
-        exit_sigs = [
-            {"ticker": e.ticker, "name": e.name, "signal_type": e.signal_type,
-             "severity": e.severity, "message": e.message,
-             "current_score": e.current_score, "current_price": e.current_price}
-            for e in exits
-        ]
+        reconcile_actions_with_exits(results, exits)
+        result_map = {r["ticker"]: r for r in results}
+        exit_sigs = [exit_signal_to_dict(e, result_map.get(e.ticker)) for e in exits]
     except Exception as e:
         logger.warning("Live exit engine failed: %s", e)
 
     # Load cached discovery from state
     state = _load_state()
     cached_disc = state.get("cached_discovery", []) if state else []
+    cached_disc_meta = state.get("cached_discovery_meta") or {} if state else {}
     disc_ts = state.get("last_discovery_run") if state else None
 
     # Persist to cache for next load
@@ -277,6 +278,7 @@ def _compute_live(holdings: list[dict]) -> DashboardData:
         cached_optimizer=cached_opt,
         cached_exit_signals=exit_sigs,
         cached_discovery=cached_disc,
+        cached_discovery_meta=cached_disc_meta,
         from_cache=False,
     )
 

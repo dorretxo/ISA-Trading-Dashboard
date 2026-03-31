@@ -30,13 +30,17 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 # Parabolic move thresholds — 90-day return that triggers penalty
-PARABOLIC_THRESHOLD_90D = 2.00   # +200% in 90 days
-PARABOLIC_THRESHOLD_30D = 1.00   # +100% in 30 days
+PARABOLIC_THRESHOLD_90D = 1.00   # +100% in 90 days
+PARABOLIC_THRESHOLD_30D = 0.60   # +60% in 30 days
 PARABOLIC_MAX_PENALTY = 0.40     # Maximum score reduction
 
 # Earnings proximity
 EARNINGS_NEAR_DAYS = 14          # Flag when earnings within N days
 EARNINGS_IMMINENT_DAYS = 5       # Stronger flag when very close
+POST_EARNINGS_RECENCY_DAYS = 21  # Flag stocks that reported within N days
+
+# 52-week high proximity
+HIGH_52W_PROXIMITY_PCT = 0.05    # Within 5% of 52-week high
 
 # Market cap tiers (USD)
 MCAP_MEGA = 200_000_000_000     # >$200B
@@ -70,6 +74,16 @@ class RiskOverlay:
     cap_tier: str = "unknown"          # mega / large / mid / small / micro / unknown
     confidence_discount: float = 1.0   # 1.0 = full confidence, <1.0 = reduced
     max_weight_scale: float = 1.0      # Multiplier on MAX_POSITION_WEIGHT for optimizer
+
+    # Post-earnings recency (reported within last N days)
+    post_earnings_recent: bool = False
+    post_earnings_days: int | None = None  # Days since last earnings
+    earnings_miss: bool = False            # Actual < Expected
+    earnings_miss_pct: float | None = None # (actual - expected) / |expected| as %
+
+    # 52-week high proximity
+    near_52w_high: bool = False
+    pct_from_52w_high: float | None = None  # e.g. 0.03 = 3% below high
 
 
 # ---------------------------------------------------------------------------
@@ -125,9 +139,12 @@ def _compute_parabolic_penalty(ticker: str, df=None) -> tuple[float, float | Non
         try:
             info = get_ticker_info(ticker)
             if info:
-                target = info.get("targetMeanPrice")
-                price = info.get("currentPrice") or info.get("regularMarketPrice")
-                num_analysts = info.get("numberOfAnalystOpinions", 0) or 0
+                try:
+                    target = float(info.get("targetMeanPrice") or 0)
+                    price = float(info.get("currentPrice") or info.get("regularMarketPrice") or 0)
+                    num_analysts = int(info.get("numberOfAnalystOpinions") or 0)
+                except (TypeError, ValueError):
+                    target, price, num_analysts = 0, 0, 0
                 if target and price and target > 0 and num_analysts >= 3:
                     overshoot = price / target
                     if overshoot >= 2.0:
@@ -164,6 +181,128 @@ def _check_earnings_proximity(result: dict) -> tuple[bool, bool, int | None]:
 
 
 # ---------------------------------------------------------------------------
+# Post-earnings recency + earnings miss detection
+# ---------------------------------------------------------------------------
+
+def _check_post_earnings(ticker: str) -> tuple[bool, int | None, bool, float | None]:
+    """Check if earnings were reported recently and whether they missed.
+
+    Uses yfinance earnings data to detect:
+    - Whether earnings were reported within POST_EARNINGS_RECENCY_DAYS
+    - Whether actual EPS missed analyst estimates
+
+    Returns (post_earnings_recent, days_since, is_miss, miss_pct).
+    """
+    try:
+        import yfinance as yf
+        from datetime import datetime, timedelta
+
+        t = yf.Ticker(ticker)
+        today = datetime.now().date()
+
+        # Try to get earnings dates from calendar
+        cal = None
+        try:
+            cal = t.calendar
+        except Exception:
+            pass
+
+        # Try earnings_dates for historical data
+        earnings_dates = None
+        try:
+            earnings_dates = t.earnings_dates
+        except Exception:
+            pass
+
+        # Find most recent past earnings date
+        recent_date = None
+        days_since = None
+
+        if earnings_dates is not None and not earnings_dates.empty:
+            past_dates = earnings_dates.index[earnings_dates.index.date <= today]
+            if len(past_dates) > 0:
+                recent_date = past_dates[0]  # Most recent
+                days_since = (today - recent_date.date()).days
+
+        # Check if within recency window
+        post_recent = days_since is not None and days_since <= POST_EARNINGS_RECENCY_DAYS
+
+        # Check for earnings miss using earnings_dates columns
+        is_miss = False
+        miss_pct = None
+
+        if earnings_dates is not None and not earnings_dates.empty and recent_date is not None:
+            try:
+                row = earnings_dates.loc[recent_date]
+                # Column names vary: "Reported EPS" / "EPS Estimate"
+                actual = None
+                estimate = None
+                for col in earnings_dates.columns:
+                    col_lower = col.lower()
+                    if "reported" in col_lower or "actual" in col_lower:
+                        actual = row[col]
+                    elif "estimate" in col_lower or "expected" in col_lower:
+                        estimate = row[col]
+
+                if actual is not None and estimate is not None:
+                    import math
+                    if not (math.isnan(actual) or math.isnan(estimate)):
+                        if abs(estimate) > 0.001:
+                            miss_pct = (actual - estimate) / abs(estimate) * 100
+                            is_miss = actual < estimate
+                        elif actual < estimate:
+                            is_miss = True
+                            miss_pct = -100.0  # Sentinel for near-zero denominator
+            except Exception:
+                pass
+
+        return post_recent, days_since, is_miss, miss_pct
+
+    except Exception as e:
+        logger.warning("Post-earnings check failed for %s: %s", ticker, e)
+        return False, None, False, None
+
+
+# ---------------------------------------------------------------------------
+# 52-week high proximity detection
+# ---------------------------------------------------------------------------
+
+def _check_52w_high_proximity(ticker: str, df=None) -> tuple[bool, float | None]:
+    """Check if current price is near 52-week high.
+
+    Returns (near_high, pct_from_high).
+    """
+    try:
+        import yfinance as yf
+
+        if df is None or df.empty:
+            t = yf.Ticker(ticker)
+            df = t.history(period="1y")
+
+        if df is None or df.empty or len(df) < 20:
+            return False, None
+
+        close_col = "Close"
+        if close_col not in df.columns:
+            return False, None
+
+        current = float(df[close_col].iloc[-1])
+        high_52w = float(df[close_col].max())
+
+        if high_52w <= 0:
+            return False, None
+
+        pct_from_high = (high_52w - current) / high_52w
+        near_high = pct_from_high <= HIGH_52W_PROXIMITY_PCT
+
+        return near_high, round(pct_from_high, 4)
+
+    except Exception as e:
+        logger.warning("52w high check failed for %s: %s", ticker, e)
+        return False, None
+
+
+# ---------------------------------------------------------------------------
 # Market cap confidence tier
 # ---------------------------------------------------------------------------
 
@@ -173,6 +312,10 @@ def _classify_market_cap(market_cap: float | None) -> tuple[str, float, float]:
     Returns (tier_name, confidence_discount, max_weight_scale).
     """
     if market_cap is None:
+        return "unknown", 0.80, 0.60
+    try:
+        market_cap = float(market_cap)
+    except (TypeError, ValueError):
         return "unknown", 0.80, 0.60
 
     if market_cap >= MCAP_MEGA:
@@ -227,6 +370,19 @@ def apply_risk_overlay(result: dict, ticker: str, df=None) -> RiskOverlay:
     overlay.confidence_discount = confidence
     overlay.max_weight_scale = weight_scale
 
+    # 4. Post-earnings recency + earnings miss
+    post_recent, days_since, is_miss, miss_pct = _check_post_earnings(ticker)
+    overlay.post_earnings_recent = post_recent
+    overlay.post_earnings_days = days_since
+    overlay.earnings_miss = is_miss
+    overlay.earnings_miss_pct = round(miss_pct, 1) if miss_pct is not None else None
+
+    # 5. 52-week high proximity
+    near_high, pct_from_high = _check_52w_high_proximity(ticker, df=df)
+    overlay.near_52w_high = near_high
+    overlay.pct_from_52w_high = pct_from_high
+
+    # --- Logging ---
     if is_parabolic:
         logger.info(
             "%s: parabolic move detected (90d: %s, 30d: %s) — penalty %.2f",
@@ -237,6 +393,11 @@ def apply_risk_overlay(result: dict, ticker: str, df=None) -> RiskOverlay:
         )
     if imminent:
         logger.info("%s: earnings imminent (%d days)", ticker, days)
+    if post_recent:
+        miss_str = f", MISS {miss_pct:+.1f}%" if is_miss and miss_pct is not None else ""
+        logger.info("%s: reported earnings %d days ago%s", ticker, days_since, miss_str)
+    if near_high:
+        logger.info("%s: within %.1f%% of 52-week high", ticker, (pct_from_high or 0) * 100)
     if tier in ("small", "micro"):
         logger.info("%s: %s cap (confidence %.0f%%, max weight scale %.0f%%)",
                     ticker, tier, confidence * 100, weight_scale * 100)

@@ -6,6 +6,7 @@ State file lives next to portfolio.json in the project root.
 
 import json
 import logging
+import os
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
@@ -25,6 +26,7 @@ def _default_state() -> dict:
         "last_email_sent": None,
         "cooldowns": {},
         "cached_discovery": [],
+        "cached_discovery_meta": None,
         "cached_portfolio": None,
         "cached_optimizer": None,
         "cached_exit_signals": None,
@@ -44,6 +46,11 @@ def load_state() -> dict:
     try:
         with open(path, "r", encoding="utf-8") as f:
             state = json.load(f)
+        # Structural validation — must be a dict with "version" key
+        if not isinstance(state, dict) or "version" not in state:
+            logger.warning("State file structurally invalid (keys: %s), resetting.",
+                           list(state.keys()) if isinstance(state, dict) else type(state).__name__)
+            return _default_state()
         # Ensure all expected keys exist (forward-compatible)
         defaults = _default_state()
         for key, value in defaults.items():
@@ -56,15 +63,38 @@ def load_state() -> dict:
 
 
 def save_state(state: dict) -> None:
-    """Persist state to disk."""
+    """Persist state to disk. Raises on failure so callers can react."""
+    # Pre-write validation — refuse to persist structurally invalid state
+    if not isinstance(state, dict) or "version" not in state:
+        logger.error("CRITICAL: Refusing to save invalid state (keys: %s)",
+                      list(state.keys()) if isinstance(state, dict) else type(state).__name__)
+        raise ValueError("State dict missing 'version' key — refusing to overwrite")
+
     path = _state_path()
     tmp = path.with_suffix(".json.tmp")
     try:
+        # Serialize to string first — catches non-serializable objects before
+        # touching the filesystem.
+        payload = json.dumps(state, indent=2, default=str)
+
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(state, f, indent=2, default=str)
-        tmp.replace(path)  # Atomic rename — prevents corruption from OneDrive sync
-    except OSError as e:
-        logger.error("Failed to save state: %s", e)
+            f.write(payload)
+            f.flush()
+            os.fsync(f.fileno())
+        # Atomic rename with retry — OneDrive sync can hold a lock on the target
+        import time as _time
+        for attempt in range(3):
+            try:
+                tmp.replace(path)
+                break
+            except PermissionError:
+                if attempt < 2:
+                    _time.sleep(0.5)
+                else:
+                    raise
+    except (OSError, TypeError, ValueError) as e:
+        logger.error("CRITICAL: Failed to save state: %s", e)
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -115,7 +145,31 @@ def _parse_date(s: str) -> date | None:
 # ---------------------------------------------------------------------------
 
 def should_run_discovery(state: dict) -> bool:
-    """True if discovery has never run or last run was >= FREQ_DAYS ago."""
+    """True if discovery should run today.
+
+    Checks two conditions:
+    1. Today is a scheduled discovery day (Mon/Wed/Fri by default)
+    2. Discovery hasn't already run today
+    Falls back to frequency-based scheduling if DISCOVERY_DAYS is not set.
+    """
+    discovery_days = getattr(config, "ORCHESTRATOR_DISCOVERY_DAYS", None)
+
+    if discovery_days is not None:
+        # Day-of-week scheduling (0=Mon ... 6=Sun)
+        today = date.today()
+        if today.weekday() not in discovery_days:
+            return False
+        # Check if already ran today
+        last = state.get("last_discovery_run")
+        if not last:
+            return True
+        try:
+            last_date = datetime.fromisoformat(last).date()
+            return last_date < today
+        except (ValueError, TypeError):
+            return True
+
+    # Fallback: frequency-based scheduling
     last = state.get("last_discovery_run")
     if not last:
         return True

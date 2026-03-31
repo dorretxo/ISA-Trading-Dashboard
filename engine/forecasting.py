@@ -1,7 +1,9 @@
 """Mixture of Experts (MoE) price forecasting engine with MAE tracking."""
 
 import json
+import logging
 import math
+import os
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -11,7 +13,10 @@ import pandas as pd
 from sklearn.linear_model import LinearRegression
 
 import config
+from utils.analysis_cache import PersistentAnalysisCache
 from utils.data_fetch import get_macro_data, get_price_history
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -37,6 +42,10 @@ class EnsembleForecast:
     ensemble_mae: float | None
     expert_maes: dict[str, float | None]
     timestamp: str
+
+
+_forecast_cache = PersistentAnalysisCache("forecast")
+_FORECAST_PERSISTENT_TTL = getattr(config, "FORECAST_PERSISTENT_CACHE_TTL", 21600)
 
 
 # ---------------------------------------------------------------------------
@@ -245,14 +254,30 @@ EXPERT_NAMES = [
 def compute_expert_weights(
     expert_maes: dict[str, list[float]],
     current_price: float,
+    expert_predictions: dict[str, float] | None = None,
 ) -> dict[str, float]:
-    """Weight experts inversely proportional to their rolling MAE."""
+    """Weight experts inversely proportional to their rolling MAE.
+
+    Flat-line experts (predicted ≈ current_price ± 0.1%) are zeroed out —
+    they contribute no directional signal and dilute the ensemble.
+    """
     n = len(EXPERT_NAMES)
     equal_weight = 1.0 / n
     epsilon = 0.01 * current_price
 
+    # Detect flat-line experts: predicted == current_price ± 0.1%
+    flatline_threshold = 0.001 * current_price if current_price > 0 else 0.01
+    flatline_experts = set()
+    if expert_predictions:
+        for name, pred in expert_predictions.items():
+            if abs(pred - current_price) <= flatline_threshold:
+                flatline_experts.add(name)
+
     raw_weights = {}
     for name in EXPERT_NAMES:
+        if name in flatline_experts:
+            raw_weights[name] = 0.0  # Zero weight — no directional signal
+            continue
         maes = expert_maes.get(name, [])
         if len(maes) < config.FORECAST_MIN_HISTORY:
             raw_weights[name] = equal_weight
@@ -262,7 +287,49 @@ def compute_expert_weights(
             raw_weights[name] = 1.0 / (avg_mae + epsilon)
 
     total = sum(raw_weights.values())
+    if total <= 0:
+        # All experts flat-lined — fall back to equal weight for non-flat experts
+        # or truly equal if ALL are flat (shouldn't happen)
+        return {name: equal_weight for name in EXPERT_NAMES}
     return {name: w / total for name, w in raw_weights.items()}
+
+
+def _forecast_cache_key(ticker: str, horizon_days: int) -> str:
+    return f"{ticker.upper()}|{int(horizon_days)}"
+
+
+def _serialize_ensemble(fc: EnsembleForecast) -> dict:
+    payload = asdict(fc)
+    payload["expert_forecasts"] = [asdict(e) for e in fc.expert_forecasts]
+    return payload
+
+
+def _deserialize_ensemble(payload: dict) -> EnsembleForecast:
+    expert_payloads = payload.get("expert_forecasts", [])
+    experts = [
+        ExpertForecast(
+            name=e["name"],
+            predicted_price=e["predicted_price"],
+            confidence_low=e["confidence_low"],
+            confidence_high=e["confidence_high"],
+        )
+        for e in expert_payloads
+    ]
+    return EnsembleForecast(
+        ticker=payload["ticker"],
+        horizon_days=payload["horizon_days"],
+        current_price=payload["current_price"],
+        predicted_price=payload["predicted_price"],
+        confidence_low=payload["confidence_low"],
+        confidence_high=payload["confidence_high"],
+        direction=payload["direction"],
+        pct_change=payload["pct_change"],
+        expert_forecasts=experts,
+        expert_weights=payload.get("expert_weights", {}),
+        ensemble_mae=payload.get("ensemble_mae"),
+        expert_maes=payload.get("expert_maes", {}),
+        timestamp=payload["timestamp"],
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -275,19 +342,23 @@ def _store_path() -> Path:
 
 def _load_store() -> dict:
     path = _store_path()
-    if path.exists():
+    if not path.exists():
+        return {"predictions": [], "rolling_maes": {}}
+    try:
         with open(path, "r") as f:
             store = json.load(f)
-        # Migrate old-style plain ticker keys to {ticker}_{horizon} format
-        maes = store.get("rolling_maes", {})
-        keys_to_migrate = [k for k in maes if "_" not in k and not k.startswith("__")]
-        for old_key in keys_to_migrate:
-            new_key = f"{old_key}_{config.FORECAST_HORIZON_DAYS}"
-            if new_key not in maes:
-                maes[new_key] = maes[old_key]
-            del maes[old_key]
-        return store
-    return {"predictions": [], "rolling_maes": {}}
+    except (json.JSONDecodeError, OSError) as e:
+        logger.warning("Forecast store corrupt (%s), starting fresh.", e)
+        return {"predictions": [], "rolling_maes": {}}
+    # Migrate old-style plain ticker keys to {ticker}_{horizon} format
+    maes = store.get("rolling_maes", {})
+    keys_to_migrate = [k for k in maes if "_" not in k and not k.startswith("__")]
+    for old_key in keys_to_migrate:
+        new_key = f"{old_key}_{config.FORECAST_HORIZON_DAYS}"
+        if new_key not in maes:
+            maes[new_key] = maes[old_key]
+        del maes[old_key]
+    return store
 
 
 def _save_store(store: dict):
@@ -295,6 +366,8 @@ def _save_store(store: dict):
     tmp = path.with_suffix(".json.tmp")
     with open(tmp, "w") as f:
         json.dump(store, f, indent=2, default=str)
+        f.flush()
+        os.fsync(f.fileno())
     tmp.replace(path)  # Atomic rename — prevents corruption from partial writes
 
 
@@ -486,6 +559,12 @@ def forecast(ticker: str, horizon_days: int | None = None) -> EnsembleForecast:
     if horizon_days is None:
         horizon_days = config.FORECAST_HORIZON_DAYS
 
+    cache_key = _forecast_cache_key(ticker, horizon_days)
+    cached = _forecast_cache.get(cache_key, _FORECAST_PERSISTENT_TTL)
+    if cached is not None:
+        logger.debug("Forecast persistent cache hit for %s (%sd)", ticker, horizon_days)
+        return _deserialize_ensemble(cached)
+
     df = get_price_history(ticker)
     if df.empty or len(df) < 20:
         raise ValueError(f"Insufficient price data for {ticker}")
@@ -512,7 +591,8 @@ def forecast(ticker: str, horizon_days: int | None = None) -> EnsembleForecast:
 
     mae_key = f"{ticker}_{horizon_days}"
     ticker_maes = store.get("rolling_maes", {}).get(mae_key, {})
-    weights = compute_expert_weights(ticker_maes, current_price)
+    expert_preds_map = {e.name: e.predicted_price for e in expert_results}
+    weights = compute_expert_weights(ticker_maes, current_price, expert_preds_map)
 
     # Weighted ensemble
     predicted = sum(
@@ -564,7 +644,7 @@ def forecast(ticker: str, horizon_days: int | None = None) -> EnsembleForecast:
 
     _save_store(store)
 
-    return EnsembleForecast(
+    result = EnsembleForecast(
         ticker=ticker,
         horizon_days=horizon_days,
         current_price=current_price,
@@ -579,6 +659,9 @@ def forecast(ticker: str, horizon_days: int | None = None) -> EnsembleForecast:
         expert_maes=expert_maes_out,
         timestamp=now_str,
     )
+    _forecast_cache.put(cache_key, _serialize_ensemble(result))
+    _forecast_cache.save()
+    return result
 
 
 # ---------------------------------------------------------------------------

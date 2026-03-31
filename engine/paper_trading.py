@@ -391,8 +391,9 @@ def get_unrealized_pnl() -> list[dict]:
     for pos in positions:
         current = get_current_price(pos["ticker"])
         if current and current > 0:
-            pnl = (current - pos["avg_entry_price"]) * pos["quantity"]
-            pnl_pct = (current - pos["avg_entry_price"]) / pos["avg_entry_price"] * 100
+            avg_entry = pos["avg_entry_price"]
+            pnl = (current - avg_entry) * pos["quantity"]
+            pnl_pct = (current - avg_entry) / avg_entry * 100 if avg_entry else 0.0
             results.append({
                 **pos,
                 "current_price": current,

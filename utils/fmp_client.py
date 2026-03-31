@@ -171,35 +171,66 @@ def _fmp_get(path: str, params: dict | None = None, ttl: float = 3600) -> Any | 
     url = f"{config.FMP_BASE_URL}{path}"
     params["apikey"] = api_key
 
-    try:
-        resp = requests.get(url, params=params, timeout=15)
-        _record_call()
+    # Retry with exponential backoff for transient failures
+    _MAX_RETRIES = 3
+    _BACKOFF_BASE = 2.0  # 2s, 4s, 8s
 
-        if resp.status_code != 200:
-            # Suppress noise for known Starter plan limitations
-            _known_unavailable = ("/earnings-surprises", "/sector-pe-ratio")
-            if path in _known_unavailable and resp.status_code in (402, 404):
-                logger.debug("FMP %s not available on Starter plan (status %d)", path, resp.status_code)
-            else:
+    for attempt in range(_MAX_RETRIES):
+        try:
+            resp = requests.get(url, params=params, timeout=15)
+            _record_call()
+
+            if resp.status_code != 200:
+                # Suppress noise for known Starter plan limitations
+                _known_unavailable = ("/earnings-surprises", "/sector-pe-ratio")
+                if path in _known_unavailable and resp.status_code in (402, 404):
+                    logger.debug("FMP %s not available on Starter plan (status %d)", path, resp.status_code)
+                    return None  # Permanent — don't retry
+                if resp.status_code == 429:
+                    # Rate-limited — backoff and retry
+                    wait = _BACKOFF_BASE ** (attempt + 1)
+                    logger.debug("FMP rate limited on %s, backing off %.1fs", path, wait)
+                    time.sleep(wait)
+                    continue
+                if resp.status_code >= 500:
+                    # Server error — transient, retry
+                    wait = _BACKOFF_BASE ** (attempt + 1)
+                    logger.debug("FMP server error %d on %s, retry %d/%d",
+                                 resp.status_code, path, attempt + 1, _MAX_RETRIES)
+                    time.sleep(wait)
+                    continue
                 logger.warning("FMP %s returned status %d", path, resp.status_code)
+                return None  # Other client errors — permanent
+
+            data = resp.json()
+
+            # FMP returns error messages as dicts with "Error Message" key
+            if isinstance(data, dict) and "Error Message" in data:
+                logger.warning("FMP error for %s: %s", path, data["Error Message"])
+                return None
+
+            _cache_set(key, data, ttl)
+            return data
+
+        except (requests.ConnectionError, requests.Timeout) as e:
+            # Transient network error — retry with backoff
+            wait = _BACKOFF_BASE ** (attempt + 1)
+            logger.debug("FMP transient error on %s (attempt %d/%d): %s",
+                         path, attempt + 1, _MAX_RETRIES, e)
+            if attempt < _MAX_RETRIES - 1:
+                time.sleep(wait)
+                continue
+            logger.warning("FMP request failed for %s after %d retries: %s",
+                           path, _MAX_RETRIES, e)
+            return None
+        except requests.RequestException as e:
+            logger.warning("FMP request failed for %s: %s", path, e)
+            return None
+        except ValueError:
+            logger.warning("FMP returned invalid JSON for %s", path)
             return None
 
-        data = resp.json()
-
-        # FMP returns error messages as dicts with "Error Message" key
-        if isinstance(data, dict) and "Error Message" in data:
-            logger.warning("FMP error for %s: %s", path, data["Error Message"])
-            return None
-
-        _cache_set(key, data, ttl)
-        return data
-
-    except requests.RequestException as e:
-        logger.warning("FMP request failed for %s: %s", path, e)
-        return None
-    except ValueError:
-        logger.warning("FMP returned invalid JSON for %s", path)
-        return None
+    return None
 
 
 # ---------------------------------------------------------------------------

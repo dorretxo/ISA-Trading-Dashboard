@@ -1,6 +1,7 @@
 """Shared data fetching utilities with session-level caching."""
 
 import json
+import os
 import time
 from pathlib import Path
 
@@ -39,6 +40,8 @@ def save_portfolio(data: dict) -> None:
     tmp = path.with_suffix(".json.tmp")
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=4, default=str)
+        f.flush()
+        os.fsync(f.fileno())
     tmp.replace(path)
 
 
@@ -107,7 +110,7 @@ def get_price_history(ticker: str) -> pd.DataFrame:
 
     period = f"{config.PRICE_HISTORY_DAYS}d"
     try:
-        df = yf.download(ticker, period=period, progress=False, auto_adjust=True)
+        df = yf.download(ticker, period=period, progress=False, auto_adjust=True, timeout=30)
         if df.empty:
             _price_cache[ticker] = pd.DataFrame()
             return pd.DataFrame()
@@ -121,13 +124,27 @@ def get_price_history(ticker: str) -> pd.DataFrame:
     return _price_cache[ticker]
 
 
-def get_ticker_info(ticker: str) -> dict:
-    """Fetch ticker info (fundamentals, name, etc.) with caching."""
+def get_ticker_info(ticker: str, timeout: int = 30) -> dict:
+    """Fetch ticker info (fundamentals, name, etc.) with caching and timeout.
+
+    Uses a thread pool to enforce a hard timeout on yfinance .info calls,
+    which can hang indefinitely on delisted or problematic tickers.
+    """
     if ticker in _info_cache:
         return _info_cache[ticker]
 
+    import concurrent.futures
+
+    def _fetch():
+        return yf.Ticker(ticker).info or {}
+
     try:
-        info = yf.Ticker(ticker).info or {}
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            info = pool.submit(_fetch).result(timeout=timeout)
+    except concurrent.futures.TimeoutError:
+        import logging
+        logging.getLogger(__name__).debug("Ticker info timeout for %s after %ds", ticker, timeout)
+        info = {}
     except Exception:
         info = {}
 
@@ -162,7 +179,7 @@ def get_macro_data() -> dict[str, pd.DataFrame]:
 
     for name, ticker in config.MACRO_TICKERS.items():
         try:
-            df = yf.download(ticker, period=f"{config.MACRO_LOOKBACK}d", progress=False, auto_adjust=True)
+            df = yf.download(ticker, period=f"{config.MACRO_LOOKBACK}d", progress=False, auto_adjust=True, timeout=30)
             if not df.empty:
                 if isinstance(df.columns, pd.MultiIndex):
                     df.columns = df.columns.get_level_values(0)

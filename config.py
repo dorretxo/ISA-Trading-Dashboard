@@ -12,10 +12,10 @@ except ImportError:
 
 # Scoring weights (must sum to 1.0) — forecast capped at 30% per Gemini review
 WEIGHTS = {
-    "technical": 0.3709,
-    "fundamental": 0.2076,
-    "sentiment": 0.1593,
-    "forecast": 0.2623,
+    "technical": 0.30,       # Trend/momentum — IC 0.03-0.05 at 90d (Moskowitz et al. 2012)
+    "fundamental": 0.40,     # Value+quality — IC 0.04-0.07 at 90d (Asness et al. 2013)
+    "sentiment": 0.08,       # News — IC ~0.005 at 90d (Tetlock 2007); confirmatory only
+    "forecast": 0.22,        # Statistical ensemble — IC 0.01-0.03 (Rapach & Zhou 2013)
 }
 
 # Forecast-to-score conversion: maps predicted % change to a -1..+1 score
@@ -40,10 +40,10 @@ TRAIL_PCT_LOW_VOL = 0.06   # 6% trailing when calm
 TRAIL_PCT_HIGH_VOL = 0.12  # 12% trailing when volatile
 
 # Scoring thresholds for actions (from highest to lowest)
-SCORE_STRONG_BUY_THRESHOLD = 0.50  # Above this = STRONG BUY
-SCORE_BUY_THRESHOLD = 0.25         # Above this = BUY
-SCORE_KEEP_THRESHOLD = -0.3        # Above this = KEEP
-SCORE_SELL_THRESHOLD = -0.6        # Above this = SELL, below = STRONG SELL
+SCORE_STRONG_BUY_THRESHOLD = 0.40  # Above this = STRONG BUY (top decile)
+SCORE_BUY_THRESHOLD = 0.20         # Above this = BUY (top quartile)
+SCORE_KEEP_THRESHOLD = -0.25       # Above this = KEEP
+SCORE_SELL_THRESHOLD = -0.50       # Above this = SELL, below = STRONG SELL
 
 # Data settings
 PRICE_HISTORY_DAYS = 730  # 2 years of history for technicals + backtest training
@@ -84,7 +84,7 @@ SHORT_INTEREST_LOW = 0.02  # <2% = no short pressure
 INST_OWNERSHIP_HIGH = 0.70  # >70% = smart money holds
 
 # Macro expert settings
-MACRO_LOOKBACK = 90  # Days of macro data for correlation
+MACRO_LOOKBACK = 365  # Days of macro data for correlation / VIX percentile reuse
 MACRO_CORRELATION_MIN = 0.3  # Min |r| to use a macro expert
 MACRO_TICKERS = {
     "vix": "^VIX",
@@ -102,6 +102,11 @@ SENTIMENT_WEIGHTS = {"news": 0.6, "reddit": 0.4}
 REDDIT_SUBREDDITS = ["stocks", "investing", "wallstreetbets"]
 REDDIT_POST_LIMIT = 10
 REDDIT_CACHE_TTL = 1800  # 30 minutes
+SENTIMENT_CACHE_TTL = 3600  # 1 hour in-process cache
+SENTIMENT_PERSISTENT_CACHE_TTL = 172800  # 48 hours across runs (avoids rate-limiting in long batches)
+
+# Persistent deep-analysis cache (repeat discovery runs)
+FORECAST_PERSISTENT_CACHE_TTL = 21600  # 6 hours across runs
 
 # Weight optimization settings
 BACKTEST_WEIGHT_STEP = 0.05    # Grid search step size for weight optimization
@@ -120,14 +125,14 @@ FMP_CACHE_TTL_QUARTERLY = 86400   # 24h — fundamentals change quarterly
 FMP_CACHE_TTL_DAILY = 3600        # 1h — technicals, news
 FMP_CACHE_TTL_CALENDAR = 43200    # 12h — earnings calendar
 
-# Global Discovery Engine (v2 — expanded global + momentum)
+# Global Discovery Engine (v4 — multi-lens + wider funnel)
 DISCOVERY_EXCHANGES = ["NYSE", "NASDAQ", "AMEX"]  # FMP screener (US only on Starter)
 DISCOVERY_FMP_LIMIT = 1000             # Per-exchange FMP screener limit (was 200)
 DISCOVERY_MIN_MCAP = 50_000_000        # £50M floor (liquidity only, no upper cap)
 DISCOVERY_VOLUME_MIN = 50_000          # Minimum daily volume (liquidity floor)
-DISCOVERY_TOP_N_LIGHTWEIGHT = 100       # Stage 5a: lightweight scoring (tech + momentum)
-DISCOVERY_TOP_N_FULL_SCORE = 30         # Stage 5b: full 4-pillar analysis on top N
-DISCOVERY_BETA_MAX = 2.5               # Maximum beta (relaxed for momentum plays)
+DISCOVERY_TOP_N_LIGHTWEIGHT = 600       # Stage 5a: lightweight scoring (tech + momentum)
+DISCOVERY_TOP_N_FULL_SCORE = 250        # Stage 5b: full 4-pillar analysis on top N
+DISCOVERY_BETA_MAX = 2.5               # Maximum beta (soft penalty above 2.0)
 DISCOVERY_CORRELATION_THRESHOLD = 0.70 # Max correlation with existing holdings
 DISCOVERY_SECTOR_CONCENTRATION_MAX = 0.40  # Max sector weight before penalty (relaxed)
 DISCOVERY_USE_GLOBAL_UNIVERSE = True   # Enable yfinance-based global screening
@@ -136,19 +141,35 @@ DISCOVERY_TIER2_DAYS = [0, 3]          # Days to screen mid-caps (0=Mon, 3=Thu)
 # Momentum screening (90-day cycle optimisation)
 DISCOVERY_MODE = "momentum_90d"        # "balanced" or "momentum_90d"
 MOMENTUM_WEIGHTS = {                   # Pillar weights in momentum mode
-    "technical": 0.45,                 # RSI, MACD, breakouts dominate
-    "fundamental": 0.10,              # Light fundamental check
-    "sentiment": 0.20,                # News/social momentum
+    "technical": 0.40,                 # Trend-following signals dominate
+    "fundamental": 0.25,              # Quality filter prevents momentum traps
+    "sentiment": 0.10,                # News/social momentum (short-lived)
     "forecast": 0.25,                 # MoE price prediction
 }
-MOMENTUM_TOP_N_PRESCREEN = 150         # Keep top N by momentum score before filtering
+MOMENTUM_TOP_N_PRESCREEN = 1000        # Keep top N by momentum score before filtering
 MOMENTUM_MIN_AVG_VOLUME = 100_000      # Minimum 20-day average volume for momentum
+
+# Multi-lens entry (each lens gets a quota within MOMENTUM_TOP_N_PRESCREEN)
+DISCOVERY_LENS_MOMENTUM_PCT = 0.50     # 50% of slots to momentum leaders
+DISCOVERY_LENS_VALUE_PCT = 0.25        # 25% of slots to value/turnaround plays
+DISCOVERY_LENS_QUALITY_PCT = 0.25      # 25% of slots to quality-at-a-discount
+
+# Region-balanced sampling (minimum % of deep-score slots per region)
+DISCOVERY_REGION_MIN_PCT = 0.15        # Each region gets at least 15% of deep-score slots
+
+# Diversified final selector
+DISCOVERY_MAX_PER_SECTOR = 4           # Max candidates from any single sector in final output
+DISCOVERY_MIN_REGIONS = 2              # Minimum number of regions represented in top 10
+
+# Timeout protection (prevents stuck tickers from blocking the whole run)
+DISCOVERY_PER_TICKER_TIMEOUT = 120     # Max seconds per ticker in deep analysis (Stage 6)
+ORCHESTRATOR_MAX_RUNTIME = 36000       # Max total orchestrator runtime in seconds (10 hours)
 
 # Multi-swap evaluation
 DISCOVERY_MAX_SWAPS_PER_RUN = 3        # Allow up to N swap recommendations per run
 SWAP_CANDIDATE_THRESHOLD = -0.10       # Holdings with score below this are swap-eligible
 
-# FX fees for ISA — Interactive Investor charges 0.75% per leg
+# FX fees for ISA — typical platform charges ~0.75% per leg
 FX_FEE_TIER = 0.0075                  # 0.75% per currency conversion
 
 # FMP-sourced technical indicator thresholds
@@ -172,7 +193,8 @@ EMAIL_TO = os.environ.get("EMAIL_TO", "")               # recipient address
 EMAIL_PASSWORD = os.environ.get("EMAIL_PASSWORD", "")   # app password
 
 # Orchestrator scheduling
-ORCHESTRATOR_DISCOVERY_FREQ_DAYS = 1   # Run discovery every N days (weekly default)
+ORCHESTRATOR_DISCOVERY_FREQ_DAYS = 1   # Fallback: max days between runs (overridden by day-of-week)
+ORCHESTRATOR_DISCOVERY_DAYS = [6]  # Days of week to run discovery (6=Sun)
 
 # Decision logic — swap hurdle rates
 HURDLE_RATE = 0.20             # candidate.aggregate_score must beat weakest by this margin
@@ -189,6 +211,47 @@ PAPER_TRADING_ENABLED = True                    # Log all signals to paper ledge
 
 # Timeouts (seconds)
 DISCOVERY_TIMEOUT = 7200       # 2 hours max for expanded discovery pipeline
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Algorithmic Upgrades
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Sentiment recency decay — exponential decay by article age
+SENTIMENT_RECENCY_DECAY = True
+SENTIMENT_DECAY_HALF_LIFE_HOURS = 48.0     # Half-life in hours (older articles count less)
+
+# Cross-sectional z-scoring — normalize pillar scores within discovery batch
+DISCOVERY_CROSS_SECTIONAL_ZSCORE = True
+
+# Position sizing / volatility management
+POSITION_RISK_BUDGET_PCT = 0.01             # Risk 1% of portfolio per trade before caps
+VOL_MANAGED_TARGET_ANN = 0.20               # 20% annualized target vol for alpha scaling
+VOL_MANAGED_FLOOR = 0.50                    # Never scale alpha below 50%
+VOL_MANAGED_CAP = 1.25                      # Never scale alpha above 125%
+PEAD_MAX_OVERLAY = 0.10                     # Cap PEAD / revision overlay magnitude
+DISCOVERY_MAX_RISK_PENALTY = 0.30           # Cap total risk overlay deduction per candidate
+DISCOVERY_MAX_PILLAR_WEIGHT = 0.70          # Cap any single pillar after adaptive redistribution
+
+# Dividend safety thresholds
+DIVIDEND_PAYOUT_HEALTHY = 0.40              # Payout ratio below this = healthy (+score)
+DIVIDEND_PAYOUT_STRETCHED = 0.60            # Payout ratio above this = stretched (-score)
+DIVIDEND_PAYOUT_UNSUSTAINABLE = 0.80        # Payout ratio above this = unsustainable (red flag)
+DIVIDEND_YIELD_TRAP_THRESHOLD = 0.08        # Yield above 8% = potential yield trap
+EX_DIVIDEND_PROXIMITY_DAYS = 14             # Flag ex-dividend within N days
+
+# Balance sheet strength thresholds
+NET_DEBT_EBITDA_FORTRESS = 0.0              # Negative net debt = fortress balance sheet
+NET_DEBT_EBITDA_HIGH = 3.0                  # Above this = leveraged
+NET_DEBT_EBITDA_DANGER = 5.0                # Above this = dangerously leveraged
+CURRENT_RATIO_MIN = 1.0                     # Below this = liquidity risk
+
+# Governance red flag composite — flag when N+ signals align
+GOVERNANCE_FLAG_THRESHOLD = 3               # Number of warning signals to trigger flag
+
+# ML ranker guardrails — keep conservative until walk-forward sample is larger
+ML_RANKER_MIN_SAMPLES = 250                 # Minimum evaluated signals before ML can go live
+ML_RANKER_BLEND_PCT = 0.15                  # Small live blend when enabled
+ML_RANKER_SHADOW_ONLY = True                # Train/evaluate offline until enough evidence exists
 
 # Broad universe for cross-sectional weight optimization (diverse sectors + geographies)
 BACKTEST_UNIVERSE = [

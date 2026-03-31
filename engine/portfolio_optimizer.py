@@ -63,11 +63,13 @@ def _get_fx_rate(currency: str) -> float:
     # yfinance FX pair convention: XXXGBP=X
     pair = f"{currency}GBP=X"
     try:
-        data = yf.download(pair, period="5d", progress=False, auto_adjust=True)
+        data = yf.download(pair, period="5d", progress=False, auto_adjust=True, timeout=30)
         if data is not None and not data.empty:
-            rate = float(data["Close"].iloc[-1:].values[0])
+            if isinstance(data.columns, pd.MultiIndex):
+                data.columns = data.columns.get_level_values(0)
+            rate = float(data["Close"].dropna().iloc[-1])
             _fx_cache[currency] = rate
-            logger.info("FX rate %s→GBP: %.4f", currency, rate)
+            logger.info("FX rate %s->GBP: %.4f", currency, rate)
             return rate
     except Exception as e:
         logger.warning("FX rate fetch failed for %s: %s", currency, e)
@@ -76,7 +78,7 @@ def _get_fx_rate(currency: str) -> float:
     fallbacks = {"USD": 0.79, "EUR": 0.86}
     rate = fallbacks.get(currency, 1.0)
     _fx_cache[currency] = rate
-    logger.warning("Using fallback FX rate %s→GBP: %.2f", currency, rate)
+    logger.warning("Using fallback FX rate %s->GBP: %.2f", currency, rate)
     return rate
 
 
@@ -159,10 +161,12 @@ def _estimate_expected_returns(
 
         # 3. Historical 90-day momentum (actual trailing return)
         try:
-            data = yf.download(ticker, period="120d", progress=False, auto_adjust=True)
+            data = yf.download(ticker, period="120d", progress=False, auto_adjust=True, timeout=30)
             if data is not None and len(data) >= 60:
-                hist_90d = (float(data["Close"].iloc[-1:].values[0]) /
-                            float(data["Close"].iloc[-63:-62].values[0]) - 1)
+                if isinstance(data.columns, pd.MultiIndex):
+                    data.columns = data.columns.get_level_values(0)
+                hist_90d = (float(data["Close"].dropna().iloc[-1]) /
+                            float(data["Close"].dropna().iloc[-63]) - 1)
             else:
                 hist_90d = 0.0
         except Exception:
@@ -171,6 +175,13 @@ def _estimate_expected_returns(
         # Blend in 90-day terms, then annualise
         expected_90d = 0.50 * moe_90d + 0.25 * score_90d + 0.25 * hist_90d
         mu[i] = expected_90d * (252 / 63)  # annualise for mean-variance math
+
+    # Guard against NaN in expected returns (e.g. bad forecast data)
+    nan_mask = np.isnan(mu)
+    if nan_mask.any():
+        logger.warning("NaN in expected returns for %s — replacing with 0",
+                       [tickers[i] for i in np.where(nan_mask)[0]])
+        mu = np.nan_to_num(mu, nan=0.0)
 
     return mu
 
@@ -263,6 +274,9 @@ def _current_weights(holdings: list[dict], results: list[dict]) -> np.ndarray:
         ticker = h["ticker"]
         r = result_map.get(ticker, {})
         price = r.get("current_price", 0) or 0
+        # Guard against NaN prices from yfinance
+        if price != price:  # NaN check
+            price = 0
         qty = h.get("quantity", 0)
         currency = h.get("currency", "GBP")
 
@@ -373,13 +387,46 @@ def _mean_variance_optimize(
 
     # Bounds: each weight between MIN_WEIGHT and MAX_WEIGHT
     # Risk overlay may reduce the upper bound for small/micro cap holdings
+    # SELL/STRONG SELL actions cap the upper bound at MIN_WEIGHT to force exit
     result_map = {r["ticker"]: r for r in results} if results else {}
+
+    # Kelly-derived upper bounds (auto-activates when sufficient backtest data exists)
+    kelly_fractions = {}
+    try:
+        from engine.discovery_backtest import get_kelly_fractions
+        kelly_fractions = get_kelly_fractions(source="portfolio")
+    except Exception:
+        kelly_fractions = {}
+
     bounds = []
     for ticker in tickers:
         r = result_map.get(ticker, {})
+        action = r.get("action", "KEEP")
         scale = r.get("max_weight_scale", 1.0)
         upper = MAX_WEIGHT * scale
+
+        # Apply Kelly cap if available for this action tier
+        if kelly_fractions and action in kelly_fractions:
+            kelly_cap = kelly_fractions[action]
+            upper = min(upper, kelly_cap)
+            logger.debug("Kelly cap for %s (%s): %.1f%%", ticker, action, kelly_cap * 100)
+
+        if action == "STRONG SELL":
+            upper = MIN_WEIGHT  # force to minimum
+        elif action == "SELL":
+            upper = min(upper, MIN_WEIGHT * 2)  # allow only a tiny residual
+
         bounds.append((MIN_WEIGHT, max(MIN_WEIGHT, upper)))
+
+    # Sanitise current_w — replace NaN with equal weight
+    if np.isnan(current_w).any():
+        logger.warning("NaN in current weights — replacing with equal weights")
+        current_w = np.where(np.isnan(current_w), 1.0 / n, current_w)
+        current_w = current_w / current_w.sum()
+
+    # Regularise covariance to prevent singular matrix in SLSQP
+    # Add small ridge term to diagonal for numerical stability
+    cov = cov + np.eye(n) * 1e-6
 
     # Initial guess: current weights (feasible starting point)
     w0 = current_w.copy()
@@ -403,8 +450,9 @@ def _mean_variance_optimize(
         optimal_w = optimal_w / optimal_w.sum()
     else:
         warnings.append(f"Optimisation did not converge: {result.message}")
-        logger.warning("Mean-variance optimisation failed: %s", result.message)
-        optimal_w = current_w
+        logger.warning("Mean-variance optimisation failed: %s — falling back to equal weights", result.message)
+        # Fallback: equal weights (safe, no NaN)
+        optimal_w = np.full(n, 1.0 / n)
 
     return optimal_w, warnings
 
@@ -504,6 +552,21 @@ def optimize_portfolio(
 
     # Expected returns
     mu = _estimate_expected_returns(results, tickers)
+
+    # --- Action-aware adjustments ---
+    # Holdings with SELL/STRONG SELL signals should be penalised so the
+    # optimizer drives their weight toward MIN_WEIGHT rather than keeping
+    # a meaningful allocation in stocks the scoring engine says to exit.
+    for i, ticker in enumerate(tickers):
+        r = result_map.get(ticker, {})
+        action = r.get("action", "KEEP")
+        if action == "STRONG SELL":
+            # Force expected return deeply negative → optimizer will minimise
+            mu[i] = min(mu[i], -0.50)
+            logger.info("Optimizer: %s is STRONG SELL — penalising expected return to %.2f", ticker, mu[i])
+        elif action == "SELL":
+            mu[i] = min(mu[i], -0.25)
+            logger.info("Optimizer: %s is SELL — penalising expected return to %.2f", ticker, mu[i])
 
     # Covariance
     cov = _estimate_covariance(tickers)

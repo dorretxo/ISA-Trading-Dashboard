@@ -40,6 +40,7 @@ from utils.state_manager import (
 from utils.email_sender import build_alert_email, send_email
 from engine.paper_trading import init_db as _init_paper_db, log_signal as _log_paper_signal, resolve_pending_signals
 from engine.discovery_backtest import record_discovery_picks, record_portfolio_signals, evaluate_matured_signals
+from engine.exit_engine import reconcile_actions_with_exits, exit_signal_to_dict
 
 # ---------------------------------------------------------------------------
 # Logging setup — console + file
@@ -141,6 +142,132 @@ def _run_discovery_pipeline(holdings: list[dict], risk_data: dict):
     return run_discovery(holdings, risk_data)
 
 
+def save_discovery_results(disc_result, state: dict) -> int:
+    """Persist discovery results to state and record picks for backtest.
+
+    Extracted so both the background orchestrator and the UI button can call it.
+    Returns the number of backtest picks recorded.
+    """
+    n_candidates = len(disc_result.candidates)
+
+    state["cached_discovery"] = [
+        {
+            "ticker": c.ticker,
+            "name": c.name,
+            "exchange": c.exchange,
+            "country": c.country,
+            "sector": c.sector,
+            "industry": c.industry,
+            "market_cap": c.market_cap,
+            "currency": c.currency,
+            "aggregate_score": c.aggregate_score,
+            "technical_score": c.technical_score,
+            "fundamental_score": c.fundamental_score,
+            "sentiment_score": c.sentiment_score,
+            "forecast_score": c.forecast_score,
+            "action": c.action,
+            "why": c.why,
+            "fx_penalty_applied": c.fx_penalty_applied,
+            "fx_penalty_pct": c.fx_penalty_pct,
+            "max_correlation": c.max_correlation,
+            "correlated_with": c.correlated_with,
+            "sector_weight_if_added": c.sector_weight_if_added,
+            "portfolio_fit_score": c.portfolio_fit_score,
+            "momentum_score": c.momentum_score,
+            "return_90d": c.return_90d,
+            "return_30d": c.return_30d,
+            "volume_ratio": c.volume_ratio,
+            "expected_return_90d": c.expected_return_90d,
+            "analyst_target": getattr(c, "analyst_target", None),
+            "analyst_upside": getattr(c, "analyst_upside", None),
+            "num_analysts": getattr(c, "num_analysts", None),
+            "insider_buys": getattr(c, "insider_buys", 0),
+            "insider_sells": getattr(c, "insider_sells", 0),
+            "insider_net": getattr(c, "insider_net", ""),
+            "beta_90d": getattr(c, "beta_90d", None),
+            "debt_to_equity": getattr(c, "debt_to_equity", None),
+            "entry_stance": getattr(c, "entry_stance", "Ready"),
+            "ticker_identity_warning": getattr(c, "ticker_identity_warning", None),
+            "parabolic_penalty": c.parabolic_penalty,
+            "is_parabolic": c.is_parabolic,
+            "earnings_near": c.earnings_near,
+            "earnings_imminent": c.earnings_imminent,
+            "earnings_days": c.earnings_days,
+            "cap_tier": c.cap_tier,
+            "confidence_discount": c.confidence_discount,
+            "max_weight_scale": c.max_weight_scale,
+            "post_earnings_recent": c.post_earnings_recent,
+            "post_earnings_days": c.post_earnings_days,
+            "earnings_miss": c.earnings_miss,
+            "earnings_miss_pct": c.earnings_miss_pct,
+            "near_52w_high": c.near_52w_high,
+            "pct_from_52w_high": c.pct_from_52w_high,
+            "entry_lens": getattr(c, "entry_lens", "momentum"),
+            "entry_price": getattr(c, "entry_price", None),
+            "entry_method": getattr(c, "entry_method", ""),
+            "entry_zone_low": getattr(c, "entry_zone_low", None),
+            "entry_zone_high": getattr(c, "entry_zone_high", None),
+            "fill_probability": getattr(c, "fill_probability", None),
+            "stop_loss": getattr(c, "stop_loss", None),
+            "stop_method": getattr(c, "stop_method", ""),
+            "stop_distance_pct": getattr(c, "stop_distance_pct", None),
+            "take_profit": getattr(c, "take_profit", None),
+            "target_method": getattr(c, "target_method", ""),
+            "position_size_shares": getattr(c, "position_size_shares", 0),
+            "position_weight": getattr(c, "position_weight", 0),
+            "risk_amount": getattr(c, "risk_amount", 0),
+            "r_r_ratio": getattr(c, "r_r_ratio", None),
+            "sizing_method": getattr(c, "sizing_method", ""),
+            "kelly_cap_fraction": getattr(c, "kelly_cap_fraction", None),
+            "support_levels": getattr(c, "support_levels", {}),
+            "regime_info": getattr(c, "regime_info", {}),
+            # Dividend safety
+            "dividend_yield": getattr(c, "dividend_yield", None),
+            "payout_ratio": getattr(c, "payout_ratio", None),
+            "ex_dividend_date": getattr(c, "ex_dividend_date", None),
+            "ex_dividend_days": getattr(c, "ex_dividend_days", None),
+            "five_year_avg_yield": getattr(c, "five_year_avg_yield", None),
+            # Balance sheet strength
+            "balance_sheet_grade": getattr(c, "balance_sheet_grade", None),
+            "net_debt_ebitda": getattr(c, "net_debt_ebitda", None),
+            "current_ratio": getattr(c, "current_ratio", None),
+            "cash_to_debt": getattr(c, "cash_to_debt", None),
+            # Governance red flag
+            "governance_flag": getattr(c, "governance_flag", False),
+            "governance_reasons": getattr(c, "governance_reasons", []),
+            # Asymmetric / binary outcome flag
+            "asymmetric_risk_flag": getattr(c, "asymmetric_risk_flag", False),
+            "asymmetric_risk_reason": getattr(c, "asymmetric_risk_reason", None),
+            "final_rank": c.final_rank,
+        }
+        for c in disc_result.candidates
+    ]
+    state["cached_discovery_meta"] = {
+        "screened_count": disc_result.screened_count,
+        "after_momentum_screen": disc_result.after_momentum_screen,
+        "after_quick_filter": disc_result.after_quick_filter,
+        "after_corr_filter": disc_result.after_corr_filter,
+        "after_quick_rank": disc_result.after_quick_rank,
+        "fully_scored": disc_result.fully_scored,
+        "run_time_seconds": disc_result.run_time_seconds,
+        "fx_penalties_applied": disc_result.fx_penalties_applied,
+    }
+    state["last_discovery_run"] = datetime.now().isoformat()
+
+    save_state(state)
+    logger.info("Discovery results saved to state (%d candidates).", n_candidates)
+
+    # Record picks for backtest tracking
+    n_recorded = 0
+    try:
+        n_recorded = record_discovery_picks(disc_result.candidates)
+        logger.info("Recorded %d discovery picks for backtest.", n_recorded)
+    except Exception as e:
+        logger.warning("Failed to record discovery picks: %s", e)
+
+    return n_recorded
+
+
 # ---------------------------------------------------------------------------
 # Decision engine
 # ---------------------------------------------------------------------------
@@ -169,20 +296,36 @@ def _evaluate_swaps(
     max_swaps = getattr(config, "DISCOVERY_MAX_SWAPS_PER_RUN", 3)
     swap_threshold = getattr(config, "SWAP_CANDIDATE_THRESHOLD", -0.10)
 
-    # Find swap-eligible holdings: sorted by score ascending, below threshold
-    sorted_by_score = sorted(results, key=lambda r: r.get("aggregate_score", 0))
-    swap_eligible = [
-        r for r in sorted_by_score
-        if r.get("aggregate_score", 0) < swap_threshold
+    # Find swap-eligible holdings — prioritise exit-flagged holdings first.
+    # Exit reconciliation sets _exit_override=True and _exit_posterior on holdings
+    # downgraded by stop/momentum/decay signals. These should be swapped before
+    # merely low-scoring holdings, since the exit engine has identified active risk.
+    exit_flagged = [
+        r for r in results
+        if r.get("_exit_override") and r.get("final_action", r.get("action")) in ("SELL", "STRONG SELL")
     ]
-    # Even if none below threshold, always consider the single weakest
+    # Sort exit-flagged by posterior score ascending (worst risk first)
+    exit_flagged.sort(key=lambda r: r.get("_exit_posterior", r.get("aggregate_score", 0)))
+
+    # Then add score-based candidates (not already in exit list)
+    exit_tickers = {r["ticker"] for r in exit_flagged}
+    sorted_by_score = sorted(results, key=lambda r: r.get("aggregate_score", 0))
+    score_eligible = [
+        r for r in sorted_by_score
+        if r.get("aggregate_score", 0) < swap_threshold and r["ticker"] not in exit_tickers
+    ]
+
+    # Combine: exit-flagged first, then score-based
+    swap_eligible = exit_flagged + score_eligible
+
+    # Even if none qualify, always consider the single weakest
     if not swap_eligible and sorted_by_score:
         swap_eligible = [sorted_by_score[0]]
 
-    # Sort candidates by aggregate_score descending (best first)
+    # Sort candidates by final discovery decision rank descending (best first)
     sorted_candidates = sorted(
         cached_candidates,
-        key=lambda c: c.get("aggregate_score", 0),
+        key=lambda c: (c.get("final_rank", c.get("aggregate_score", 0)), c.get("aggregate_score", 0)),
         reverse=True,
     )
 
@@ -195,7 +338,7 @@ def _evaluate_swaps(
             break
 
         target_ticker = target["ticker"]
-        target_score = target.get("aggregate_score", 0)
+        target_score = target.get("_exit_posterior", target.get("aggregate_score", 0))
 
         if target_ticker in used_holdings:
             continue
@@ -205,23 +348,27 @@ def _evaluate_swaps(
             if cand_ticker in used_candidates:
                 continue
 
-            cand_score = cand.get("aggregate_score", 0)
+            cand_score = cand.get("final_rank", cand.get("aggregate_score", 0))
             cand_fit = cand.get("portfolio_fit_score", 0)
+            cand_action = cand.get("action", "NEUTRAL")
             delta = cand_score - target_score
 
             passes_hurdle = delta >= hurdle
             passes_fit = cand_fit >= fit_min
+            passes_action = cand_action in ("BUY", "STRONG BUY")
             on_cooldown = is_on_cooldown(state, cand_ticker)
-            recommended = passes_hurdle and passes_fit and not on_cooldown
+            recommended = passes_action and passes_hurdle and passes_fit and not on_cooldown
 
             # Log every evaluation for audit
             _log_decision("swap_eval", {
                 "candidate": cand_ticker,
                 "candidate_score": round(cand_score, 3),
+                "candidate_action": cand_action,
                 "candidate_fit": round(cand_fit, 3),
                 "target": target_ticker,
                 "target_score": round(target_score, 3),
                 "delta": round(delta, 3),
+                "passes_action": passes_action,
                 "passes_hurdle": passes_hurdle,
                 "passes_fit": passes_fit,
                 "on_cooldown": on_cooldown,
@@ -257,6 +404,7 @@ def run_orchestrator(
     Returns a summary dict for logging / testing.
     """
     start = time.time()
+    max_runtime = getattr(config, "ORCHESTRATOR_MAX_RUNTIME", 3600)
     summary = {
         "dry_run": dry_run,
         "portfolio_ran": False,
@@ -266,6 +414,13 @@ def run_orchestrator(
         "email_sent": False,
         "error": None,
     }
+
+    def _check_timeout(stage: str):
+        """Raise if total runtime exceeds max. Ensures process always completes."""
+        elapsed = time.time() - start
+        if elapsed > max_runtime:
+            raise TimeoutError(f"Orchestrator timeout after {elapsed:.0f}s in {stage} "
+                               f"(limit: {max_runtime}s). Partial results will be used.")
 
     _log_decision("run_start", {
         "dry_run": dry_run,
@@ -335,6 +490,8 @@ def run_orchestrator(
         save_state(state)
         return summary
 
+    _check_timeout("portfolio_analysis")
+
     # --- Step 2: VIX regime ---
     vix_regime = _get_regime()
     logger.info("VIX regime: %s (level %.1f, percentile %.0f%%)",
@@ -388,19 +545,8 @@ def run_orchestrator(
     except Exception as e:
         logger.warning("Failed to record portfolio signals for backtest: %s", e)
 
-    # --- Step 3: Identify SELL / STRONG SELL alerts ---
-    alerts = [r for r in results if r.get("action") in ("SELL", "STRONG SELL")]
-    for a in alerts:
-        logger.info("ALERT: %s — %s (score: %.3f)", a["ticker"], a["action"],
-                     a.get("aggregate_score", 0))
-        _log_decision("alert_found", {
-            "ticker": a["ticker"],
-            "action": a["action"],
-            "score": a.get("aggregate_score", 0),
-        })
-    summary["alerts"] = [{"ticker": a["ticker"], "action": a["action"]} for a in alerts]
-
-    # --- Step 3b: Exit intelligence — signal decay and exit signals ---
+    # --- Step 3: Exit intelligence and final risk-adjusted alerts ---
+    summary["exit_signals"] = []
     try:
         from engine.exit_engine import assess_exits
         exit_signals = assess_exits(results, holdings)
@@ -414,14 +560,58 @@ def run_orchestrator(
                 "message": es.message,
                 "score": es.current_score,
             })
+        reconcile_actions_with_exits(results, exit_signals)
+        result_map = {r["ticker"]: r for r in results}
         summary["exit_signals"] = [
-            {"ticker": e.ticker, "name": e.name, "signal_type": e.signal_type,
-             "severity": e.severity, "message": e.message,
-             "current_score": e.current_score, "current_price": e.current_price}
+            exit_signal_to_dict(e, result_map.get(e.ticker))
             for e in exit_signals
         ]
+        for es in exit_signals:
+            r = result_map.get(es.ticker)
+            if r and r.get("_exit_override"):
+                logger.info(
+                    "EXIT RECONCILE: %s %s -> %s "
+                    "(prior=%.3f, exit_score=%.3f, penalty=%.3f, posterior=%.3f)",
+                    es.ticker, r.get("base_action"), r.get("final_action"),
+                    r.get("aggregate_score", 0) or 0,
+                    es.exit_score,
+                    r.get("_exit_penalty", 0) or 0,
+                    r.get("_exit_posterior", 0) or 0,
+                )
     except Exception as e:
         logger.warning("Exit intelligence failed: %s", e)
+
+    # Final alerts should use the post-risk-adjustment action, not the alpha prior.
+    alerts = [r for r in results if r.get("final_action", r.get("action")) in ("SELL", "STRONG SELL")]
+    summary["alerts"] = [
+        {
+            "ticker": a["ticker"],
+            "action": a.get("final_action", a.get("action")),
+            "base_action": a.get("base_action", a.get("action")),
+            "prior_score": a.get("aggregate_score"),
+            "posterior_score": a.get("_exit_posterior"),
+            "exit_score": a.get("exit_score"),
+            "exit_penalty": a.get("_exit_penalty"),
+            "current_price": a.get("current_price"),
+            "structural_stop_loss": a.get("structural_stop_loss", a.get("stop_loss")),
+            "trailing_exit_stop": a.get("trailing_exit_stop"),
+        }
+        for a in alerts
+    ]
+    for a in alerts:
+        logger.info("FINAL ALERT: %s â€” %s (base: %s, prior=%.3f, posterior=%s)",
+                    a["ticker"],
+                    a.get("final_action", a.get("action")),
+                    a.get("base_action", a.get("action")),
+                    a.get("aggregate_score", 0) or 0,
+                    a.get("_exit_posterior", "n/a"))
+        _log_decision("alert_found", {
+            "ticker": a["ticker"],
+            "action": a.get("final_action", a.get("action")),
+            "base_action": a.get("base_action", a.get("action")),
+            "score": a.get("aggregate_score", 0),
+            "posterior_score": a.get("_exit_posterior"),
+        })
 
     # --- Paper trading: log SELL signals ---
     if getattr(config, "PAPER_TRADING_ENABLED", False):
@@ -434,16 +624,18 @@ def run_orchestrator(
                     signal_price=a.get("current_price", 0),
                     quantity=a.get("quantity"),
                     score=a.get("aggregate_score"),
-                    action=a.get("action"),
+                    action=a.get("final_action", a.get("action")),
                 )
             except Exception as e:
                 logger.warning("Paper trading signal log failed for %s: %s", a["ticker"], e)
+
+    _check_timeout("pre_discovery")
 
     # --- Step 4: Discovery (weekly or forced) ---
     if not portfolio_only:
         run_disc = should_run_discovery(state) or force_discovery
         if run_disc:
-            logger.info("Running Global Discovery Engine v2 (expanded universe, may take 60-90 min)...")
+            logger.info("Running Global Discovery Engine v4 (multi-lens, 240 deep-scored, may take 30-60 min)...")
             timeout = getattr(config, "DISCOVERY_TIMEOUT", 900)
             try:
                 disc_result = _run_with_timeout(
@@ -459,56 +651,9 @@ def run_orchestrator(
                     logger.info("Discovery complete: %d candidates in %.1fs",
                                 n_candidates, disc_result.run_time_seconds)
 
-                    # Cache full candidate data for UI auto-display
-                    state["cached_discovery"] = [
-                        {
-                            "ticker": c.ticker,
-                            "name": c.name,
-                            "exchange": c.exchange,
-                            "country": c.country,
-                            "sector": c.sector,
-                            "industry": c.industry,
-                            "market_cap": c.market_cap,
-                            "currency": c.currency,
-                            "aggregate_score": c.aggregate_score,
-                            "technical_score": c.technical_score,
-                            "fundamental_score": c.fundamental_score,
-                            "sentiment_score": c.sentiment_score,
-                            "forecast_score": c.forecast_score,
-                            "action": c.action,
-                            "why": c.why,
-                            "fx_penalty_applied": c.fx_penalty_applied,
-                            "fx_penalty_pct": c.fx_penalty_pct,
-                            "max_correlation": c.max_correlation,
-                            "correlated_with": c.correlated_with,
-                            "sector_weight_if_added": c.sector_weight_if_added,
-                            "portfolio_fit_score": c.portfolio_fit_score,
-                            "momentum_score": c.momentum_score,
-                            "return_90d": c.return_90d,
-                            "return_30d": c.return_30d,
-                            "volume_ratio": c.volume_ratio,
-                            "expected_return_90d": c.expected_return_90d,
-                            "parabolic_penalty": c.parabolic_penalty,
-                            "is_parabolic": c.is_parabolic,
-                            "earnings_near": c.earnings_near,
-                            "earnings_imminent": c.earnings_imminent,
-                            "earnings_days": c.earnings_days,
-                            "cap_tier": c.cap_tier,
-                            "confidence_discount": c.confidence_discount,
-                            "max_weight_scale": c.max_weight_scale,
-                            "final_rank": c.final_rank,
-                        }
-                        for c in disc_result.candidates
-                    ]
-                    state["last_discovery_run"] = datetime.now().isoformat()
+                    # Persist results + record backtest picks (shared with UI button)
+                    save_discovery_results(disc_result, state)
                     summary["discovery_ran"] = True
-
-                    # Record picks for backtest tracking
-                    try:
-                        n_recorded = record_discovery_picks(disc_result.candidates)
-                        logger.info("Recorded %d discovery picks for backtest.", n_recorded)
-                    except Exception as e:
-                        logger.warning("Failed to record discovery picks: %s", e)
 
                     _log_decision("discovery_done", {
                         "screened": disc_result.screened_count,
@@ -530,6 +675,13 @@ def run_orchestrator(
             logger.info("Discovery not scheduled (last run: %s). Using cached results.",
                         state.get("last_discovery_run", "never"))
 
+    try:
+        _check_timeout("post_discovery")
+    except TimeoutError:
+        logger.warning("Timeout after discovery — saving state with results so far.")
+        save_state(state)
+        raise
+
     # --- Step 5: Evaluate swap opportunities ---
     cached = get_cached_discovery(state) if not portfolio_only else []
     swap_recs = _evaluate_swaps(results, cached, state)
@@ -538,7 +690,9 @@ def run_orchestrator(
         for s in swap_recs
     ]
 
+    # Persist cooldowns set during swap evaluation
     if swap_recs:
+        save_state(state)
         for s in swap_recs:
             logger.info("SWAP: Sell %s (%.3f) -> Buy %s (%.3f), delta +%.3f",
                         s["weakest_ticker"], s["weakest_score"],
@@ -582,8 +736,12 @@ def run_orchestrator(
                 except Exception as e:
                     logger.warning("Paper signal (swap BUY) failed for %s: %s", cand["ticker"], e)
 
-    # --- Step 6: Build and send email (only if there are alerts or swaps) ---
-    has_triggers = bool(alerts) or bool(swap_recs)
+    # --- Step 6: Build and send email ---
+    # Always send when discovery ran (user wants confirmation of completion).
+    # Otherwise send only if there are alerts or swap recommendations.
+    discovery_ran = summary.get("discovery_ran", False)
+    has_exit_signals = bool(summary.get("exit_signals"))
+    has_triggers = bool(alerts) or bool(swap_recs) or discovery_ran or has_exit_signals
 
     if has_triggers:
         logger.info("Building alert email (alerts=%d, swaps=%d)...", len(alerts), len(swap_recs))
@@ -591,6 +749,9 @@ def run_orchestrator(
             results, risk_data, position_weights,
             vix_regime, alerts, swap_recs,
             dry_run=dry_run,
+            optimizer_alloc=portfolio_alloc,
+            discovery_candidates=get_cached_discovery(state),
+            exit_signals=summary.get("exit_signals"),
         )
 
         success = send_email(subject, html, dry_run=dry_run)
@@ -683,9 +844,10 @@ def run_orchestrator(
         logger.info("Cached all artifacts for dashboard instant load.")
     except Exception as e:
         logger.warning("Failed to cache artifacts: %s", e)
-
-    # --- Save state ---
-    save_state(state)
+    finally:
+        # Always save state — ensures discovery results, cooldowns, and
+        # portfolio cache are persisted even if artifact caching partially fails
+        save_state(state)
 
     elapsed = round(time.time() - start, 1)
     _log_decision("run_complete", {"elapsed_s": elapsed, "summary": summary})

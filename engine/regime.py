@@ -21,20 +21,32 @@ _vix_cache: pd.Series | None = None
 
 
 def _get_vix_history() -> pd.Series | None:
-    """Fetch VIX close prices for the last VIX_HISTORY_DAYS days.
-
-    Uses a separate cache from get_macro_data() which only fetches 90 days.
-    """
+    """Fetch VIX close prices, reusing the shared macro cache when possible."""
     global _vix_cache
     if _vix_cache is not None:
         return _vix_cache
 
+    # Try shared macro cache first (same 365-day lookback)
+    try:
+        from utils.data_fetch import get_macro_data
+        macro = get_macro_data()
+        if "vix" in macro and not macro["vix"].empty:
+            closes = macro["vix"]["Close"].dropna()
+            if hasattr(closes, "columns"):
+                closes = closes.iloc[:, 0]
+            if len(closes) >= 20:
+                _vix_cache = closes
+                return _vix_cache
+    except Exception:
+        pass
+
+    # Fallback: direct download
     try:
         days = getattr(config, "VIX_HISTORY_DAYS", 365)
-        df = yf.download("^VIX", period=f"{days}d", progress=False, auto_adjust=True)
+        df = yf.download("^VIX", period=f"{days}d", progress=False,
+                         auto_adjust=True, timeout=30)
         if df is not None and not df.empty:
             closes = df["Close"].dropna()
-            # Handle MultiIndex columns from yfinance
             if hasattr(closes, "columns"):
                 closes = closes.iloc[:, 0]
             _vix_cache = closes
