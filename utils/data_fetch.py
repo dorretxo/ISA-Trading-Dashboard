@@ -1,7 +1,7 @@
 """Shared data fetching utilities with session-level caching."""
 
 import json
-import os
+import socket
 import time
 from pathlib import Path
 
@@ -9,6 +9,13 @@ import pandas as pd
 import yfinance as yf
 
 import config
+from utils.atomic_io import atomic_write_json
+
+# Enforce a global socket timeout so that yfinance HTTP calls (which hold the
+# GIL inside C extensions like ssl/urllib3) cannot block indefinitely.  This is
+# the belt-and-suspenders fix for GIL-blocked thread timeouts.
+_SOCKET_TIMEOUT = getattr(config, "SOCKET_TIMEOUT", 45)
+socket.setdefaulttimeout(_SOCKET_TIMEOUT)
 
 # Session-level cache for yfinance data
 _price_cache: dict[str, pd.DataFrame] = {}
@@ -37,12 +44,7 @@ def load_portfolio_full() -> dict:
 def save_portfolio(data: dict) -> None:
     """Atomic write of portfolio data."""
     path = _portfolio_path()
-    tmp = path.with_suffix(".json.tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=4, default=str)
-        f.flush()
-        os.fsync(f.fileno())
-    tmp.replace(path)
+    atomic_write_json(path, data, indent=4, default=str)
 
 
 def record_sale(
@@ -117,6 +119,15 @@ def get_price_history(ticker: str) -> pd.DataFrame:
         # Flatten multi-level columns if present (yfinance sometimes returns them)
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
+        # Drop trailing rows with NaN Close (yfinance returns today's row with
+        # NaN when the market is still open or data isn't available yet).
+        # This prevents downstream ZeroDivisionError / NaN propagation.
+        if "Close" in df.columns:
+            _last_valid = df["Close"].last_valid_index()
+            if _last_valid is not None:
+                df = df.loc[:_last_valid]
+            else:
+                df = pd.DataFrame()
         _price_cache[ticker] = df
     except Exception:
         _price_cache[ticker] = pd.DataFrame()
@@ -138,18 +149,33 @@ def get_ticker_info(ticker: str, timeout: int = 30) -> dict:
     def _fetch():
         return yf.Ticker(ticker).info or {}
 
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
     try:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-            info = pool.submit(_fetch).result(timeout=timeout)
+        info = pool.submit(_fetch).result(timeout=timeout)
+        pool.shutdown(wait=False)
     except concurrent.futures.TimeoutError:
+        pool.shutdown(wait=False)
         import logging
         logging.getLogger(__name__).debug("Ticker info timeout for %s after %ds", ticker, timeout)
         info = {}
     except Exception:
+        pool.shutdown(wait=False)
         info = {}
 
     _info_cache[ticker] = info
     return info
+
+
+def get_cached_ticker_info(ticker: str) -> dict:
+    """Return cached ticker info without making a network call."""
+    return _info_cache.get(ticker, {})
+
+
+def _scalar(val) -> float:
+    """Extract a scalar float from a value that may be a pandas Series or scalar."""
+    if hasattr(val, "item"):
+        return float(val.item())
+    return float(val)
 
 
 def get_current_price(ticker: str) -> float | None:
@@ -157,7 +183,7 @@ def get_current_price(ticker: str) -> float | None:
     df = get_price_history(ticker)
     if df.empty:
         return None
-    return float(df["Close"].iloc[-1])
+    return _scalar(df["Close"].iloc[-1])
 
 
 def get_daily_change(ticker: str) -> float | None:
@@ -165,8 +191,8 @@ def get_daily_change(ticker: str) -> float | None:
     df = get_price_history(ticker)
     if df.empty or len(df) < 2:
         return None
-    latest = float(df["Close"].iloc[-1])
-    previous = float(df["Close"].iloc[-2])
+    latest = _scalar(df["Close"].iloc[-1])
+    previous = _scalar(df["Close"].iloc[-2])
     if previous == 0:
         return None
     return ((latest - previous) / previous) * 100
@@ -188,6 +214,86 @@ def get_macro_data() -> dict[str, pd.DataFrame]:
             pass
 
     return _macro_cache
+
+
+def get_macro_regime_signals() -> dict:
+    """Compute macro regime signals for factor timing (Arnott et al. 2019).
+
+    Returns dict with:
+    - term_spread: 10Y-2Y yield spread (expansion/contraction indicator)
+    - credit_spread_ratio: HY vs IG bond return differential (risk appetite)
+    - regime: "expansion", "contraction", or "neutral"
+    - factor_tilts: recommended factor weight adjustments
+    """
+    extended_tickers = getattr(config, "MACRO_TICKERS_EXTENDED", {})
+    if not extended_tickers:
+        return {"regime": "neutral", "factor_tilts": {}}
+
+    macro_prices: dict[str, float] = {}
+    for name, ticker in extended_tickers.items():
+        try:
+            df = yf.download(ticker, period="5d", progress=False, auto_adjust=True, timeout=15)
+            if not df.empty:
+                if isinstance(df.columns, pd.MultiIndex):
+                    df.columns = df.columns.get_level_values(0)
+                macro_prices[name] = _scalar(df["Close"].iloc[-1])
+        except Exception:
+            pass
+
+    # Term structure: 10Y yield - 2Y yield proxy
+    # ^TNX is in percentage (e.g., 4.5 = 4.5%), ^IRX is 13-week T-bill rate
+    yield_10y = macro_prices.get("bonds_10y", 0)
+    yield_2y = macro_prices.get("bonds_2y", 0)
+    # ^IRX is quoted as yield * 10 (e.g., 45 = 4.5%) — normalize
+    if yield_2y > 20:
+        yield_2y = yield_2y / 10.0
+
+    term_spread = yield_10y - yield_2y if yield_10y and yield_2y else None
+
+    # Credit spread proxy: HYG vs LQD price ratio change (inverse of spread)
+    hyg = macro_prices.get("hy_spread")
+    lqd = macro_prices.get("ig_spread")
+    credit_spread_ratio = (hyg / lqd) if hyg and lqd and lqd > 0 else None
+
+    # Determine regime
+    expansion_threshold = getattr(config, "MACRO_TERM_SPREAD_EXPANSION", 1.0)
+    contraction_threshold = getattr(config, "MACRO_TERM_SPREAD_CONTRACTION", 0.0)
+
+    if term_spread is not None and term_spread > expansion_threshold:
+        regime = "expansion"
+    elif term_spread is not None and term_spread < contraction_threshold:
+        regime = "contraction"
+    else:
+        regime = "neutral"
+
+    # Factor tilts based on regime (Arnott, Harvey, Kalesnik & Linnainmaa 2019)
+    if regime == "expansion":
+        factor_tilts = {
+            "momentum_tilt": 0.10,      # Momentum works in trending markets
+            "investment_tilt": 0.08,     # Low-investment firms outperform in expansions
+            "quality_tilt": -0.05,       # Quality premium compressed
+            "volatility_tilt": -0.05,    # Low-vol underperforms in risk-on
+            "reversal_tilt": -0.03,      # Reversal weaker in trending markets
+        }
+    elif regime == "contraction":
+        factor_tilts = {
+            "momentum_tilt": -0.08,      # Momentum crashes in regime shifts
+            "investment_tilt": -0.03,     # Less discriminating
+            "quality_tilt": 0.12,        # Flight to quality
+            "volatility_tilt": 0.10,     # Low-vol premium spikes
+            "reversal_tilt": 0.05,       # Mean reversion stronger
+        }
+    else:
+        factor_tilts = {}
+
+    return {
+        "term_spread": term_spread,
+        "credit_spread_ratio": credit_spread_ratio,
+        "yield_10y": yield_10y,
+        "yield_2y": yield_2y,
+        "regime": regime,
+        "factor_tilts": factor_tilts,
+    }
 
 
 def get_reddit_posts(ticker: str) -> list[dict]:

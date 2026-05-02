@@ -18,12 +18,14 @@ Public API:
 """
 
 import logging
+import time
 from dataclasses import dataclass
 
 import config
-from utils.data_fetch import get_price_history, get_ticker_info
+from utils.data_fetch import get_cached_ticker_info, get_price_history, get_ticker_info
 
 logger = logging.getLogger(__name__)
+_post_earnings_cache: dict[str, tuple[tuple[bool, int | None, bool, float | None], float]] = {}
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -137,7 +139,12 @@ def _compute_parabolic_penalty(ticker: str, df=None) -> tuple[float, float | Non
         # Additional check: price far above analyst target (if available)
         # A stock trading at 2x+ analyst target is a strong reversion signal
         try:
-            info = get_ticker_info(ticker)
+            info = get_cached_ticker_info(ticker)
+            if not info and getattr(config, "RISK_OVERLAY_LIVE_TARGET_CHECK", False):
+                info = get_ticker_info(
+                    ticker,
+                    timeout=int(getattr(config, "RISK_OVERLAY_INFO_TIMEOUT_SECONDS", 3)),
+                )
             if info:
                 try:
                     target = float(info.get("targetMeanPrice") or 0)
@@ -193,6 +200,12 @@ def _check_post_earnings(ticker: str) -> tuple[bool, int | None, bool, float | N
 
     Returns (post_earnings_recent, days_since, is_miss, miss_pct).
     """
+    ttl = float(getattr(config, "RISK_OVERLAY_POST_EARNINGS_CACHE_TTL", 43200))
+    now = time.time()
+    cached = _post_earnings_cache.get(ticker)
+    if cached and now - cached[1] < ttl:
+        return cached[0]
+
     try:
         import yfinance as yf
         from datetime import datetime, timedelta
@@ -256,11 +269,15 @@ def _check_post_earnings(ticker: str) -> tuple[bool, int | None, bool, float | N
             except Exception:
                 pass
 
-        return post_recent, days_since, is_miss, miss_pct
+        result = (post_recent, days_since, is_miss, miss_pct)
+        _post_earnings_cache[ticker] = (result, now)
+        return result
 
     except Exception as e:
         logger.warning("Post-earnings check failed for %s: %s", ticker, e)
-        return False, None, False, None
+        result = (False, None, False, None)
+        _post_earnings_cache[ticker] = (result, now)
+        return result
 
 
 # ---------------------------------------------------------------------------

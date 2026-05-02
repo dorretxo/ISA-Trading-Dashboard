@@ -6,11 +6,11 @@ State file lives next to portfolio.json in the project root.
 
 import json
 import logging
-import os
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import config
+from utils.atomic_io import atomic_write_text
 
 logger = logging.getLogger(__name__)
 
@@ -71,27 +71,11 @@ def save_state(state: dict) -> None:
         raise ValueError("State dict missing 'version' key — refusing to overwrite")
 
     path = _state_path()
-    tmp = path.with_suffix(".json.tmp")
     try:
         # Serialize to string first — catches non-serializable objects before
         # touching the filesystem.
         payload = json.dumps(state, indent=2, default=str)
-
-        with open(tmp, "w", encoding="utf-8") as f:
-            f.write(payload)
-            f.flush()
-            os.fsync(f.fileno())
-        # Atomic rename with retry — OneDrive sync can hold a lock on the target
-        import time as _time
-        for attempt in range(3):
-            try:
-                tmp.replace(path)
-                break
-            except PermissionError:
-                if attempt < 2:
-                    _time.sleep(0.5)
-                else:
-                    raise
+        atomic_write_text(path, payload)
     except (OSError, TypeError, ValueError) as e:
         logger.error("CRITICAL: Failed to save state: %s", e)
         raise

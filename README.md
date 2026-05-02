@@ -31,11 +31,11 @@ Risk chips surface key warnings inline: earnings proximity, parabolic moves, gov
 Global screening pipeline that finds replacement candidates across NYSE, NASDAQ, and AMEX. Multi-stage funnel:
 
 1. Universe assembly from FMP screener + yfinance global tickers
-2. Multi-lens entry (momentum, value, quality quotas)
-3. Lightweight momentum prescreen
+2. Multi-lens entry (momentum, value, composite prescreen; quality joins once fundamentals are loaded)
+3. Lightweight momentum/value prescreen
 4. Portfolio correlation and sector fit filtering
-5. Full four-pillar deep scoring on top candidates
-6. Final ranking with diversified sector/region selection
+5. Full four-pillar deep scoring on top candidates plus QMJ-style quality metrics
+6. Final ranking with diversified sector balancing and a 30% sector-weight cap
 
 Swap recommendations compare discovery candidates against the weakest current holdings, with hurdle rates and cooldown logic to prevent churn.
 
@@ -58,7 +58,7 @@ Each holding is scored across four pillars with configurable weights:
 | Pillar | Default Weight | Signals |
 |--------|---------------|---------|
 | **Technical** (30%) | Trend/momentum | RSI, MACD, ADX, Williams %R, moving averages, ATR |
-| **Fundamental** (40%) | Value + quality | P/E, PEG, margins, EPS growth, insider activity, dividend safety, balance sheet strength, analyst consensus |
+| **Fundamental** (40%) | Value + quality | P/E, PEG, gross profitability, ROE, FCF/assets, EPS stability, insider activity, dividend safety, balance sheet strength, analyst consensus |
 | **Sentiment** (8%) | News flow | Google News + FinBERT, Reddit retail sentiment, FMP news, recency decay |
 | **Forecast** (22%) | Statistical ensemble | Mixture-of-experts (linear regression, mean reversion, momentum, volatility, macro correlation), multi-horizon |
 

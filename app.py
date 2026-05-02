@@ -21,6 +21,15 @@ from engine.scoring import analyse_portfolio
 from engine.backtest import optimize_weights, _score_to_action
 from utils.data_fetch import clear_cache, load_portfolio, get_ticker_info, get_price_history
 from utils.cache_loader import load_dashboard_data, format_freshness
+from utils.discovery_digest import (
+    build_trade_packet,
+    candidate_entry_stance as shared_candidate_entry_stance,
+    candidate_entry_trigger as shared_candidate_entry_trigger,
+    candidate_readiness_summary as shared_candidate_readiness_summary,
+    discovery_confidence as shared_discovery_confidence,
+    is_top_pick as shared_is_top_pick,
+    sort_trade_packets,
+)
 from utils.safe_numeric import safe_float, is_valid_number, format_currency, format_pct, format_score
 
 # ---------------------------------------------------------------------------
@@ -28,7 +37,7 @@ from utils.safe_numeric import safe_float, is_valid_number, format_currency, for
 # ---------------------------------------------------------------------------
 st.set_page_config(
     page_title="ISA Portfolio Dashboard",
-    page_icon="📊",
+    page_icon=":chart_with_upwards_trend:",
     layout="wide",
 )
 
@@ -204,7 +213,7 @@ div[data-testid="stTabContent"] div[data-testid="stTabs"] > div[data-testid="stT
     font-size: 0.78rem;
 }
 .pillar-label {
-    width: 42px;
+    width: 76px;
     font-weight: 600;
     opacity: 0.7;
     flex-shrink: 0;
@@ -484,6 +493,28 @@ div[data-testid="stTabContent"] div[data-testid="stTabs"] > div[data-testid="stT
 .confidence-chip.medium { background: rgba(59,130,246,0.12); color: #93c5fd; border-color: rgba(59,130,246,0.20); }
 .confidence-chip.low { background: rgba(245,158,11,0.14); color: #fde68a; border-color: rgba(245,158,11,0.22); }
 .confidence-chip.data { background: rgba(107,114,128,0.20); color: #e5e7eb; border-color: rgba(148,163,184,0.18); }
+/* Top Pick highlight */
+.rec-hero.top-pick {
+    border: 2px solid rgba(234, 179, 8, 0.55);
+    background:
+        radial-gradient(circle at top right, rgba(234, 179, 8, 0.12), transparent 38%),
+        linear-gradient(150deg, rgba(15,23,42,0.96), rgba(30,41,59,0.92));
+    box-shadow: 0 16px 32px rgba(15, 23, 42, 0.14), 0 0 0 1px rgba(234, 179, 8, 0.18);
+}
+.top-pick-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.3rem;
+    padding: 0.26rem 0.62rem;
+    border-radius: 999px;
+    font-size: 0.72rem;
+    font-weight: 800;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    background: rgba(234, 179, 8, 0.18);
+    color: #fde68a;
+    border: 1px solid rgba(234, 179, 8, 0.35);
+}
 .exit-card {
     border-radius: 18px;
     padding: 16px 18px;
@@ -566,6 +597,54 @@ _ACTION_COLORS = {
     "STRONG SELL": "#ef4444",
 }
 
+_ACTION_LABELS = {
+    "STRONG BUY": "Ready to buy",
+    "BUY": "Buy candidate",
+    "KEEP": "Hold",
+    "NEUTRAL": "Watch",
+    "MANUAL REVIEW": "Review first",
+    "AVOID": "Avoid for now",
+    "SELL": "Consider trimming",
+    "STRONG SELL": "Exit candidate",
+    "INSUFFICIENT DATA": "Not enough data",
+}
+
+_PILLAR_LABELS = {
+    "technical": "Price trend",
+    "fundamental": "Business quality",
+    "sentiment": "News mood",
+    "forecast": "Model forecast",
+}
+
+_HELP_TEXT = {
+    "opportunity_score": (
+        "A combined score for new ideas. It blends business quality, price trend, "
+        "forecast, and fit with your current holdings. Higher is better, but it is not a guarantee."
+    ),
+    "holding_score": (
+        "The app's current view of a holding after combining price trend, business quality, "
+        "news mood, forecast, and risk checks."
+    ),
+    "price_trend": "Price and volume behavior. Positive means the chart is helping the idea.",
+    "business_quality": "Value, profitability, balance sheet strength, cash flow, and analyst support.",
+    "news_mood": "Recent news and social-market tone. Positive means the latest headlines are supportive.",
+    "model_forecast": "The app's short-term price estimate. Treat it as one input, not a promise.",
+    "confidence": "How complete and reliable the available data is. Low confidence means size down or wait.",
+    "entry_price": "The price area where the app thinks the trade has a better risk/reward.",
+    "stop_loss": "The risk limit. If price reaches this area, the trade idea is probably wrong.",
+    "take_profit": "The first planned upside target.",
+    "reward_risk": "Reward-to-risk. 2.0x means the upside target is twice the planned loss.",
+    "fill_probability": "Estimated chance that the suggested entry price is reached soon.",
+    "position_weight": "Suggested portfolio size for the idea after risk controls.",
+    "portfolio_fit": "How well the idea diversifies your current holdings.",
+    "correlation": "How similarly this stock has moved versus your current holdings.",
+    "beta": "Market sensitivity. 1.0 moves roughly like the market; below 1 is calmer; above 1 is more volatile.",
+    "rsi": "Momentum heat gauge. Below 30 can be washed out; above 70 can be stretched.",
+    "mae": "Average forecast miss. Lower means the forecast has been closer to reality.",
+    "ic": "Information coefficient. It checks whether higher-ranked stocks later did better. Higher is better.",
+    "weight": "Influence in the final score. A higher weight means that input matters more today.",
+}
+
 # ---------------------------------------------------------------------------
 # Cached data helpers
 # ---------------------------------------------------------------------------
@@ -595,9 +674,60 @@ def _format_change(val) -> str:
     return format_pct(val, decimals=2)
 
 
+def _plain_action(action: str) -> str:
+    """Translate engine action codes into trader-facing language."""
+    return _ACTION_LABELS.get(str(action or "").upper(), str(action or "Watch").replace("_", " ").title())
+
+
+def _plain_pillar(pillar: str) -> str:
+    return _PILLAR_LABELS.get(str(pillar or "").lower(), str(pillar or "").replace("_", " ").title())
+
+
+def _help(key: str) -> str:
+    return _HELP_TEXT.get(key, "")
+
+
+def _action_next_step(action: str, stance: str | None = None) -> str:
+    action_code = str(action or "").upper()
+    stance_code = str(stance or "").lower()
+    if stance_code == "watch only" or action_code in {"AVOID", "INSUFFICIENT DATA"}:
+        return "Do not buy yet. Keep it on the watchlist until the warning clears."
+    if stance_code == "pullback preferred":
+        return "Do not chase. Wait for the planned entry price or a cleaner setup."
+    if action_code == "STRONG BUY":
+        return "Ready to consider now if the suggested size and risk limit are acceptable."
+    if action_code == "BUY":
+        return "Buy candidate, but check the entry price and risk limit before acting."
+    if action_code == "KEEP":
+        return "Hold. No fresh action is needed unless your portfolio sizing has changed."
+    if action_code == "SELL":
+        return "Consider trimming or tightening the risk limit."
+    if action_code == "STRONG SELL":
+        return "Exit candidate. Review the sale plan before adding more risk."
+    return "Watch. The setup is not clean enough for a clear buy or sell call."
+
+
 def _render_action_pill(action: str) -> str:
     cls = action.lower().replace(" ", "-")
-    return f'<span class="action-pill action-pill-{cls}">{action}</span>'
+    return f'<span class="action-pill action-pill-{cls}">{_html.escape(_plain_action(action))}</span>'
+
+
+def _render_plain_help() -> None:
+    with st.expander("How to read this dashboard", expanded=False):
+        st.markdown(
+            """
+            **Recommendation** is the plain-English action: ready to buy, hold, watch, trim, or exit.
+
+            **Opportunity score** ranks new ideas after business quality, price trend, model forecast, and portfolio fit are combined.
+
+            **Buy around** is the preferred entry area. **Risk limit** is where the idea is probably wrong. **First target** is the first planned upside level.
+
+            **Reward/risk** compares target upside with planned downside. A 2.0x setup aims for twice as much upside as downside.
+
+            **Confidence** tells you how complete the app's evidence is. Low confidence should mean smaller size, manual review, or no trade.
+            """
+        )
+
 
 
 def _render_score_bar(score: float) -> str:
@@ -616,7 +746,7 @@ def _render_score_bar(score: float) -> str:
 def _render_pillar_bars(tech: float, fund: float, sent: float, fcast: float) -> str:
     """4 mini horizontal score bars for the 4 pillars."""
     rows = ""
-    for label, val in [("Tech", tech), ("Fund", fund), ("Sent", sent), ("Fcast", fcast)]:
+    for label, val in [("Trend", tech), ("Quality", fund), ("News", sent), ("Forecast", fcast)]:
         pct = ((val + 1) / 2) * 100
         pct = max(0, min(100, pct))
         # Color: green for positive, red for negative
@@ -697,18 +827,7 @@ def _render_weight_bar(label: str, weight: float) -> str:
 
 
 def _discovery_confidence(cand) -> tuple[str, str, float]:
-    sent_conf = safe_float(getattr(cand, "sentiment_score", 0))
-    data_discount = safe_float(getattr(cand, "confidence_discount", 1.0), default=1.0)
-    has_data = 0.0 if getattr(cand, "action", "") == "INSUFFICIENT DATA" else 1.0
-    score = max(0.0, min(1.0, 0.35 * has_data + 0.30 * data_discount + 0.35 * (0.5 + 0.5 * max(min(sent_conf, 1.0), -1.0))))
-
-    if getattr(cand, "action", "") == "INSUFFICIENT DATA":
-        return "Data Gap", "data", score
-    if score >= 0.75:
-        return "High Confidence", "high", score
-    if score >= 0.55:
-        return "Medium Confidence", "medium", score
-    return "Watch Carefully", "low", score
+    return shared_discovery_confidence(cand)
 
 
 def _candidate_risk_tags(cand) -> list[str]:
@@ -784,62 +903,26 @@ def _candidate_evidence_tags(cand) -> list[tuple[str, str]]:
     if ret_30 > 10:
         tags.append((f"30d {ret_30:+.1f}%", "good"))
     if fund > 0.15:
-        tags.append((f"Fundamentals {fund:+.2f}", "good"))
+        tags.append((f"Business quality {fund:+.2f}", "good"))
     if tech > 0.15:
-        tags.append((f"Technicals {tech:+.2f}", "good"))
+        tags.append((f"Price trend {tech:+.2f}", "good"))
     if exp_90 > 5:
-        tags.append((f"90d model {exp_90:+.1f}%", "good"))
+        tags.append((f"90d upside {exp_90:+.1f}%", "good"))
     if safe_float(getattr(cand, "volume_ratio", 1.0)) > 1.5:
         tags.append((f"Volume {safe_float(getattr(cand, 'volume_ratio', 1.0)):.1f}x", "info"))
     return tags[:5]
 
 
 def _candidate_entry_stance(cand) -> str:
-    stance = str(getattr(cand, "entry_stance", "") or "").strip()
-    if stance in {"Ready", "Pullback Preferred", "Watch Only"}:
-        return stance
+    return shared_candidate_entry_stance(cand)
 
-    analyst_upside_raw = getattr(cand, "analyst_upside", None)
-    analyst_upside = (
-        safe_float(analyst_upside_raw)
-        if analyst_upside_raw is not None
-        else None
-    )
-    insider_buys = int(safe_float(getattr(cand, "insider_buys", 0), default=0))
-    insider_sells = int(safe_float(getattr(cand, "insider_sells", 0), default=0))
-    return_30d = safe_float(getattr(cand, "return_30d", 0))
 
-    if (
-        getattr(cand, "governance_flag", False)
-        or getattr(cand, "asymmetric_risk_flag", False)
-        or getattr(cand, "earnings_imminent", False)
-        or (
-            getattr(cand, "is_parabolic", False)
-            and analyst_upside is not None
-            and analyst_upside < 0
-        )
-        or (
-            getattr(cand, "near_52w_high", False)
-            and return_30d >= 0.25
-        )
-        or (
-            insider_sells > insider_buys
-            and analyst_upside is not None
-            and analyst_upside < 0
-        )
-    ):
-        return "Watch Only"
+def _candidate_entry_trigger(cand) -> str:
+    return shared_candidate_entry_trigger(cand)
 
-    if (
-        getattr(cand, "is_parabolic", False)
-        or getattr(cand, "near_52w_high", False)
-        or (analyst_upside is not None and analyst_upside < 5)
-        or insider_sells > insider_buys
-        or getattr(cand, "earnings_near", False)
-    ):
-        return "Pullback Preferred"
 
-    return "Ready"
+def _candidate_readiness_summary(cand) -> str:
+    return shared_candidate_readiness_summary(cand)
 
 
 def _entry_stance_tone(stance: str) -> str:
@@ -850,28 +933,45 @@ def _entry_stance_tone(stance: str) -> str:
     }.get(stance, "neutral")
 
 
+def _is_top_pick(cand) -> bool:
+    """True when a candidate meets all four 'Top Pick' criteria simultaneously."""
+    return shared_is_top_pick(cand)
+
+
 def _candidate_is_gated(cand) -> bool:
     return bool(getattr(cand, "ticker_identity_warning", None)) or _candidate_entry_stance(cand) == "Watch Only"
 
 
 def _pick_best_new_opportunity(candidates: list):
     """Return (candidate_or_none, meta, subtitle) for the command-center opportunity card."""
-    verified = [c for c in candidates if not getattr(c, "ticker_identity_warning", None)]
-    ready = [c for c in verified if _candidate_entry_stance(c) == "Ready"]
+    packets = [(cand, build_trade_packet(cand)) for cand in candidates]
+    ready = [item for item in packets if item[1]["trade_ready"]]
     if ready:
-        cand = max(ready, key=lambda c: safe_float(getattr(c, "final_rank", 0)))
+        cand, packet = max(
+            ready,
+            key=lambda item: (
+                safe_float(item[1]["confidence_score"]),
+                safe_float(item[1]["final_rank"]),
+            ),
+        )
         meta = (
-            f"Ready entry · Final rank {safe_float(getattr(cand, 'final_rank', 0)):.3f} "
-            f"· {getattr(cand, 'action', 'NEUTRAL')}"
+            f"Ready to buy | Opportunity score {safe_float(packet['final_rank']):.3f} "
+            f"| {_plain_action(packet['action'])} | {packet['confidence_label']}"
         )
         return cand, meta, _candidate_thesis(cand)
 
-    pullback = [c for c in verified if _candidate_entry_stance(c) == "Pullback Preferred"]
-    if pullback:
-        cand = max(pullback, key=lambda c: safe_float(getattr(c, "final_rank", 0)))
+    clean = [item for item in packets if item[1]["clean_entry"]]
+    if clean:
+        cand, packet = max(
+            clean,
+            key=lambda item: (
+                safe_float(item[1]["confidence_score"]),
+                safe_float(item[1]["final_rank"]),
+            ),
+        )
         meta = (
-            f"Pullback preferred · Final rank {safe_float(getattr(cand, 'final_rank', 0)):.3f} "
-            f"· {getattr(cand, 'action', 'NEUTRAL')}"
+            f"{packet['entry_stance']} | Opportunity score {safe_float(packet['final_rank']):.3f} "
+            f"| {_plain_action(packet['action'])} | {packet['confidence_label']}"
         )
         return cand, meta, _candidate_thesis(cand)
 
@@ -880,7 +980,6 @@ def _pick_best_new_opportunity(candidates: list):
         "No clean entry right now",
         "The current top set is gated by timing or ticker-identity risk, so the dashboard is withholding a fresh entry candidate.",
     )
-
 
 def _candidate_thesis(cand) -> str:
     positives = []
@@ -911,6 +1010,34 @@ def _candidate_thesis(cand) -> str:
     return f"This idea stands out because it {lead}, with no immediate red-flag overlays in the current pass."
 
 
+def _build_discovery_setup_rows(candidates: list) -> list[dict]:
+    """Compact scan surface for trade-ready discovery ideas."""
+    rows = []
+    for packet in sort_trade_packets(candidates)[:10]:
+        rows.append({
+            "Top idea": "Yes" if packet["top_pick"] else "",
+            "Ticker": packet["ticker"],
+            "Recommendation": _plain_action(packet["action"]),
+            "Entry view": packet["entry_stance"],
+            "Ready now": "Yes" if packet["trade_ready"] else "No",
+            "Next trigger": packet["entry_trigger"],
+            "Confidence": f"{packet['confidence_label']} ({packet['confidence_score']:.0%})",
+            "Opportunity score": f"{safe_float(packet['final_rank']):.3f}",
+            "90-day upside": format_pct(safe_float(packet["expected_return_90d"]) * 100),
+            "Buy around": _format_price(packet["entry_price"], packet["currency"]),
+            "Risk limit": _format_price(packet["stop_loss"], packet["currency"]),
+            "First target": _format_price(packet["take_profit"], packet["currency"]),
+            "Reward/risk": f"{safe_float(packet['r_r_ratio']):.1f}x" if packet["r_r_ratio"] else "-",
+            "Entry chance": format_pct(safe_float(packet["fill_probability"]) * 100) if packet["fill_probability"] else "-",
+            "Position": format_pct(safe_float(packet["position_weight"]) * 100, plus_sign=False) if packet["position_weight"] else "-",
+            "Portfolio fit": f"{safe_float(packet['portfolio_fit_score']):.2f}",
+            "Similar to holdings": f"{safe_float(packet['max_correlation']):.2f}",
+            "Main caution": packet["key_risk"] or "-",
+            "Ticker check": "Verify" if packet["identity_warning"] else "OK",
+        })
+    return rows
+
+
 def _render_html_chips(chips: list[tuple[str, str]], class_name: str = "signal-chip") -> str:
     if not chips:
         return ""
@@ -922,7 +1049,7 @@ def _render_html_chips(chips: list[tuple[str, str]], class_name: str = "signal-c
 
 
 def _lens_sorted_candidates(candidates: list, lens: str) -> list:
-    if lens == "Balanced Growth / Downside Protection":
+    if lens == "Balanced growth and downside protection":
         stance_rank = {
             "Ready": 2,
             "Pullback Preferred": 1,
@@ -939,7 +1066,7 @@ def _lens_sorted_candidates(candidates: list, lens: str) -> list:
             ),
             reverse=True,
         )
-    if lens == "Best Diversifiers":
+    if lens == "Best diversifiers":
         return sorted(
             candidates,
             key=lambda c: (
@@ -949,7 +1076,7 @@ def _lens_sorted_candidates(candidates: list, lens: str) -> list:
             ),
             reverse=True,
         )
-    if lens == "Momentum Leaders":
+    if lens == "Trend leaders":
         return sorted(
             candidates,
             key=lambda c: (
@@ -959,7 +1086,7 @@ def _lens_sorted_candidates(candidates: list, lens: str) -> list:
             ),
             reverse=True,
         )
-    if lens == "Value / Quality":
+    if lens == "Value and quality":
         return sorted(
             candidates,
             key=lambda c: (
@@ -996,23 +1123,27 @@ def _render_candidate_detail_card(cand, label: str = "Selected") -> None:
     _geo = _country_flags.get(cand.country, "Global")
     _entry_stance = _candidate_entry_stance(cand)
     _entry_tone = _entry_stance_tone(_entry_stance)
+    _top_pick = _is_top_pick(cand)
     _subtitle = (
-        f"{_geo} · {cand.exchange} · {cand.sector}"
-        + (f" · {format_currency(_mcap / 1e9, 'GBP', decimals=1)}B mcap" if _mcap > 0 else "")
+        f"{_geo} | {cand.exchange} | {cand.sector}"
+        + (f" | {format_currency(_mcap / 1e9, 'GBP', decimals=1)}B mcap" if _mcap > 0 else "")
     )
+    _top_pick_chip = '<span class="top-pick-badge">&#9733; Top Pick</span>' if _top_pick else ''
     _badge_html = (
         f'<div class="badge-row">'
-        f'<span class="signal-badge {_action_tone}">{_html.escape(_action)}</span>'
+        f'{_top_pick_chip}'
+        f'<span class="signal-badge {_action_tone}">{_html.escape(_plain_action(_action))}</span>'
         f'<span class="signal-badge {_entry_tone}">{_html.escape(_entry_stance)}</span>'
         f'<span class="confidence-chip {_conf_tone}">{_html.escape(_conf_label)}</span>'
         f'</div>'
     )
+    _hero_class = "rec-hero top-pick" if _top_pick else "rec-hero"
     st.markdown(
         f"""
-        <div class="rec-hero">
+        <div class="{_hero_class}">
             <div class="rec-rankline">
                 <div class="rec-rank">{_html.escape(label)}</div>
-                <div class="rec-rank">Final Rank {safe_float(cand.final_rank):.3f}</div>
+                <div class="rec-rank">Opportunity score {safe_float(cand.final_rank):.3f}</div>
             </div>
             <div class="rec-title">{_html.escape(cand.ticker)}</div>
             <div class="rec-subtitle">{_html.escape(cand.name)}<br>{_html.escape(_subtitle)}</div>
@@ -1024,11 +1155,53 @@ def _render_candidate_detail_card(cand, label: str = "Selected") -> None:
         """,
         unsafe_allow_html=True,
     )
+    if _action in {"BUY", "STRONG BUY"}:
+        _readiness = _candidate_readiness_summary(cand)
+        if _action == "BUY" or getattr(cand, "ready_contract_status", None) == "FAIL":
+            st.warning(_readiness)
+        else:
+            st.success(_readiness)
+
+    # Action-gate breakdown (Tier 1-4 hard gates) — surface why the action
+    # isn't STRONG BUY at a glance.  The data the user used to fetch from
+    # an external review now lives next to the recommendation.
+    _gate_ceiling = str(getattr(cand, "action_gate_ceiling", "STRONG BUY") or "STRONG BUY")
+    _gate_reasons = list(getattr(cand, "action_gate_reasons", []) or [])
+    _gate_flags = dict(getattr(cand, "action_gate_flags", {}) or {})
+    _limit_price = safe_float(getattr(cand, "limit_price", None), default=None)
+    _limit_method = getattr(cand, "limit_price_method", None)
+
+    if _gate_ceiling != "STRONG BUY" or _gate_reasons:
+        with st.expander("Why not STRONG BUY?", expanded=(_gate_ceiling != "STRONG BUY")):
+            st.caption(f"Gate ceiling: **{_gate_ceiling}** — strictest of Tier 1-4 distress, value, quality, and momentum gates.")
+            if _gate_reasons:
+                for _reason in _gate_reasons[:6]:
+                    st.markdown(f"- {_html.escape(str(_reason))}")
+            if _gate_flags:
+                _failed = [k for k, v in _gate_flags.items() if v == "fail"]
+                _borderline = [k for k, v in _gate_flags.items() if v == "borderline"]
+                if _failed:
+                    st.caption(f"Failed: {', '.join(_failed)}")
+                if _borderline:
+                    st.caption(f"Borderline: {', '.join(_borderline)}")
+            _altman = safe_float(getattr(cand, "altman_z", None), default=None)
+            if _altman is not None:
+                _zone = str(getattr(cand, "altman_zone", "unknown") or "unknown")
+                st.caption(f"Altman Z = {_altman:.2f} ({_zone})")
+
+    if _limit_price and _limit_price > 0:
+        _cur_price = safe_float(getattr(cand, "entry_price", None) or getattr(cand, "current_price", None), default=0.0)
+        _cur = getattr(cand, "currency", "USD")
+        st.info(
+            f"Wait for pullback to **{_format_price(_limit_price, _cur)}** "
+            f"({_limit_method or 'limit'})"
+            + (f" — currently {_format_price(_cur_price, _cur)}" if _cur_price > 0 else "")
+        )
 
     mc1, mc2, mc3 = st.columns(3)
-    mc1.metric("Momentum", f"{safe_float(cand.momentum_score):.2f}")
-    mc2.metric("Fit", f"{safe_float(cand.portfolio_fit_score):.2f}")
-    mc3.metric("90d Model", format_pct(safe_float(getattr(cand, "expected_return_90d", 0)) * 100))
+    mc1.metric("Trend strength", f"{safe_float(cand.momentum_score):.2f}", help=_help("price_trend"))
+    mc2.metric("Portfolio fit", f"{safe_float(cand.portfolio_fit_score):.2f}", help=_help("portfolio_fit"))
+    mc3.metric("90-day upside", format_pct(safe_float(getattr(cand, "expected_return_90d", 0)) * 100), help=_help("model_forecast"))
     st.markdown(
         _render_pillar_bars(
             safe_float(cand.technical_score),
@@ -1044,53 +1217,57 @@ def _render_candidate_detail_card(cand, label: str = "Selected") -> None:
     _tp_p = safe_float(getattr(cand, "take_profit", None))
     _has_plan = _entry_p and _entry_p > 0
     if _has_plan:
-        st.markdown("**Trading Plan**")
+        st.markdown("**Suggested trade plan**")
+        st.caption(_action_next_step(_action, _entry_stance))
         _cur = getattr(cand, "currency", "USD")
         _plan_cols = st.columns(4)
         with _plan_cols[0]:
-            st.metric("Entry Price",
+            st.metric("Buy around",
                       _format_price(_entry_p, _cur),
-                      help=f"Method: {getattr(cand, 'entry_method', 'N/A')}")
+                      help=f"{_help('entry_price')} Method: {getattr(cand, 'entry_method', 'N/A')}")
         with _plan_cols[1]:
-            st.metric("Stop Loss",
+            st.metric("Risk limit",
                       _format_price(_stop_p, _cur) if _stop_p else "N/A",
-                      help=f"Method: {getattr(cand, 'stop_method', 'N/A')}")
+                      help=f"{_help('stop_loss')} Method: {getattr(cand, 'stop_method', 'N/A')}")
         with _plan_cols[2]:
-            st.metric("Take Profit",
+            st.metric("First target",
                       _format_price(_tp_p, _cur) if _tp_p else "N/A",
-                      help=f"Method: {getattr(cand, 'target_method', 'N/A')}")
+                      help=f"{_help('take_profit')} Method: {getattr(cand, 'target_method', 'N/A')}")
         with _plan_cols[3]:
             _rr = safe_float(getattr(cand, "r_r_ratio", None))
-            st.metric("R/R Ratio",
-                      f"{_rr:.1f}x" if _rr and _rr > 0 else "N/A")
-        with st.expander("Entry Details", expanded=False):
+            st.metric("Reward/risk",
+                      f"{_rr:.1f}x" if _rr and _rr > 0 else "N/A",
+                      help=_help("reward_risk"))
+        with st.expander("Entry details", expanded=False):
             _cur = getattr(cand, "currency", "USD")
             _tp_cols = st.columns(4)
             with _tp_cols[0]:
-                st.metric("Entry Price",
+                st.metric("Buy around",
                           _format_price(_entry_p, _cur),
-                          help=f"Method: {getattr(cand, 'entry_method', 'N/A')}")
+                          help=f"{_help('entry_price')} Method: {getattr(cand, 'entry_method', 'N/A')}")
             with _tp_cols[1]:
-                st.metric("Stop Loss",
+                st.metric("Risk limit",
                           _format_price(_stop_p, _cur) if _stop_p else "N/A",
-                          help=f"Method: {getattr(cand, 'stop_method', 'N/A')}")
+                          help=f"{_help('stop_loss')} Method: {getattr(cand, 'stop_method', 'N/A')}")
             with _tp_cols[2]:
-                st.metric("Take Profit",
+                st.metric("First target",
                           _format_price(_tp_p, _cur) if _tp_p else "N/A",
-                          help=f"Method: {getattr(cand, 'target_method', 'N/A')}")
+                          help=f"{_help('take_profit')} Method: {getattr(cand, 'target_method', 'N/A')}")
             with _tp_cols[3]:
                 _rr = safe_float(getattr(cand, "r_r_ratio", None))
-                st.metric("R/R Ratio",
-                          f"{_rr:.1f}x" if _rr and _rr > 0 else "N/A")
+                st.metric("Reward/risk",
+                          f"{_rr:.1f}x" if _rr and _rr > 0 else "N/A",
+                          help=_help("reward_risk"))
 
             _tp_cols2 = st.columns(4)
             with _tp_cols2[0]:
                 _fill = safe_float(getattr(cand, "fill_probability", None))
-                st.metric("Fill Prob.",
-                          format_pct(_fill * 100) if _fill else "N/A")
+                st.metric("Entry chance",
+                          format_pct(_fill * 100) if _fill else "N/A",
+                          help=_help("fill_probability"))
             with _tp_cols2[1]:
                 _sdp = safe_float(getattr(cand, "stop_distance_pct", None))
-                st.metric("Stop Distance",
+                st.metric("Risk distance",
                           format_pct(_sdp) if _sdp else "N/A")
             with _tp_cols2[2]:
                 _shares = getattr(cand, "position_size_shares", 0) or 0
@@ -1099,8 +1276,9 @@ def _render_candidate_detail_card(cand, label: str = "Selected") -> None:
                           help=_size_method.replace("_", " "))
             with _tp_cols2[3]:
                 _pw = safe_float(getattr(cand, "position_weight", 0))
-                st.metric("Position Weight",
-                          format_pct(_pw * 100) if _pw > 0 else "N/A")
+                st.metric("Suggested size",
+                          format_pct(_pw * 100) if _pw > 0 else "N/A",
+                          help=_help("position_weight"))
 
             # Entry zone + support levels
             _support = getattr(cand, "support_levels", {}) or {}
@@ -1123,14 +1301,14 @@ def _render_candidate_detail_card(cand, label: str = "Selected") -> None:
                     _info_parts.append(
                         f"{_sk}: {_format_price(_sv.get('price', 0), _cur)} "
                         f"({_sv.get('distance_pct', 0):.1f}% below)")
-                st.caption(" · ".join(_info_parts))
+                st.caption(" | ".join(_info_parts))
 
-    with st.expander("Why this ranked here"):
+    with st.expander("Why this is on the list"):
         st.markdown(f"**Thesis:** {_candidate_thesis(cand)}")
-        st.caption(f"**System rationale:** {cand.why}")
+        st.caption(f"**Model notes:** {cand.why}")
         st.caption(
-            f"Momentum: {format_pct(safe_float(getattr(cand, 'return_90d', 0)) * 100)} over 90d · "
-            f"{format_pct(safe_float(getattr(cand, 'return_30d', 0)) * 100)} over 30d · "
+            f"Trend: {format_pct(safe_float(getattr(cand, 'return_90d', 0)) * 100)} over 90d | "
+            f"{format_pct(safe_float(getattr(cand, 'return_30d', 0)) * 100)} over 30d | "
             f"volume {safe_float(getattr(cand, 'volume_ratio', 1.0)):.1f}x"
         )
         if cand.fx_penalty_applied:
@@ -1159,13 +1337,13 @@ def _exit_card_tags(exit_signal: dict) -> list[tuple[str, str]]:
     final_action = exit_signal.get("final_action")
 
     if is_valid_number(score):
-        chips.append((f"Score {format_score(score)}", "info"))
+        chips.append((f"Holding score {format_score(score)}", "info"))
     if is_valid_number(price):
         chips.append((f"Price {format_currency(price, currency)}", "info"))
     if base_action:
-        chips.append((f"Alpha {base_action}", "info"))
+        chips.append((f"Before risk checks {_plain_action(base_action)}", "info"))
     if final_action and final_action != base_action:
-        chips.append((f"Final {final_action}", "risk"))
+        chips.append((f"Final {_plain_action(final_action)}", "risk"))
     if is_valid_number(structural_stop):
         chips.append((f"Structural {format_currency(structural_stop, currency)}", "warn"))
     if is_valid_number(trailing_stop):
@@ -1199,13 +1377,13 @@ def _exit_override_html(exit_signal: dict) -> str:
         return ""
     action_txt = ""
     if base_action and final_action:
-        action_txt = f"{_html.escape(str(base_action))} &rarr; {_html.escape(str(final_action))} &bull; "
+        action_txt = f"{_html.escape(_plain_action(str(base_action)))} -> {_html.escape(_plain_action(str(final_action)))} | "
     return (
         '<div style="font-size:12px;color:#94a3b8;margin-top:6px;">'
-        f'{action_txt}Prior {safe_float(prior):+.3f} &bull; '
-        f'Exit {safe_float(exit_score):.3f} &bull; '
-        f'Penalty {safe_float(penalty):+.3f} &bull; '
-        f'Posterior {safe_float(posterior):+.3f}'
+        f'{action_txt}Before risk checks {safe_float(prior):+.3f} | '
+        f'Exit warning {safe_float(exit_score):.3f} | '
+        f'Risk penalty {safe_float(penalty):+.3f} | '
+        f'After risk checks {safe_float(posterior):+.3f}'
         '</div>'
     )
 
@@ -1213,27 +1391,28 @@ def _exit_override_html(exit_signal: dict) -> str:
 # ---------------------------------------------------------------------------
 # Header
 # ---------------------------------------------------------------------------
-st.markdown("## 📊 ISA Portfolio Dashboard")
-st.caption("Multi-factor analysis engine — Technical · Fundamental · Sentiment · MoE Forecast")
+st.markdown("## Portfolio command centre")
+st.caption("Plain-English buy, hold, trim, and watchlist recommendations for your ISA portfolio.")
+_render_plain_help()
 
 # ---------------------------------------------------------------------------
 # Sidebar
 # ---------------------------------------------------------------------------
 with st.sidebar:
-    st.markdown("### Controls")
+    st.markdown("### What to do")
 
     # Refresh triggers live recomputation; normal load uses cache
-    _force_refresh = st.button("🔄 Refresh Analysis", use_container_width=True, type="primary")
+    _force_refresh = st.button("Refresh recommendations", use_container_width=True, type="primary")
     if _force_refresh:
         clear_cache()
 
     st.divider()
 
-    # Scoring weights — visual bars
-    st.markdown("**Scoring Weights**")
+    # Scoring weights: plain-English model mix bars.
+    st.markdown("**Model mix**")
     weight_html = ""
     for pillar, w in config.WEIGHTS.items():
-        weight_html += _render_weight_bar(pillar.title(), w)
+        weight_html += _render_weight_bar(_plain_pillar(pillar), w)
     st.markdown(weight_html, unsafe_allow_html=True)
 
     st.divider()
@@ -1241,13 +1420,14 @@ with st.sidebar:
     # Sort & Filter
     sort_option = st.selectbox(
         "Sort by",
-        ["Score ↓", "Score ↑", "P&L % ↓", "P&L % ↑", "Ticker A-Z"],
+        ["Best score first", "Lowest score first", "Best gain first", "Worst gain first", "Ticker A-Z"],
         index=0,
     )
     action_filter = st.multiselect(
-        "Filter by Final Action",
+        "Show only these recommendations",
         ["STRONG BUY", "BUY", "KEEP", "SELL", "STRONG SELL"],
         default=[],
+        format_func=_plain_action,
     )
 
     st.divider()
@@ -1262,16 +1442,16 @@ with st.sidebar:
             remaining = get_remaining_budget()
             today_calls = get_calls_today()
             plan = getattr(config, "FMP_PLAN", "free").title()
-            st.markdown(f":green_circle: **FMP {plan}** — {remaining}/min avail · {today_calls} today")
+            st.markdown(f":green_circle: **FMP {plan}** - {remaining}/min available, {today_calls} today")
         elif config.FMP_API_KEY:
-            st.markdown(":orange_circle: **FMP** — Rate limit reached")
+            st.markdown(":orange_circle: **FMP** - Rate limit reached")
         else:
-            st.markdown(":red_circle: **FMP** — Not configured")
+            st.markdown(":red_circle: **FMP** - Not configured")
     except ImportError:
-        st.markdown(":red_circle: **FMP** — Not available")
+        st.markdown(":red_circle: **FMP** - Not available")
 
     st.divider()
-    st.caption("Data: yfinance + FMP · News: Google RSS + Reddit + FMP · Sentiment: FinBERT")
+    st.caption("Prices from Yahoo Finance. Fundamentals and news from FMP when available.")
     st.caption("Record sales below in the Trade History section.")
 
 # ---------------------------------------------------------------------------
@@ -1306,7 +1486,7 @@ if _regime:
     _regime_icon = _regime_colors_map.get(_regime.get("regime_label", ""), "⚪")
     _freshness_parts.append(f"Regime: {_regime_icon} {_regime.get('regime_label', 'N/A')}")
 
-st.caption(" · ".join(_freshness_parts))
+st.caption(" | ".join(_freshness_parts))
 if _dash.from_cache and not results:
     st.warning("No cached data available. Click **Refresh Analysis** to run the first analysis.")
     st.stop()
@@ -1349,16 +1529,16 @@ avg_score = np.mean([r["aggregate_score"] for r in results]) if results else 0
 # Action counts
 action_counts = {}
 for a in ["STRONG BUY", "BUY", "KEEP", "SELL", "STRONG SELL"]:
-    action_counts[a] = sum(1 for r in results if r["action"] == a)
+    action_counts[a] = sum(1 for r in results if r.get("final_action", r.get("action")) == a)
 
 # ---------------------------------------------------------------------------
 # TOP-LEVEL TAB NAVIGATION
 # ---------------------------------------------------------------------------
 tab_dashboard, tab_holdings, tab_discovery, tab_analytics = st.tabs([
-    "📊 Dashboard",
-    f"💼 Holdings ({len(results)})",
-    "🔍 Discovery",
-    "📈 Analytics",
+    "Dashboard",
+    f"Holdings ({len(results)})",
+    "New ideas",
+    "Learning and backtest",
 ])
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1382,14 +1562,14 @@ with tab_dashboard:
             f'{pl_sign}{format_currency(abs(total_pl), "GBP", decimals=0)} ({format_pct(total_pl_pct)})</div>',
             unsafe_allow_html=True,
         )
-        st.caption("Total portfolio value · unrealised P&L")
+        st.caption("Total portfolio value | unrealised gain/loss")
 
         # Best / worst performer
         if per_holding_pl:
             best = max(per_holding_pl, key=lambda x: x[2])
             worst = min(per_holding_pl, key=lambda x: x[2])
             st.markdown(
-                f"**Best:** {best[0]} ({format_pct(safe_float(best[2]))}) · "
+                f"**Best:** {best[0]} ({format_pct(safe_float(best[2]))}) | "
                 f"**Worst:** {worst[0]} ({format_pct(safe_float(worst[2]))})"
             )
 
@@ -1401,7 +1581,7 @@ with tab_dashboard:
         for action_name in ["STRONG BUY", "BUY", "KEEP", "SELL", "STRONG SELL"]:
             cnt = action_counts[action_name]
             if cnt > 0:
-                donut_labels.append(action_name)
+                donut_labels.append(_plain_action(action_name))
                 donut_values.append(cnt)
                 donut_colors.append(_ACTION_COLORS[action_name])
 
@@ -1425,7 +1605,12 @@ with tab_dashboard:
                     x=0.5, y=0.5, font_size=16, showarrow=False,
                 )],
             )
-            st.plotly_chart(fig_donut, use_container_width=True, config={"displayModeBar": False})
+            st.plotly_chart(
+                fig_donut,
+                use_container_width=True,
+                config={"displayModeBar": False},
+                key="portfolio_action_donut_chart",
+            )
 
     # Action count cards
     act_cols = st.columns(5)
@@ -1434,7 +1619,7 @@ with tab_dashboard:
         ("SELL", "#f59e0b"), ("STRONG SELL", "#ef4444"),
     ]):
         cnt = action_counts[action_name]
-        act_cols[i].metric(action_name, cnt)
+        act_cols[i].metric(_plain_action(action_name), cnt)
 
     # Portfolio health gauge
     gauge_fig = go.Figure(go.Indicator(
@@ -1452,16 +1637,21 @@ with tab_dashboard:
             ],
             threshold=dict(line=dict(color="white", width=2), thickness=0.8, value=avg_score),
         ),
-        title=dict(text="Portfolio Health", font=dict(size=14)),
+        title=dict(text="Portfolio recommendation score", font=dict(size=14)),
     ))
     gauge_fig.update_layout(**{**_PLOTLY_LAYOUT, "margin": dict(l=30, r=30, t=50, b=10)}, height=160)
-    st.plotly_chart(gauge_fig, use_container_width=True, config={"displayModeBar": False})
+    st.plotly_chart(
+        gauge_fig,
+        use_container_width=True,
+        config={"displayModeBar": False},
+        key="portfolio_health_gauge_chart",
+    )
 
     # ---------------------------------------------------------------------------
     # Portfolio Risk Analysis
     # ---------------------------------------------------------------------------
     if risk_data and risk_data.get("sector_weights"):
-        with st.expander("🛡️ **Portfolio Risk Analysis**", expanded=bool(risk_data.get("concentration_warnings"))):
+        with st.expander("Portfolio risk check", expanded=bool(risk_data.get("concentration_warnings"))):
             risk_col1, risk_col2 = st.columns(2)
 
             # Sector allocation pie chart
@@ -1479,10 +1669,15 @@ with tab_dashboard:
                     sector_fig.update_layout(
                         **{**_PLOTLY_LAYOUT, "margin": dict(l=10, r=10, t=35, b=10)},
                         height=300,
-                        title=dict(text="Sector Allocation", font=dict(size=14)),
+                        title=dict(text="Sector mix", font=dict(size=14)),
                         showlegend=False,
                     )
-                    st.plotly_chart(sector_fig, use_container_width=True, config={"displayModeBar": False})
+                    st.plotly_chart(
+                        sector_fig,
+                        use_container_width=True,
+                        config={"displayModeBar": False},
+                        key="portfolio_sector_allocation_chart",
+                    )
 
             # Correlation heatmap
             with risk_col2:
@@ -1498,10 +1693,15 @@ with tab_dashboard:
                     corr_fig.update_layout(
                         **{**_PLOTLY_LAYOUT, "margin": dict(l=10, r=10, t=35, b=10)},
                         height=300,
-                        title=dict(text="Return Correlations (90d)", font=dict(size=14)),
+                        title=dict(text="How similarly holdings moved (90d)", font=dict(size=14)),
                         coloraxis_showscale=False,
                     )
-                    st.plotly_chart(corr_fig, use_container_width=True, config={"displayModeBar": False})
+                    st.plotly_chart(
+                        corr_fig,
+                        use_container_width=True,
+                        config={"displayModeBar": False},
+                        key="portfolio_correlation_heatmap",
+                    )
 
             # Risk warnings
             warnings = risk_data.get("concentration_warnings", [])
@@ -1509,11 +1709,11 @@ with tab_dashboard:
 
             if warnings:
                 for w in warnings:
-                    st.warning(f"⚠️ {w}")
+                    st.warning(w)
 
             if high_corrs:
-                corr_strs = [f"{t1}↔{t2} ({c:+.2f})" for t1, t2, c in high_corrs[:5]]
-                st.info(f"📊 Highly correlated pairs: {', '.join(corr_strs)}")
+                corr_strs = [f"{t1}<->{t2} ({c:+.2f})" for t1, t2, c in high_corrs[:5]]
+                st.info(f"Holdings moving very similarly: {', '.join(corr_strs)}")
 
             # Risk score
             risk_score = risk_data.get("risk_score", 0)
@@ -1521,11 +1721,68 @@ with tab_dashboard:
             risk_color = "#10b981" if risk_score < 0.3 else "#f59e0b" if risk_score < 0.6 else "#ef4444"
             st.markdown(
                 f'<div style="text-align:center; padding:8px;">'
-                f'<span style="font-size:1.1rem; font-weight:600;">Portfolio Risk Score: </span>'
+                f'<span style="font-size:1.1rem; font-weight:600;">Portfolio risk score: </span>'
                 f'<span style="font-size:1.3rem; font-weight:700; color:{risk_color};">'
                 f'{risk_score:.0%} ({risk_label})</span></div>',
                 unsafe_allow_html=True,
             )
+
+            # ── Institutional Risk Metrics (VaR/ES/β/stress) ────────────
+            _var_es = risk_data.get("var_es") or {}
+            _beta_info = risk_data.get("beta") or {}
+            _stress = risk_data.get("stress_scenarios") or []
+            _worst = risk_data.get("worst_stress")
+
+            if _var_es or _beta_info or _stress:
+                st.markdown("##### Downside risk numbers")
+                _rc1, _rc2, _rc3, _rc4 = st.columns(4)
+                _v = _var_es.get("var_1d")
+                _e = _var_es.get("es_1d")
+                _va = _var_es.get("vol_annual")
+                _b = _beta_info.get("beta")
+                _rc1.metric(
+                    "Bad-day loss",
+                    f"{_v*100:+.2f}%" if _v is not None else "-",
+                    help="A historical estimate of a poor one-day move. Roughly 1 day in 20 may be worse.",
+                )
+                _rc2.metric(
+                    "Worst-day average",
+                    f"{_e*100:+.2f}%" if _e is not None else "-",
+                    help="Average loss across the worst historical days in the sample.",
+                )
+                _rc3.metric(
+                    "Annual volatility",
+                    f"{_va*100:.1f}%" if _va is not None else "-",
+                    help="How much the portfolio has typically moved over a year, based on daily returns.",
+                )
+                _rc4.metric(
+                    f"Market sensitivity vs {_beta_info.get('benchmark','SPY')}",
+                    f"{_b:.2f}" if _b is not None else "-",
+                    help=_help("beta"),
+                )
+
+                if _stress:
+                    _sc_rows = [
+                        {
+                            "Scenario": s["name"],
+                            "Window": s["window"],
+                            "Portfolio": f"{s['portfolio_return']*100:+.1f}%",
+                            "Worst Name": s.get("worst_name") or "-",
+                            "Worst Return": (
+                                f"{s['worst_return']*100:+.1f}%"
+                                if s.get("worst_return") is not None else "-"
+                            ),
+                            "Coverage": f"{s['coverage']*100:.0f}%",
+                        }
+                        for s in _stress
+                    ]
+                    st.caption("**Historical stress replays** - how the current portfolio would have behaved in past selloffs.")
+                    st.dataframe(_sc_rows, use_container_width=True, hide_index=True)
+                    if _worst and _worst.get("portfolio_return", 0) < -0.15:
+                        st.warning(
+                            f"Worst historical replay '{_worst['name']}': "
+                            f"{_worst['portfolio_return']*100:+.1f}% on current book."
+                        )
 
     # ---------------------------------------------------------------------------
     # Exit Intelligence (from cache or live)
@@ -1547,17 +1804,17 @@ with tab_dashboard:
         _severity_icons = {"urgent": "🔴", "action_needed": "🟡", "warning": "⚪"}
 
         with st.expander(
-            f"🚪 **Exit Intelligence** ({len(_exit_list)} signals)"
-            + (f" · {format_freshness(_dash.exit_signals_timestamp)}" if _dash.exit_signals_timestamp else ""),
+            f"Exit review ({len(_exit_list)} warnings)"
+            + (f" | {format_freshness(_dash.exit_signals_timestamp)}" if _dash.exit_signals_timestamp else ""),
             expanded=any(e.get("severity") == "urgent" for e in _exit_list),
         ):
-            st.markdown("#### Exit Command Center")
+            st.markdown("#### Exit review")
             _urgent_count = sum(1 for e in _exit_list if e.get("severity") == "urgent")
             _action_count = sum(1 for e in _exit_list if e.get("severity") == "action_needed")
             _warning_count = sum(1 for e in _exit_list if e.get("severity") == "warning")
             ec1, ec2, ec3 = st.columns(3)
             ec1.metric("Urgent", _urgent_count)
-            ec2.metric("Action Needed", _action_count)
+            ec2.metric("Action needed", _action_count)
             ec3.metric("Watchlist", _warning_count)
 
             _sorted_exit = sorted(
@@ -1570,9 +1827,9 @@ with tab_dashboard:
             for _card_exit in _sorted_exit:
                 _sev = _card_exit.get("severity", "warning")
                 _card_cls = "urgent" if _sev == "urgent" else "action" if _sev == "action_needed" else "warning"
-                _sev_label = "Urgent" if _sev == "urgent" else "Action Needed" if _sev == "action_needed" else "Watch"
+                _sev_label = "Urgent" if _sev == "urgent" else "Action needed" if _sev == "action_needed" else "Watch"
                 _title = _html.escape(_card_exit.get("ticker", ""))
-                _subtitle = _html.escape(_card_exit.get("name", "")) + " · " + _html.escape(
+                _subtitle = _html.escape(_card_exit.get("name", "")) + " | " + _html.escape(
                     _card_exit.get("signal_type", "").replace("_", " ").title()
                 )
                 _message = _html.escape(_card_exit.get("message", ""))
@@ -1611,7 +1868,7 @@ with tab_dashboard:
     # Suggested Allocation (Inverse-Volatility)
     # ---------------------------------------------------------------------------
     if position_weights:
-        with st.expander("⚖️ **Suggested Allocation (Inverse-Volatility)**"):
+        with st.expander("Suggested position sizes"):
             alloc_tickers = [pw["ticker"] for pw in position_weights]
             alloc_current = [pw["current_weight"] * 100 for pw in position_weights]
             alloc_suggested = [pw["suggested_weight"] * 100 for pw in position_weights]
@@ -1634,12 +1891,17 @@ with tab_dashboard:
             alloc_fig.update_layout(
                 **{**_PLOTLY_LAYOUT, "margin": dict(l=40, r=10, t=35, b=10)},
                 barmode="group",
-                yaxis_title="Weight %",
+                yaxis_title="Portfolio %",
                 height=300,
-                title=dict(text="Current vs Suggested Allocation", font=dict(size=14)),
+                title=dict(text="Current vs suggested position size", font=dict(size=14)),
                 legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
             )
-            st.plotly_chart(alloc_fig, use_container_width=True, config={"displayModeBar": False})
+            st.plotly_chart(
+                alloc_fig,
+                use_container_width=True,
+                config={"displayModeBar": False},
+                key="portfolio_allocation_comparison_chart",
+            )
 
             # Rebalance table
             alloc_df = pd.DataFrame([
@@ -1655,11 +1917,15 @@ with tab_dashboard:
             st.dataframe(alloc_df, hide_index=True, use_container_width=True)
 
     # ---------------------------------------------------------------------------
-    # Portfolio Optimizer (Mean-Variance) — from cache or live
+    # Portfolio Optimizer (Ensemble) — from cache or live
     # ---------------------------------------------------------------------------
     _opt_data = _dash.cached_optimizer
     if _opt_data and _opt_data.get("holdings"):
-        _opt_title = "🎯 **Portfolio Optimizer (Mean-Variance)**"
+        _per_method_w = _opt_data.get("per_method_weights") or {}
+        _method_w = _opt_data.get("method_weights") or {}
+        _history_runs = int(_opt_data.get("history_run_count") or 0)
+        _is_ensemble = bool(_method_w)
+        _opt_title = "🎯 **Portfolio Optimizer (Ensemble)**" if _is_ensemble else "🎯 **Portfolio Optimizer (Mean-Variance)**"
         if _dash.optimizer_timestamp:
             _opt_title += f" · {format_freshness(_dash.optimizer_timestamp)}"
         with st.expander(_opt_title, expanded=False):
@@ -1670,8 +1936,68 @@ with tab_dashboard:
             oc4.metric("Turnover", format_pct(safe_float(_opt_data['turnover']) * 100, plus_sign=False))
 
             _regime_label = (_regime or {}).get("regime_label", "NEUTRAL") if _regime else "N/A"
-            st.caption(f"Risk-free rate: {safe_float(_opt_data.get('risk_free_rate', 0))*100:.1f}% | "
-                       f"Regime: {_regime_label} | Method: {_opt_data.get('method', 'N/A')}")
+            _mu_ver = _opt_data.get("mu_version", "legacy")
+            _cov_m = _opt_data.get("cov_method", "lw_ewma")
+            st.caption(
+                f"Risk-free rate: {safe_float(_opt_data.get('risk_free_rate', 0))*100:.1f}% | "
+                f"Regime: {_regime_label} | μ: {_mu_ver} | Σ: {_cov_m} | "
+                f"Method: {_opt_data.get('method', 'N/A')}"
+            )
+
+            # Ensemble method weights (Sharpe-realised combiner)
+            if _is_ensemble:
+                _method_labels = {
+                    "mean_variance": "Mean-Variance",
+                    "min_variance": "Min Variance",
+                    "risk_parity": "Risk Parity",
+                    "black_litterman": "Black-Litterman",
+                    "hrp": "HRP",
+                }
+                _mw_items = sorted(_method_w.items(), key=lambda kv: -safe_float(kv[1]))
+                _mw_rows = [
+                    {
+                        "Method": _method_labels.get(m, m),
+                        "Weight": format_pct(safe_float(w) * 100, plus_sign=False),
+                    }
+                    for m, w in _mw_items
+                ]
+                st.markdown("**Ensemble method weights**")
+                st.caption(
+                    f"Ensemble of {len(_mw_items)} methods - weights from realised Sharpe over {_history_runs} runs"
+                )
+
+                _mw_colors = ["#10b981", "#3b82f6", "#f59e0b", "#ef4444", "#8b5cf6"]
+                _mw_fig = go.Figure()
+                for i, (m, w) in enumerate(_mw_items):
+                    _mw_fig.add_trace(go.Bar(
+                        name=_method_labels.get(m, m),
+                        y=["Ensemble"],
+                        x=[safe_float(w) * 100],
+                        orientation="h",
+                        marker_color=_mw_colors[i % len(_mw_colors)],
+                        text=[format_pct(safe_float(w) * 100, plus_sign=False)],
+                        textposition="inside",
+                    ))
+                _mw_fig.update_layout(
+                    **{**_PLOTLY_LAYOUT, "margin": dict(l=20, r=10, t=20, b=10)},
+                    barmode="stack",
+                    height=180,
+                    xaxis_title="Method weight %",
+                    yaxis_title="",
+                    showlegend=True,
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+                )
+
+                mwc1, mwc2 = st.columns([1.6, 1.0])
+                with mwc1:
+                    st.plotly_chart(
+                        _mw_fig,
+                        use_container_width=True,
+                        config={"displayModeBar": False},
+                        key="portfolio_optimizer_method_weights_chart",
+                    )
+                with mwc2:
+                    st.dataframe(pd.DataFrame(_mw_rows), hide_index=True, use_container_width=True)
 
             for w in _opt_data.get("warnings", []):
                 st.info(w)
@@ -1696,10 +2022,15 @@ with tab_dashboard:
             _opt_fig.update_layout(
                 **{**_PLOTLY_LAYOUT, "margin": dict(l=40, r=10, t=35, b=10)},
                 barmode="group", yaxis_title="Weight %", height=300,
-                title=dict(text="Current vs Mean-Variance Optimal Allocation", font=dict(size=14)),
+                title=dict(text="Current vs Ensemble Target Allocation", font=dict(size=14)),
                 legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
             )
-            st.plotly_chart(_opt_fig, use_container_width=True, config={"displayModeBar": False})
+            st.plotly_chart(
+                _opt_fig,
+                use_container_width=True,
+                config={"displayModeBar": False},
+                key="portfolio_optimizer_allocation_chart",
+            )
 
             # Per-holding table
             _opt_rows = pd.DataFrame([{
@@ -1714,6 +2045,31 @@ with tab_dashboard:
                 "FX Cost": format_pct(safe_float(h['fx_cost_if_rebalanced']) * 100, decimals=2, plus_sign=False) if safe_float(h.get("fx_cost_if_rebalanced", 0)) > 0 else "—",
             } for h in _opt_h])
             st.dataframe(_opt_rows, hide_index=True, use_container_width=True)
+
+            # Per-method comparison (ensemble only)
+            if _is_ensemble and _per_method_w:
+                _method_col_labels = {
+                    "mean_variance": "MV",
+                    "min_variance": "MinVar",
+                    "risk_parity": "RP",
+                    "black_litterman": "BL",
+                    "hrp": "HRP",
+                }
+                _per_method_rows = []
+                for h in _opt_h:
+                    _t = h["ticker"]
+                    _row = {
+                        "Ticker": _t,
+                        "Current": format_pct(safe_float(h["current_weight"]) * 100, plus_sign=False),
+                    }
+                    _pm = _per_method_w.get(_t, {}) or {}
+                    for m, lbl in _method_col_labels.items():
+                        if m in _pm:
+                            _row[lbl] = format_pct(safe_float(_pm[m]) * 100, plus_sign=False)
+                    _row["Ensemble"] = format_pct(safe_float(h["optimal_weight"]) * 100, plus_sign=False)
+                    _per_method_rows.append(_row)
+                st.markdown("**Per-method weights** — side-by-side comparison")
+                st.dataframe(pd.DataFrame(_per_method_rows), hide_index=True, use_container_width=True)
 
             # Rebalance trades
             _trades = _opt_data.get("rebalance_trades", [])
@@ -1768,19 +2124,66 @@ with tab_holdings:
         r["_pl_pct"] = ((_cp - _ap) / _ap * 100) if (_cp and _ap and _ap > 0) else 0
 
     sort_map = {
-        "Score ↓": (lambda r: r["aggregate_score"], True),
-        "Score ↑": (lambda r: r["aggregate_score"], False),
-        "P&L % ↓": (lambda r: r["_pl_pct"], True),
-        "P&L % ↑": (lambda r: r["_pl_pct"], False),
+        "Best score first": (lambda r: r["aggregate_score"], True),
+        "Lowest score first": (lambda r: r["aggregate_score"], False),
+        "Best gain first": (lambda r: r["_pl_pct"], True),
+        "Worst gain first": (lambda r: r["_pl_pct"], False),
         "Ticker A-Z": (lambda r: r["ticker"], False),
     }
     sort_key, sort_reverse = sort_map.get(sort_option, (lambda r: r["aggregate_score"], True))
     filtered_results.sort(key=sort_key, reverse=sort_reverse)
 
     # ---------------------------------------------------------------------------
+    # Holdings Summary Table — dense scan surface before the cards
+    # ---------------------------------------------------------------------------
+    _exit_list_for_holdings = _dash.cached_exit_signals or []
+    _exit_by_ticker = {e.get("ticker"): e for e in _exit_list_for_holdings}
+
+    if filtered_results:
+        def _conf_label(c):
+            if c is None:
+                return "-"
+            if c >= 0.75:
+                return f"High ({c:.0%})"
+            if c >= 0.55:
+                return f"Medium ({c:.0%})"
+            return f"Low ({c:.0%})"
+
+        _summary_rows = []
+        for _r in filtered_results:
+            _cp_ = _r.get("current_price")
+            _ap_ = _r.get("avg_buy_price")
+            _pl_pct_ = ((_cp_ - _ap_) / _ap_ * 100) if (_cp_ and _ap_ and _ap_ > 0) else None
+            _fin_ = _r.get("final_action", _r.get("action", ""))
+            _base_ = _r.get("base_action", _fin_)
+            _conf_ = _r.get("effective_data_confidence", _r.get("data_confidence"))
+            _exit_ = _exit_by_ticker.get(_r.get("ticker"))
+            _exit_flag = ""
+            if _exit_:
+                _sev = _exit_.get("severity", "")
+                _exit_flag = _sev.replace("_", " ").title() if _sev else ""
+            _summary_rows.append({
+                "Ticker": _r.get("ticker", ""),
+                "Holding score": format_score(_r.get("aggregate_score", 0)),
+                "Recommendation": _plain_action(_fin_),
+                "Before risk checks": _plain_action(_base_) if _base_ != _fin_ else "-",
+                "Confidence": _conf_label(safe_float(_conf_) if _conf_ is not None else None),
+                "Gain/loss": format_pct(_pl_pct_) if _pl_pct_ is not None else "-",
+                "Price": _format_price(_cp_, _r.get("currency", "GBP")),
+                "Risk limit": _format_price(
+                    _r.get("structural_stop_loss", _r.get("stop_loss")),
+                    _r.get("currency", "GBP"),
+                ),
+                "First target": _format_price(_r.get("take_profit"), _r.get("currency", "GBP")),
+                "Exit warning": _exit_flag,
+            })
+        with st.expander(f"Summary table ({len(_summary_rows)} holdings)", expanded=False):
+            st.dataframe(_summary_rows, use_container_width=True, hide_index=True)
+
+    # ---------------------------------------------------------------------------
     # Holding cards
     # ---------------------------------------------------------------------------
-    st.markdown(f"### Portfolio Analysis ({len(filtered_results)} holdings)")
+    st.markdown(f"### Holding recommendations ({len(filtered_results)} holdings)")
 
     for r in filtered_results:
         final_action = r.get("final_action", r["action"])
@@ -1805,20 +2208,57 @@ with tab_holdings:
                 change_color = "#10b981" if is_valid_number(change_val) and change_val >= 0 else "#ef4444"
                 change_txt = format_pct(change_val, decimals=2) if is_valid_number(change_val) else ""
                 st.markdown(
-                    f"**{r['ticker']}** &nbsp;·&nbsp; {r['name']} &nbsp;"
+                    f"**{r['ticker']}** &nbsp;|&nbsp; {r['name']} &nbsp;"
                     f'<span style="color:{change_color};font-weight:600;font-size:0.85rem">{change_txt}</span>',
                     unsafe_allow_html=True,
                 )
 
+                # Confidence badge (Phase 1.10) — flags recommendations
+                # derived from sparse or degraded inputs.
+                _conf = safe_float(
+                    r.get("effective_data_confidence", r.get("data_confidence")),
+                    default=None,
+                ) if r.get("effective_data_confidence") is not None or r.get("data_confidence") is not None else None
+                if _conf is not None:
+                    if _conf >= 0.75:
+                        _cbg, _cfg, _clbl = "#064e3b", "#6ee7b7", f"High confidence ({_conf:.0%})"
+                    elif _conf >= 0.55:
+                        _cbg, _cfg, _clbl = "#3b2f12", "#fcd34d", f"Medium confidence ({_conf:.0%})"
+                    else:
+                        _cbg, _cfg, _clbl = "#3b1220", "#fca5a5", f"Low confidence ({_conf:.0%})"
+                    st.markdown(
+                        f'<span style="display:inline-block;padding:2px 8px;border-radius:10px;'
+                        f'background:{_cbg};color:{_cfg};font-size:11px;font-weight:600;'
+                        f'margin-top:4px">{_clbl}</span>',
+                        unsafe_allow_html=True,
+                    )
+
+                # Inline exit signal (Phase 1.11) — surfaces urgent/action_needed
+                # alerts on the card itself so the trader sees them without
+                # scrolling to the Exit Intelligence expander.
+                _holding_exit = _exit_by_ticker.get(r.get("ticker"))
+                if _holding_exit and _holding_exit.get("severity") in ("urgent", "action_needed"):
+                    _sev = _holding_exit.get("severity")
+                    _icon = "🔴" if _sev == "urgent" else "🟡"
+                    _msg = _holding_exit.get("message", "") or _holding_exit.get("signal_type", "")
+                    _exit_color = "#ef4444" if _sev == "urgent" else "#f59e0b"
+                    st.markdown(
+                        f'<div style="margin-top:6px;padding:6px 10px;border-left:3px solid {_exit_color};'
+                        f'background:rgba(239,68,68,0.08);font-size:12px;color:#f3f4f6;">'
+                        f'<b>{_sev.replace("_"," ").title()}</b> | {_html.escape(_msg[:140])}'
+                        f'</div>',
+                        unsafe_allow_html=True,
+                    )
+
             with hdr2:
                 _er90 = r.get("expected_return_90d")
-                _er90_txt = f" · 90d: {format_pct(safe_float(_er90) * 100)}" if is_valid_number(_er90) else ""
-                st.markdown(f"**Score: {format_score(r['aggregate_score'])}**{_er90_txt}")
+                _er90_txt = f" | 90-day upside: {format_pct(safe_float(_er90) * 100)}" if is_valid_number(_er90) else ""
+                st.markdown(f"**Holding score: {format_score(r['aggregate_score'])}**{_er90_txt}")
                 st.markdown(_render_score_bar(r["aggregate_score"]), unsafe_allow_html=True)
                 _action_caption = (
-                    f"Alpha: {base_action} → Final: {final_action}"
+                    f"Model view before risk checks: {_plain_action(base_action)} -> final recommendation: {_plain_action(final_action)}"
                     if base_action != final_action
-                    else f"Alpha = Final: {final_action}"
+                    else f"Recommendation: {_plain_action(final_action)}"
                 )
                 st.caption(_action_caption)
 
@@ -1829,7 +2269,7 @@ with tab_holdings:
                 )
                 st.markdown(
                     f'<div style="text-align:center;font-size:12px;color:#94a3b8;margin-top:6px;">'
-                    f'Base Alpha: {_html.escape(str(base_action))}'
+                    f'Before risk checks: {_html.escape(_plain_action(base_action))}'
                     f'</div>',
                     unsafe_allow_html=True,
                 )
@@ -1839,7 +2279,7 @@ with tab_holdings:
 
             with b1:
                 price_str = _format_price(_cp, currency)
-                st.metric("Price", price_str)
+                st.metric("Current price", price_str)
                 if _ap:
                     st.caption(f"Avg buy: {_format_price(_ap, currency)}")
 
@@ -1857,11 +2297,11 @@ with tab_holdings:
                     _total_str = format_currency(abs(_total_pl), currency if currency != "GBX" else "GBP", decimals=0)
                     if _total_pl < 0:
                         _total_str = f"-{_total_str}"
-                    st.metric("P&L / Share", _pl_str, format_pct(_pl_pct))
-                    st.metric("Total P&L", _total_str, format_pct(_pl_pct),
-                        help=f"{safe_float(_qty):.0f} shares × {_format_price(abs(_pl), currency)} per share")
+                    st.metric("Gain/loss per share", _pl_str, format_pct(_pl_pct))
+                    st.metric("Total gain/loss", _total_str, format_pct(_pl_pct),
+                        help=f"{safe_float(_qty):.0f} shares x {_format_price(abs(_pl), currency)} per share")
                 else:
-                    st.metric("P&L / Share", "N/A")
+                    st.metric("Gain/loss per share", "N/A")
 
             with b3:
                 tp_str = _format_price(r.get("take_profit"), currency)
@@ -1874,15 +2314,15 @@ with tab_holdings:
                 if _regime.get("vix_percentile"):
                     _vp = _regime["vix_percentile"]
                     _rl = "calm" if _vp < 30 else ("elevated" if _vp < 70 else "stressed")
-                    _regime_hint = f" · VIX: {_rl}"
-                st.metric("Target ↑", tp_str, help=f"Method: {r.get('target_method', 'N/A')}")
-                st.metric("Structural Stop ↓", sl_str,
-                          help=f"Method: {_structural_method}{_sdp_str}{_regime_hint}")
-                st.metric("Trailing Exit ↓", trailing_str,
-                          help=f"Method: {_trailing_method}")
+                    _regime_hint = f" | Market stress: {_rl}"
+                st.metric("First target", tp_str, help=f"{_help('take_profit')} Method: {r.get('target_method', 'N/A')}")
+                st.metric("Risk limit", sl_str,
+                          help=f"{_help('stop_loss')} Method: {_structural_method}{_sdp_str}{_regime_hint}")
+                st.metric("Trailing exit", trailing_str,
+                          help=f"A moving exit level used to protect gains. Method: {_trailing_method}")
 
             with b4:
-                st.markdown("**Pillar Scores**")
+                st.markdown("**What drove the score**")
                 st.markdown(
                     _render_pillar_bars(
                         r["technical_score"],
@@ -1940,12 +2380,12 @@ with tab_holdings:
                 st.markdown(" ".join(_risk_flags), unsafe_allow_html=True)
 
             # ── Why row ──
-            st.caption(f"**Why:** {r['why']}")
+            st.caption(f"**Reason:** {r['why']}")
 
             # ── Tabbed details ──
             with st.expander("Details"):
                 tab_overview, tab_scores, tab_fund, tab_sent, tab_fcast = st.tabs([
-                    "🏠 Overview", "📊 Scores", "📈 Fundamentals", "📰 Sentiment", "🔮 Forecast"
+                    "Overview", "Score drivers", "Business quality", "News mood", "Forecast"
                 ])
 
                 # ─── Tab 0: Overview (Yahoo Finance-style) ───
@@ -2083,7 +2523,12 @@ with tab_holdings:
                                 x=0.01, y=0.98,
                             ),
                         )
-                        st.plotly_chart(fig_ov, use_container_width=True, config={"displayModeBar": False})
+                        st.plotly_chart(
+                            fig_ov,
+                            use_container_width=True,
+                            config={"displayModeBar": False},
+                            key=f"holding_overview_chart_{r['ticker'].replace('.', '_')}",
+                        )
 
                     # --- Key stats grid (Yahoo Finance style) ---
                     _ov_prev_close = _ov_info.get("previousClose") or _ov_info.get("regularMarketPreviousClose")
@@ -2171,18 +2616,18 @@ with tab_holdings:
 
                     with sc1:
                         # 4 pillar metrics
-                        st.metric("Technical", format_score(r.get('technical_score', 0), decimals=2),
-                            help="SMA, RSI, MACD, Bollinger Bands, Stochastic RSI, OBV, ADX, Williams %R")
-                        st.metric("Fundamental", format_score(r.get('fundamental_score', 0), decimals=2),
-                            help="P/E, EPS growth, D/E, margins, ROE, FCF, analyst target, short interest, insider activity")
-                        st.metric("Sentiment", format_score(r.get('sentiment_score', 0), decimals=2),
-                            help="VADER NLP on Google News + Reddit + FMP News")
-                        st.metric("Forecast", format_score(r.get('forecast_score', 0), decimals=2),
-                            help="MoE 5-day price forecast (7 experts)")
+                        st.metric("Price trend", format_score(r.get('technical_score', 0), decimals=2),
+                            help=_help("price_trend"))
+                        st.metric("Business quality", format_score(r.get('fundamental_score', 0), decimals=2),
+                            help=_help("business_quality"))
+                        st.metric("News mood", format_score(r.get('sentiment_score', 0), decimals=2),
+                            help=_help("news_mood"))
+                        st.metric("Model forecast", format_score(r.get('forecast_score', 0), decimals=2),
+                            help=_help("model_forecast"))
 
                     with sc2:
                         # Radar chart for 4 pillars
-                        pillars = ["Technical", "Fundamental", "Sentiment", "Forecast"]
+                        pillars = ["Price trend", "Business quality", "News mood", "Forecast"]
                         raw_vals = [r["technical_score"], r["fundamental_score"],
                                     r["sentiment_score"], r.get("forecast_score", 0)]
                         # Map -1..+1 to 0..1 for radar
@@ -2210,27 +2655,33 @@ with tab_holdings:
                             ),
                             showlegend=False,
                         )
-                        st.plotly_chart(fig_radar, use_container_width=True, config={"displayModeBar": False})
+                        st.plotly_chart(
+                            fig_radar,
+                            use_container_width=True,
+                            config={"displayModeBar": False},
+                            key=f"holding_radar_chart_{r['ticker'].replace('.', '_')}",
+                        )
 
                     # RSI gauge
                     if r.get("rsi") is not None:
-                        st.markdown(f"**RSI** — {r['rsi']:.1f}")
+                        st.markdown(f"**Momentum heat gauge (RSI)** - {r['rsi']:.1f}")
+                        st.caption(_help("rsi"))
                         st.markdown(_render_rsi_gauge(r["rsi"]), unsafe_allow_html=True)
 
                     # Technical indicators grid
                     tech_metrics = []
                     if r.get("bb_pct") is not None:
-                        tech_metrics.append(("BB%", f"{r['bb_pct']:.0%}"))
+                        tech_metrics.append(("Price band position", f"{r['bb_pct']:.0%}"))
                     if r.get("stoch_k") is not None:
-                        tech_metrics.append(("StochRSI", f"{r['stoch_k']:.0%}"))
+                        tech_metrics.append(("Short-term momentum", f"{r['stoch_k']:.0%}"))
                     if r.get("obv_divergence"):
-                        tech_metrics.append(("OBV", f"{r['obv_divergence']} div"))
+                        tech_metrics.append(("Volume pressure", f"{r['obv_divergence']} div"))
                     elif r.get("obv_trend"):
-                        tech_metrics.append(("OBV", r["obv_trend"]))
+                        tech_metrics.append(("Volume pressure", r["obv_trend"]))
                     if r.get("adx") is not None:
-                        tech_metrics.append(("ADX", f"{r['adx']:.0f}"))
+                        tech_metrics.append(("Trend strength", f"{r['adx']:.0f}"))
                     if r.get("williams_r") is not None:
-                        tech_metrics.append(("W%R", f"{r['williams_r']:.0f}"))
+                        tech_metrics.append(("Pullback gauge", f"{r['williams_r']:.0f}"))
 
                     if tech_metrics:
                         cols_per_row = 3
@@ -2248,27 +2699,27 @@ with tab_holdings:
                     # Quality metrics grid
                     fund_metrics = []
                     if r.get("pe_ratio"):
-                        fund_metrics.append(("P/E", f"{r['pe_ratio']:.1f}"))
+                        fund_metrics.append(("Price / earnings", f"{r['pe_ratio']:.1f}"))
                     if r.get("revenue_growth") is not None:
-                        fund_metrics.append(("Rev Growth", f"{r['revenue_growth']:.0%}"))
+                        fund_metrics.append(("Revenue growth", f"{r['revenue_growth']:.0%}"))
                     if r.get("profit_margin") is not None:
-                        fund_metrics.append(("Margin", f"{r['profit_margin']:.0%}"))
+                        fund_metrics.append(("Profit margin", f"{r['profit_margin']:.0%}"))
                     if r.get("roe") is not None:
-                        fund_metrics.append(("ROE", f"{r['roe']:.0%}"))
+                        fund_metrics.append(("Return on equity", f"{r['roe']:.0%}"))
                     if r.get("fcf_yield") is not None:
-                        fund_metrics.append(("FCF Yield", f"{r['fcf_yield']:.1%}"))
+                        fund_metrics.append(("Free cash flow yield", f"{r['fcf_yield']:.1%}"))
                     if r.get("short_pct") is not None:
-                        fund_metrics.append(("Short Interest", f"{r['short_pct']:.1%}"))
+                        fund_metrics.append(("Short interest", f"{r['short_pct']:.1%}"))
                     if r.get("inst_ownership") is not None:
-                        fund_metrics.append(("Inst. Ownership", f"{r['inst_ownership']:.0%}"))
+                        fund_metrics.append(("Fund ownership", f"{r['inst_ownership']:.0%}"))
                     if r.get("dividend_yield") is not None:
-                        fund_metrics.append(("Div Yield", f"{r['dividend_yield']:.1%}"))
+                        fund_metrics.append(("Dividend yield", f"{r['dividend_yield']:.1%}"))
                     if r.get("payout_ratio") is not None:
-                        fund_metrics.append(("Payout Ratio", f"{r['payout_ratio']:.0%}"))
+                        fund_metrics.append(("Dividend payout", f"{r['payout_ratio']:.0%}"))
                     if r.get("current_ratio") is not None:
-                        fund_metrics.append(("Current Ratio", f"{r['current_ratio']:.1f}"))
+                        fund_metrics.append(("Short-term cover", f"{r['current_ratio']:.1f}"))
                     if r.get("net_debt_ebitda") is not None:
-                        fund_metrics.append(("ND/EBITDA", f"{r['net_debt_ebitda']:.1f}x"))
+                        fund_metrics.append(("Debt / profit", f"{r['net_debt_ebitda']:.1f}x"))
                     if r.get("balance_sheet_grade"):
                         fund_metrics.append(("Balance Sheet", r["balance_sheet_grade"]))
 
@@ -2290,8 +2741,8 @@ with tab_holdings:
                         upside_str = f"({upside:+.0f}%)" if upside is not None else ""
                         analysts = f" · {r['num_analysts']} analysts" if r.get("num_analysts") else ""
                         st.markdown(
-                            f"**Analyst Target:** {_format_price(r['analyst_target'], currency)} "
-                            f"{upside_str} · {rec_str}{analysts}"
+                            f"**Analyst target:** {_format_price(r['analyst_target'], currency)} "
+                            f"{upside_str} | {rec_str}{analysts}"
                         )
 
                     # Insider activity
@@ -2312,10 +2763,10 @@ with tab_holdings:
                     # FMP Insights
                     if r.get("fmp_available"):
                         st.markdown("---")
-                        st.markdown("**FMP Insights**")
+                        st.markdown("**Analyst and earnings checks**")
                         fmp_metrics = []
                         if r.get("peg_ratio") is not None:
-                            fmp_metrics.append(("PEG", f"{r['peg_ratio']:.1f}"))
+                            fmp_metrics.append(("Growth-adjusted value", f"{r['peg_ratio']:.1f}"))
                         if r.get("earnings_beat_rate"):
                             fmp_metrics.append(("Beat Rate", r["earnings_beat_rate"]))
                         if r.get("quarterly_trend"):
@@ -2323,7 +2774,7 @@ with tab_holdings:
                         if r.get("estimate_revision"):
                             fmp_metrics.append(("Revisions", r["estimate_revision"]))
                         if r.get("pe_vs_sector"):
-                            fmp_metrics.append(("P/E vs Sector", r["pe_vs_sector"]))
+                            fmp_metrics.append(("Value vs peers", r["pe_vs_sector"]))
                         if r.get("next_earnings_date"):
                             fmp_metrics.append(("Next Earnings", r["next_earnings_date"]))
 
@@ -2340,16 +2791,16 @@ with tab_holdings:
 
                         if r.get("recent_upgrades", 0) > 0 or r.get("recent_downgrades", 0) > 0:
                             st.markdown(
-                                f"Upgrades: **{r['recent_upgrades']}** · "
+                                f"Upgrades: **{r['recent_upgrades']}** | "
                                 f"Downgrades: **{r['recent_downgrades']}** (90 days)"
                             )
 
                     # Position info
                     st.markdown("---")
                     st.caption(
-                        f"Avg Buy: {_format_price(r.get('avg_buy_price'), currency)} · "
-                        f"Qty: {r.get('quantity', 0)} · "
-                        f"Stop: {r.get('stop_method', 'N/A')} · Target: {r.get('target_method', 'N/A')}"
+                        f"Avg buy: {_format_price(r.get('avg_buy_price'), currency)} | "
+                        f"Shares: {r.get('quantity', 0)} | "
+                        f"Risk limit method: {r.get('stop_method', 'N/A')} | Target method: {r.get('target_method', 'N/A')}"
                     )
 
                 # ─── Tab 3: Sentiment ───
@@ -2393,17 +2844,18 @@ with tab_holdings:
                 with tab_fcast:
                     if r.get("forecast_price") is not None:
                         horizon = r.get("forecast_horizon", 5)
-                        st.markdown(f"**MoE Price Forecast ({horizon}-day)**")
+                        st.markdown(f"**Price forecast ({horizon}-day)**")
+                        st.caption("The app blends several forecast models and gives more influence to models that have recently been more accurate.")
 
                         fc_cols = st.columns(4)
-                        fc_cols[0].metric("Predicted", _format_price(r.get("forecast_price"), currency),
+                        fc_cols[0].metric("Expected price", _format_price(r.get("forecast_price"), currency),
                                          f"{r.get('forecast_pct_change', 0):+.1f}%")
-                        fc_cols[1].metric("Low (80%)", _format_price(r.get("forecast_low"), currency))
-                        fc_cols[2].metric("High (80%)", _format_price(r.get("forecast_high"), currency))
+                        fc_cols[1].metric("Likely low", _format_price(r.get("forecast_low"), currency))
+                        fc_cols[2].metric("Likely high", _format_price(r.get("forecast_high"), currency))
                         if r.get("forecast_ensemble_mae") is not None:
-                            fc_cols[3].metric("Ensemble MAE", f"{r.get('forecast_ensemble_mae', 0):.2f}")
+                            fc_cols[3].metric("Avg miss", f"{r.get('forecast_ensemble_mae', 0):.2f}", help=_help("mae"))
                         else:
-                            fc_cols[3].metric("Ensemble MAE", "Building...")
+                            fc_cols[3].metric("Avg miss", "Building...", help=_help("mae"))
 
                         # Expert weights as horizontal bar chart
                         if r.get("forecast_experts") and r.get("forecast_expert_weights"):
@@ -2432,11 +2884,16 @@ with tab_holdings:
                             fig_expert.update_layout(
                                 **_PLOTLY_LAYOUT,
                                 height=220,
-                                xaxis=dict(title="Weight %", showgrid=True, gridcolor="rgba(128,128,128,0.1)"),
+                                xaxis=dict(title="Influence %", showgrid=True, gridcolor="rgba(128,128,128,0.1)"),
                                 yaxis=dict(autorange="reversed"),
-                                title=dict(text="Expert Weight Allocation", font=dict(size=13)),
+                                title=dict(text="Forecast model influence", font=dict(size=13)),
                             )
-                            st.plotly_chart(fig_expert, use_container_width=True, config={"displayModeBar": False})
+                            st.plotly_chart(
+                                fig_expert,
+                                use_container_width=True,
+                                config={"displayModeBar": False},
+                                key=f"forecast_expert_weights_{r['ticker'].replace('.', '_')}_{horizon}",
+                            )
 
                         # Expert table
                         if r.get("forecast_experts"):
@@ -2445,12 +2902,12 @@ with tab_holdings:
                                 weight = r.get("forecast_expert_weights", {}).get(e["name"], 0)
                                 mae_val = r.get("forecast_expert_maes", {}).get(e["name"])
                                 expert_rows.append({
-                                    "Expert": e["name"].replace("_", " ").title(),
+                                    "Model": e["name"].replace("_", " ").title(),
                                     "Prediction": round(e["price"], 2),
                                     "Low": round(e["low"], 2),
                                     "High": round(e["high"], 2),
-                                    "Weight": f"{weight:.1%}",
-                                    "MAE": f"{mae_val:.2f}" if mae_val is not None else "—",
+                                    "Influence": f"{weight:.1%}",
+                                    "Avg miss": f"{mae_val:.2f}" if mae_val is not None else "-",
                                 })
                             st.dataframe(pd.DataFrame(expert_rows), hide_index=True, use_container_width=True)
 
@@ -2458,16 +2915,16 @@ with tab_holdings:
                         if r.get("forecast_price_long") is not None:
                             st.divider()
                             horizon_long = r.get("forecast_horizon_long", 63)
-                            st.markdown(f"**Long-Term Forecast ({horizon_long}-day)**")
+                            st.markdown(f"**Longer-term forecast ({horizon_long}-day)**")
                             lc = st.columns(4)
-                            lc[0].metric("Predicted", _format_price(r.get("forecast_price_long"), currency),
+                            lc[0].metric("Expected price", _format_price(r.get("forecast_price_long"), currency),
                                          f"{r.get('forecast_pct_change_long', 0):+.1f}%")
-                            lc[1].metric("Low (80%)", _format_price(r.get("forecast_low_long", 0), currency))
-                            lc[2].metric("High (80%)", _format_price(r.get("forecast_high_long", 0), currency))
+                            lc[1].metric("Likely low", _format_price(r.get("forecast_low_long", 0), currency))
+                            lc[2].metric("Likely high", _format_price(r.get("forecast_high_long", 0), currency))
                             if r.get("forecast_ensemble_mae_long") is not None:
-                                lc[3].metric("Ensemble MAE", f"{r.get('forecast_ensemble_mae_long', 0):.2f}")
+                                lc[3].metric("Avg miss", f"{r.get('forecast_ensemble_mae_long', 0):.2f}", help=_help("mae"))
                             else:
-                                lc[3].metric("Ensemble MAE", "Building...")
+                                lc[3].metric("Avg miss", "Building...", help=_help("mae"))
                     else:
                         st.info("Forecast data not available for this holding.")
 
@@ -2477,32 +2934,31 @@ with tab_analytics:
     # ---------------------------------------------------------------------------
     # 90-Day Portfolio Return Projection
     # ---------------------------------------------------------------------------
-    st.markdown("### 90-Day Return Projection")
+    st.markdown("### 90-day portfolio outlook")
     st.caption(
-        "Monte Carlo simulation (5,000 paths) combining MoE directional forecasts with "
-        "historical volatility and cross-asset correlations. Shows the distribution of "
-        "portfolio returns over the next ~90 calendar days (63 trading days)."
+        "A scenario engine blends the app's forecasts with recent volatility and how holdings move together. "
+        "It shows a range of possible portfolio outcomes over about 90 calendar days."
     )
 
-    _run_projection = st.button("Run 90-Day Projection (Monte Carlo)", type="secondary")
+    _run_projection = st.button("Run 90-day outlook", type="secondary")
     if _run_projection:
         from engine.portfolio_projection import project_portfolio_return, project_swap_impact
 
-        with st.spinner("Running Monte Carlo simulation (5,000 paths × 63 days)..."):
+        with st.spinner("Running 5,000 possible 90-day paths..."):
             _proj = project_portfolio_return(results, holdings, position_weights)
 
         # Portfolio-level summary
-        st.markdown("#### Portfolio Return Distribution")
+        st.markdown("#### Portfolio outcome range")
         pc1, pc2, pc3, pc4, pc5 = st.columns(5)
-        pc1.metric("Expected Return", format_pct(safe_float(_proj.expected_return_pct)))
-        pc2.metric("P(Positive)", f"{safe_float(_proj.prob_positive):.0%}")
-        pc3.metric("Current Value", format_currency(_proj.current_value, "GBP", decimals=0))
-        pc4.metric("Expected Value", format_currency(_proj.expected_value, "GBP", decimals=0))
+        pc1.metric("Expected return", format_pct(safe_float(_proj.expected_return_pct)))
+        pc2.metric("Chance of gain", f"{safe_float(_proj.prob_positive):.0%}")
+        pc3.metric("Current value", format_currency(_proj.current_value, "GBP", decimals=0))
+        pc4.metric("Expected value", format_currency(_proj.expected_value, "GBP", decimals=0))
         _gain = safe_float(_proj.expected_value) - safe_float(_proj.current_value)
-        pc5.metric("Expected Gain", format_currency(_gain, "GBP", decimals=0))
+        pc5.metric("Expected gain", format_currency(_gain, "GBP", decimals=0))
 
         # Confidence interval table
-        st.markdown("#### Confidence Intervals")
+        st.markdown("#### Scenario bands")
         ci_data = []
         for pctile, label in [(0.10, "Bear (10th)"), (0.25, "Cautious (25th)"),
                                (0.50, "Median (50th)"), (0.75, "Optimistic (75th)"),
@@ -2510,32 +2966,32 @@ with tab_analytics:
             _pv = safe_float(_proj.projected_values[pctile])
             ci_data.append({
                 "Scenario": label,
-                "Portfolio Return": format_pct(safe_float(_proj.projected_returns[pctile])),
-                "Portfolio Value": format_currency(_pv, "GBP", decimals=0),
-                "Gain / Loss": format_currency(_pv - safe_float(_proj.current_value), "GBP", decimals=0),
+                "Portfolio return": format_pct(safe_float(_proj.projected_returns[pctile])),
+                "Portfolio value": format_currency(_pv, "GBP", decimals=0),
+                "Gain / loss": format_currency(_pv - safe_float(_proj.current_value), "GBP", decimals=0),
             })
         st.dataframe(pd.DataFrame(ci_data), hide_index=True, use_container_width=True)
 
         # Per-ticker breakdown
-        st.markdown("#### Per-Ticker Projections")
+        st.markdown("#### Holding-level outlook")
         ticker_rows = []
         for tp in sorted(_proj.ticker_projections, key=lambda x: safe_float(x.expected_return_pct), reverse=True):
             ticker_rows.append({
                 "Ticker": tp.ticker,
                 "Current": format_currency(tp.current_price, "GBP"),
-                "MoE Forecast": format_currency(tp.moe_predicted_price, "GBP"),
-                "MoE Return": format_pct(safe_float(tp.moe_pct_change)),
-                "MC Expected": format_pct(safe_float(tp.expected_return_pct)),
-                "10th pct": format_pct(safe_float(tp.projected_returns.get(0.10))),
-                "50th pct": format_pct(safe_float(tp.projected_returns.get(0.50))),
-                "90th pct": format_pct(safe_float(tp.projected_returns.get(0.90))),
-                "P(>0)": f"{safe_float(tp.prob_positive):.0%}",
-                "Annual Vol": f"{safe_float(tp.annual_volatility):.0%}",
+                "Model forecast": format_currency(tp.moe_predicted_price, "GBP"),
+                "Model return": format_pct(safe_float(tp.moe_pct_change)),
+                "Scenario expected": format_pct(safe_float(tp.expected_return_pct)),
+                "Bad case": format_pct(safe_float(tp.projected_returns.get(0.10))),
+                "Middle case": format_pct(safe_float(tp.projected_returns.get(0.50))),
+                "Good case": format_pct(safe_float(tp.projected_returns.get(0.90))),
+                "Chance of gain": f"{safe_float(tp.prob_positive):.0%}",
+                "Annual volatility": f"{safe_float(tp.annual_volatility):.0%}",
             })
         st.dataframe(pd.DataFrame(ticker_rows), hide_index=True, use_container_width=True)
 
         # Swap impact analysis — uses cached discovery candidates from orchestrator state
-        st.markdown("#### Swap Impact Analysis")
+        st.markdown("#### Swap impact")
         st.caption("Compare projected returns before and after a proposed swap.")
 
         _state_path = Path(__file__).parent / config.ORCHESTRATOR_STATE_FILE
@@ -2617,8 +3073,8 @@ with tab_analytics:
 
     if _rolling_maes:
         tab_accuracy, tab_weights, tab_impact, tab_backtest, tab_performance = st.tabs([
-            "📉 Expert Accuracy", "⚖️ Weight Distribution", "🎯 Signal Impact",
-            "🔧 Weight Optimization", "📊 Forecast Performance",
+            "Forecast accuracy", "Model mix", "What helps",
+            "Weight tuning", "Forecast history",
         ])
 
         _all_experts = set()
@@ -2628,7 +3084,7 @@ with tab_analytics:
 
         # ── Tab 1: Expert Accuracy (MAE) ──
         with tab_accuracy:
-            st.caption("Lower MAE = more accurate predictions. Experts with lower MAE get higher weight.")
+            st.caption("Lower average miss means better forecasts. More accurate models get more influence.")
 
             mae_data = {}
             for ticker, experts in _rolling_maes.items():
@@ -2643,9 +3099,9 @@ with tab_analytics:
 
             if mae_data:
                 mae_df = pd.DataFrame(mae_data)
-                mae_df.index.name = "Expert"
+                mae_df.index.name = "Model"
 
-                ticker_select = st.selectbox("Select holding:", list(mae_data.keys()), key="mae_ticker")
+                ticker_select = st.selectbox("Choose holding:", list(mae_data.keys()), key="mae_ticker")
 
                 if ticker_select:
                     ticker_mae = mae_df[ticker_select].dropna().sort_values()
@@ -2659,28 +3115,33 @@ with tab_analytics:
                     fig_mae.update_layout(
                         **_PLOTLY_LAYOUT,
                         height=300,
-                        xaxis_title="MAE",
+                        xaxis_title="Average miss",
                         yaxis_title="",
                         coloraxis_showscale=False,
-                        title=dict(text=f"Expert MAE — {ticker_select}", font=dict(size=14)),
+                        title=dict(text=f"Forecast miss - {ticker_select}", font=dict(size=14)),
                     )
-                    fig_mae.update_traces(hovertemplate="%{y}: MAE %{x:.2f}<extra></extra>")
-                    st.plotly_chart(fig_mae, use_container_width=True, config={"displayModeBar": False})
+                    fig_mae.update_traces(hovertemplate="%{y}: average miss %{x:.2f}<extra></extra>")
+                    st.plotly_chart(
+                        fig_mae,
+                        use_container_width=True,
+                        config={"displayModeBar": False},
+                        key="forecast_mae_chart",
+                    )
 
                     # Ensemble MAE
                     for full_ticker, experts in _rolling_maes.items():
                         if full_ticker.split(".")[0] == ticker_select:
                             ens_list = experts.get("ensemble", [])
                             if ens_list:
-                                st.metric(f"Ensemble MAE ({ticker_select})", f"{sum(ens_list)/len(ens_list):.2f}")
+                                st.metric(f"Blended avg miss ({ticker_select})", f"{sum(ens_list)/len(ens_list):.2f}", help=_help("mae"))
                             break
 
-                with st.expander("Full MAE comparison table"):
+                with st.expander("Full forecast-miss table"):
                     st.dataframe(mae_df, use_container_width=True)
 
         # ── Tab 2: Weight Distribution ──
         with tab_weights:
-            st.caption("How the gating network distributes weight across experts per holding.")
+            st.caption("How the app splits influence across forecast models for each holding.")
 
             weight_data = {}
             for r in results:
@@ -2694,9 +3155,9 @@ with tab_analytics:
 
             if weight_data:
                 weight_df = pd.DataFrame(weight_data)
-                weight_df.index.name = "Expert"
+                weight_df.index.name = "Model"
 
-                ticker_select_w = st.selectbox("Select holding:", list(weight_data.keys()), key="weight_ticker")
+                ticker_select_w = st.selectbox("Choose holding:", list(weight_data.keys()), key="weight_ticker")
 
                 if ticker_select_w:
                     w_series = weight_df[ticker_select_w].dropna().sort_values(ascending=False)
@@ -2709,11 +3170,16 @@ with tab_analytics:
                     )
                     fig_w.update_layout(
                         **_PLOTLY_LAYOUT, height=300,
-                        xaxis_title="", yaxis_title="Weight %",
+                        xaxis_title="", yaxis_title="Influence %",
                         coloraxis_showscale=False,
-                        title=dict(text=f"Expert Weights — {ticker_select_w}", font=dict(size=14)),
+                        title=dict(text=f"Model influence - {ticker_select_w}", font=dict(size=14)),
                     )
-                    st.plotly_chart(fig_w, use_container_width=True, config={"displayModeBar": False})
+                    st.plotly_chart(
+                        fig_w,
+                        use_container_width=True,
+                        config={"displayModeBar": False},
+                        key="forecast_weight_bar_chart",
+                    )
 
                     # Radar chart
                     radar_experts = list(w_series.index)
@@ -2736,18 +3202,23 @@ with tab_analytics:
                             bgcolor="rgba(0,0,0,0)",
                         ),
                         showlegend=False,
-                        title=dict(text=f"Weight Profile — {ticker_select_w}", font=dict(size=14)),
+                        title=dict(text=f"Influence profile - {ticker_select_w}", font=dict(size=14)),
                     )
-                    st.plotly_chart(fig_radar_w, use_container_width=True, config={"displayModeBar": False})
+                    st.plotly_chart(
+                        fig_radar_w,
+                        use_container_width=True,
+                        config={"displayModeBar": False},
+                        key="forecast_weight_radar_chart",
+                    )
 
-                with st.expander("Full weight distribution table (%)"):
+                with st.expander("Full model mix table (%)"):
                     st.dataframe(weight_df, use_container_width=True)
 
         # ── Tab 3: Signal Impact Analysis ──
         with tab_impact:
             st.caption(
-                "Compares each expert's MAE against the ensemble. "
-                "**Negative = expert improves accuracy** · **Positive = expert hurts accuracy**"
+                "Compares each model against the blended forecast. "
+                "**Negative means the model helped accuracy. Positive means it hurt accuracy.**"
             )
 
             impact_data = {}
@@ -2769,7 +3240,7 @@ with tab_analytics:
             if impact_data:
                 impact_df = pd.DataFrame(impact_data)
 
-                ticker_select_i = st.selectbox("Select holding:", list(impact_data.keys()), key="impact_ticker")
+                ticker_select_i = st.selectbox("Choose holding:", list(impact_data.keys()), key="impact_ticker")
 
                 if ticker_select_i:
                     impact_series = impact_df[ticker_select_i].dropna().sort_values()
@@ -2786,30 +3257,35 @@ with tab_analytics:
                     fig_impact.add_vline(x=0, line_dash="dash", line_color="rgba(128,128,128,0.5)")
                     fig_impact.update_layout(
                         **_PLOTLY_LAYOUT, height=300,
-                        xaxis_title="MAE vs Ensemble",
-                        title=dict(text=f"Signal Impact — {ticker_select_i}", font=dict(size=14)),
+                        xaxis_title="Average miss vs blended forecast",
+                        title=dict(text=f"What helped - {ticker_select_i}", font=dict(size=14)),
                     )
-                    st.plotly_chart(fig_impact, use_container_width=True, config={"displayModeBar": False})
+                    st.plotly_chart(
+                        fig_impact,
+                        use_container_width=True,
+                        config={"displayModeBar": False},
+                        key="forecast_signal_impact_chart",
+                    )
 
                     best_expert = impact_series.idxmin()
                     worst_expert = impact_series.idxmax()
                     bcol, wcol = st.columns(2)
-                    bcol.metric("Most Accurate", best_expert, f"{impact_series[best_expert]:+.2f} vs ensemble")
-                    wcol.metric("Least Accurate", worst_expert, f"{impact_series[worst_expert]:+.2f} vs ensemble", delta_color="inverse")
+                    bcol.metric("Most helpful", best_expert, f"{impact_series[best_expert]:+.2f} vs blend")
+                    wcol.metric("Least helpful", worst_expert, f"{impact_series[worst_expert]:+.2f} vs blend", delta_color="inverse")
 
-                with st.expander("Full signal impact table"):
+                with st.expander("Full model-impact table"):
                     st.dataframe(impact_df, use_container_width=True)
 
                 st.markdown("---")
-                st.markdown("**Cross-Portfolio Expert Ranking**")
+                st.markdown("**Model ranking across the portfolio**")
                 avg_impact = impact_df.mean(axis=1).sort_values()
                 summary_df = pd.DataFrame({
-                    "Expert": avg_impact.index,
-                    "Avg MAE Delta": [f"{v:+.2f}" for v in avg_impact.values],
+                    "Model": avg_impact.index,
+                    "Avg miss vs blend": [f"{v:+.2f}" for v in avg_impact.values],
                     "Verdict": [
-                        "✅ Improves" if v < -0.5
-                        else "⚠️ Neutral" if abs(v) <= 0.5
-                        else "❌ Hurts"
+                        "Helps" if v < -0.5
+                        else "Neutral" if abs(v) <= 0.5
+                        else "Hurts"
                         for v in avg_impact.values
                     ],
                 })
@@ -2818,15 +3294,15 @@ with tab_analytics:
         # ── Tab 4: Weight Optimization ──
         with tab_backtest:
             st.markdown(
-                "**Multi-method weight optimization** — IC-based weighting with shrinkage + "
-                "constrained grid search across ~40 stocks."
+                "**Weight tuning** - the app checks which score drivers have recently worked "
+                "and gently shifts influence toward them."
             )
             st.caption(
-                f"Shrinkage: {config.WEIGHT_SHRINKAGE:.0%} toward equal · "
-                f"Min floor: {config.WEIGHT_MIN_FLOOR:.0%} per pillar"
+                f"Stability guard: {config.WEIGHT_SHRINKAGE:.0%} toward equal weights | "
+                f"Minimum influence: {config.WEIGHT_MIN_FLOOR:.0%} per score driver"
             )
 
-            if st.button("🚀 Run Optimization", key="run_backtest", type="secondary"):
+            if st.button("Run weight tuning", key="run_backtest", type="secondary"):
                 progress_bar = st.progress(0, text="Starting...")
 
                 def _progress(current, total, ticker):
@@ -2842,13 +3318,13 @@ with tab_analytics:
 
                 if opt.universe_size >= 10:
                     # Grouped bar chart — weight comparison
-                    pillar_names = ["Technical", "Fundamental", "Sentiment", "Forecast"]
+                    pillar_names = ["Price trend", "Business quality", "News mood", "Forecast"]
                     pillar_keys = ["technical", "fundamental", "sentiment", "forecast"]
 
                     fig_wcomp = go.Figure()
                     for label, weights_dict, color in [
                         ("Current", dict(config.WEIGHTS), "#6b7280"),
-                        ("IC-Based", opt.ic_based_weights, "#f59e0b"),
+                        ("Recent accuracy", opt.ic_based_weights, "#f59e0b"),
                         ("Grid Search", opt.grid_search_weights, "#8b5cf6"),
                         ("Recommended", opt.recommended_weights, "#3b82f6"),
                     ]:
@@ -2864,24 +3340,30 @@ with tab_analytics:
                         **_PLOTLY_LAYOUT,
                         height=320,
                         barmode="group",
-                        yaxis_title="Weight %",
+                        yaxis_title="Influence %",
                         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5),
-                        title=dict(text="Weight Comparison", font=dict(size=14)),
+                        title=dict(text="Model mix comparison", font=dict(size=14)),
                     )
-                    st.plotly_chart(fig_wcomp, use_container_width=True, config={"displayModeBar": False})
+                    st.plotly_chart(
+                        fig_wcomp,
+                        use_container_width=True,
+                        config={"displayModeBar": False},
+                        key="weight_optimization_comparison_chart",
+                    )
 
                     # Weight table
                     weight_comparison = pd.DataFrame({
-                        "Pillar": pillar_names,
+                        "Score driver": pillar_names,
                         "Current": [config.WEIGHTS[k] for k in pillar_keys],
-                        "IC-Based": [opt.ic_based_weights[k] for k in pillar_keys],
+                        "Recent accuracy": [opt.ic_based_weights[k] for k in pillar_keys],
                         "Grid Search": [opt.grid_search_weights[k] for k in pillar_keys],
                         "Recommended": [opt.recommended_weights[k] for k in pillar_keys],
                     })
                     weight_comparison["Change"] = weight_comparison["Recommended"] - weight_comparison["Current"]
                     st.dataframe(
                         weight_comparison.style.format({
-                            "Current": "{:.1%}", "IC-Based": "{:.1%}",
+                            "Current": "{:.1%}",
+                            "Recent accuracy": "{:.1%}",
                             "Grid Search": "{:.1%}", "Recommended": "{:.1%}",
                             "Change": "{:+.1%}",
                         }),
@@ -2890,36 +3372,37 @@ with tab_analytics:
 
                     # Summary metrics
                     m1, m2, m3, m4 = st.columns(4)
-                    m1.metric("Universe", f"{opt.universe_size} stocks")
-                    m2.metric("Shrinkage", f"{opt.shrinkage_factor:.0%}")
-                    m3.metric("Current Fitness", f"{opt.fitness_current:.3f}")
-                    m4.metric("Recommended Fitness", f"{opt.fitness_recommended:.3f}",
+                    m1.metric("Stocks checked", f"{opt.universe_size} stocks")
+                    m2.metric("Stability guard", f"{opt.shrinkage_factor:.0%}")
+                    m3.metric("Current fit", f"{opt.fitness_current:.3f}")
+                    m4.metric("Recommended fit", f"{opt.fitness_recommended:.3f}",
                               delta=f"{opt.fitness_recommended - opt.fitness_current:+.3f}")
 
                     # Pillar ICs
-                    st.markdown("#### Pillar Information Coefficients (IC)")
+                    st.markdown("#### Which score drivers have worked recently")
+                    st.caption(_help("ic"))
                     if opt.pillar_ics:
                         ic_rows = []
                         for pillar in pillar_keys:
                             pic = opt.pillar_ics.get(pillar)
                             if pic:
                                 ic_rows.append({
-                                    "Pillar": pillar.title(),
-                                    "Avg IC": f"{pic.avg_ic:+.3f}",
-                                    "IC Std": f"{pic.ic_std:.3f}" if pic.ic_std > 0 else "—",
-                                    "IC IR": f"{pic.ic_ir:+.2f}" if pic.ic_ir != 0 else "—",
+                                    "Score driver": _plain_pillar(pillar),
+                                    "Predictive link": f"{pic.avg_ic:+.3f}",
+                                    "Stability": f"{pic.ic_std:.3f}" if pic.ic_std > 0 else "-",
+                                    "Signal quality": f"{pic.ic_ir:+.2f}" if pic.ic_ir != 0 else "-",
                                     "Snapshots": pic.num_snapshots,
                                     "Method": pic.method,
                                     "Signal": (
-                                        "🟢 Strong" if abs(pic.avg_ic) > 0.2
-                                        else "🟡 Moderate" if abs(pic.avg_ic) > 0.1
-                                        else "🔴 Weak"
+                                        "Strong" if abs(pic.avg_ic) > 0.2
+                                        else "Moderate" if abs(pic.avg_ic) > 0.1
+                                        else "Weak"
                                     ),
                                 })
                         st.dataframe(pd.DataFrame(ic_rows), hide_index=True, use_container_width=True)
 
                     # Expandable sections
-                    with st.expander("Per-Stock Score Breakdown"):
+                    with st.expander("Per-stock score breakdown"):
                         stock_rows = []
                         for s in sorted(opt.current_snapshot_scores, key=lambda x: x.forward_return_pct, reverse=True):
                             agg = (
@@ -2930,25 +3413,25 @@ with tab_analytics:
                             )
                             stock_rows.append({
                                 "Ticker": s.ticker,
-                                "Tech": f"{s.technical_score:+.2f}",
-                                "Fund": f"{s.fundamental_score:+.2f}",
-                                "Sent": f"{s.sentiment_score:+.2f}",
-                                "Fcast": f"{s.forecast_score:+.2f}",
-                                "Aggregate": f"{agg:+.3f}",
-                                "Action": _score_to_action(agg),
+                                "Price trend": f"{s.technical_score:+.2f}",
+                                "Business quality": f"{s.fundamental_score:+.2f}",
+                                "News mood": f"{s.sentiment_score:+.2f}",
+                                "Forecast": f"{s.forecast_score:+.2f}",
+                                "Combined score": f"{agg:+.3f}",
+                                "Recommendation": _plain_action(_score_to_action(agg)),
                                 f"Actual {config.FORECAST_HORIZON_DAYS}d Return": f"{s.forward_return_pct:+.2f}%",
                             })
                         st.dataframe(pd.DataFrame(stock_rows), hide_index=True, use_container_width=True)
 
-                    with st.expander("Top 10 Grid Search Combinations"):
+                    with st.expander("Top 10 model-mix combinations"):
                         top_rows = []
                         for i, entry in enumerate(opt.weight_grid_top_n, 1):
                             w = entry["weights"]
                             top_rows.append({
                                 "#": i,
-                                "Technical": f"{w['technical']:.0%}",
-                                "Fundamental": f"{w['fundamental']:.0%}",
-                                "Sentiment": f"{w['sentiment']:.0%}",
+                                "Price trend": f"{w['technical']:.0%}",
+                                "Business quality": f"{w['fundamental']:.0%}",
+                                "News mood": f"{w['sentiment']:.0%}",
                                 "Forecast": f"{w['forecast']:.0%}",
                                 "Fitness": f"{entry['fitness']:.4f}",
                             })
@@ -2959,10 +3442,9 @@ with tab_analytics:
                             st.write(", ".join(opt.skipped_tickers))
 
                     st.info(
-                        "**How it works:** IC-based weights measure each pillar's predictive power, "
-                        "shrunk toward equal weights to prevent overfitting, with a minimum floor "
-                        "to preserve signal diversity. Grid search cross-checks by finding the best "
-                        "combo. Recommended = average of both methods. Re-run monthly."
+                        "**How it works:** the app checks which score drivers have recently predicted returns, "
+                        "keeps the shifts small to avoid overfitting, and preserves a minimum influence for each "
+                        "driver so one noisy signal cannot take over. Re-run monthly."
                     )
                 else:
                     st.warning(f"Only {opt.universe_size} stocks scored (need 10+). Check connectivity.")
@@ -2980,11 +3462,11 @@ with tab_analytics:
                     pm1, pm2, pm3, pm4 = st.columns(4)
                     hit_pct = perf["hit_rate"] * 100
                     hit_color = "normal" if hit_pct >= 50 else "inverse"
-                    pm1.metric("Hit Rate", f"{hit_pct:.1f}%",
+                    pm1.metric("Direction hit rate", f"{hit_pct:.1f}%",
                                delta=f"{'above' if hit_pct >= 50 else 'below'} 50%",
                                delta_color=hit_color)
-                    pm2.metric("Avg Error", f"{perf['avg_error_pct']:.1f}%")
-                    pm3.metric("RMSE", f"{perf['rmse']:.2f}")
+                    pm2.metric("Avg miss", f"{perf['avg_error_pct']:.1f}%", help=_help("mae"))
+                    pm3.metric("Large-miss penalty", f"{perf['rmse']:.2f}")
                     pm4.metric("Predictions", perf["total_predictions"])
 
                     # Rolling accuracy chart
@@ -3002,16 +3484,21 @@ with tab_analytics:
                         fig_roll.update_layout(
                             **_PLOTLY_LAYOUT,
                             height=280,
-                            yaxis=dict(title="Hit Rate %", range=[0, 100]),
+                            yaxis=dict(title="Direction hit rate %", range=[0, 100]),
                             xaxis=dict(title="Date"),
-                            title=dict(text="Rolling Directional Accuracy (30-prediction window)",
+                            title=dict(text="Rolling direction accuracy (30-prediction window)",
                                        font=dict(size=13)),
                         )
-                        st.plotly_chart(fig_roll, use_container_width=True, config={"displayModeBar": False})
+                        st.plotly_chart(
+                            fig_roll,
+                            use_container_width=True,
+                            config={"displayModeBar": False},
+                            key="forecast_rolling_accuracy_chart",
+                        )
 
                     # Expert comparison table
                     if perf.get("expert_comparison"):
-                        st.markdown("**Expert Performance Comparison**")
+                        st.markdown("**Forecast model comparison**")
                         expert_perf_rows = []
                         for name, stats in sorted(
                             perf["expert_comparison"].items(),
@@ -3019,10 +3506,10 @@ with tab_analytics:
                             reverse=True,
                         ):
                             expert_perf_rows.append({
-                                "Expert": name.replace("_", " ").title(),
-                                "Hit Rate": f"{stats['hit_rate']:.1%}",
-                                "Avg Error %": f"{stats['avg_error_pct']:.1f}%",
-                                "RMSE": f"{stats['rmse']:.2f}",
+                                "Model": name.replace("_", " ").title(),
+                                "Direction hit rate": f"{stats['hit_rate']:.1%}",
+                                "Avg miss": f"{stats['avg_error_pct']:.1f}%",
+                                "Large-miss penalty": f"{stats['rmse']:.2f}",
                                 "Predictions": stats["count"],
                             })
                         st.dataframe(pd.DataFrame(expert_perf_rows), hide_index=True,
@@ -3030,7 +3517,7 @@ with tab_analytics:
 
                     # Per-ticker breakdown
                     if perf.get("per_ticker"):
-                        st.markdown("**Per-Ticker Accuracy**")
+                        st.markdown("**Accuracy by holding**")
                         ticker_perf_rows = []
                         for ticker, stats in sorted(
                             perf["per_ticker"].items(),
@@ -3039,33 +3526,70 @@ with tab_analytics:
                         ):
                             ticker_perf_rows.append({
                                 "Ticker": ticker,
-                                "Hit Rate": f"{stats['hit_rate']:.1%}",
-                                "Avg Error %": f"{stats['avg_error_pct']:.1f}%",
+                                "Direction hit rate": f"{stats['hit_rate']:.1%}",
+                                "Avg miss": f"{stats['avg_error_pct']:.1f}%",
                                 "Predictions": stats["count"],
                             })
                         st.dataframe(pd.DataFrame(ticker_perf_rows), hide_index=True,
                                      use_container_width=True)
                 else:
                     st.info(
-                        f"📊 Need at least 5 evaluated predictions for performance metrics. "
+                        f"Need at least 5 evaluated predictions for performance metrics. "
                         f"Currently: {perf['total_predictions']} predictions tracked."
                     )
             except Exception as e:
                 st.warning(f"Could not load forecast performance: {e}")
 
     else:
-        st.info("Signal analytics will appear after the first forecast run builds MAE history.")
+        st.info("Learning and backtest results will appear after the first forecast run builds accuracy history.")
 
 
 with tab_discovery:
     # ---------------------------------------------------------------------------
     # Global Discovery Engine
     # ---------------------------------------------------------------------------
-    st.markdown("### 🔍 Global Discovery Engine")
+    st.markdown("### New stock ideas")
     st.caption(
-        "A portfolio-aware idea engine for surfacing the best new opportunities, strongest diversifiers, "
-        "and cleanest momentum setups from the daily discovery universe."
+        "Fresh buy candidates, wait-for-pullback ideas, and watchlist names ranked for your current portfolio."
     )
+
+    # ── Regime banner (Phase 4.5) — surfaces which factors are being
+    # up/down-weighted so traders can calibrate how aggressively to act
+    # on discovery output in the current macro regime.
+    try:
+        from engine.regime import get_vix_regime as _get_vix_regime, get_multi_macro_regime as _get_multi_regime
+        _vix_r = _get_vix_regime()
+        _macro_r = _get_multi_regime()
+        _regime_label = _vix_r.get("regime_label", "NEUTRAL")
+        _vix_pctl = _vix_r.get("vix_percentile", 50.0)
+        _macro_label = _macro_r.get("regime_label", "NEUTRAL")
+        _tilts = _macro_r.get("factor_tilts", {}) or {}
+        _regime_color = {
+            "BULL": "#10b981", "NEUTRAL": "#3b82f6", "BEAR": "#ef4444",
+            "RISK_ON": "#10b981", "RISK_OFF": "#ef4444",
+            "TRANSITION_UP": "#84cc16", "TRANSITION_DOWN": "#f59e0b",
+        }
+        _vc = _regime_color.get(_regime_label, "#6b7280")
+        _mc = _regime_color.get(_macro_label, "#6b7280")
+        _tilt_strs = [
+            f"{_plain_pillar(k.replace('_tilt',''))}: {v:+.0%}"
+            for k, v in _tilts.items() if v
+        ]
+        _tilt_txt = " | ".join(_tilt_strs) if _tilt_strs else "no extra model tilt"
+        st.markdown(
+            f'<div style="margin:8px 0;padding:10px 14px;border-radius:8px;'
+            f'background:rgba(59,130,246,0.08);border-left:3px solid {_mc};'
+            f'font-size:13px;">'
+            f'<b>Market backdrop:</b> '
+            f'<span style="color:{_vc};font-weight:600">VIX {_regime_label}</span> '
+            f'(stress percentile {_vix_pctl:.0f}) | '
+            f'<span style="color:{_mc};font-weight:600">Macro {_macro_label}</span> '
+            f'<span style="color:#94a3b8;margin-left:8px">Model emphasis: {_tilt_txt}</span>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+    except Exception:
+        pass  # Regime data unavailable — banner is optional
 
     # Auto-load cached discovery results from dashboard data on first visit
     if "discovery_results" not in st.session_state:
@@ -3132,7 +3656,14 @@ with tab_discovery:
                             momentum_score=_momentum_score,
                             return_90d=c.get("return_90d") or 0,
                             return_30d=c.get("return_30d") or 0,
+                            return_10d=c.get("return_10d") or 0,
                             volume_ratio=c.get("volume_ratio") or 1.0,
+                            vol_20d=c.get("vol_20d"),
+                            pe_ratio=c.get("pe_ratio"),
+                            peg_ratio=c.get("peg_ratio"),
+                            revenue_growth=c.get("revenue_growth"),
+                            roe=c.get("roe"),
+                            short_pct=c.get("short_pct"),
                             expected_return_90d=c.get("expected_return_90d") or 0,
                             analyst_target=c.get("analyst_target"),
                             analyst_upside=c.get("analyst_upside"),
@@ -3177,6 +3708,18 @@ with tab_discovery:
                             kelly_cap_fraction=c.get("kelly_cap_fraction"),
                             support_levels=c.get("support_levels") or {},
                             regime_info=c.get("regime_info") or {},
+                            quality_score_fundamental=c.get("quality_score_fundamental") or 0.0,
+                            gross_profitability=c.get("gross_profitability"),
+                            fcf_to_assets=c.get("fcf_to_assets"),
+                            earnings_stability=c.get("earnings_stability"),
+                            eps_growth_variance_5y=c.get("eps_growth_variance_5y"),
+                            factor_momentum_tilt=c.get("factor_momentum_tilt") or {},
+                            network_momentum=c.get("network_momentum"),
+                            qa_sentiment_score=c.get("qa_sentiment_score"),
+                            ml_alpha_raw=c.get("ml_alpha_raw"),
+                            analysis_degraded=c.get("analysis_degraded", False),
+                            analysis_degraded_reason=c.get("analysis_degraded_reason"),
+                            alpha_rank=c.get("alpha_rank") or 0.0,
                             # Dividend safety
                             dividend_yield=c.get("dividend_yield"),
                             payout_ratio=c.get("payout_ratio"),
@@ -3208,8 +3751,12 @@ with tab_discovery:
                         fx_penalties_applied=_cached_disc_meta.get("fx_penalties_applied", 0),
                     )
                     st.session_state["discovery_cached_from"] = _last_disc_run
-            except Exception:
-                pass
+            except Exception as _cache_err:
+                import logging as _logging
+                _logging.getLogger("app").warning(
+                    "Failed to restore cached discovery: %s: %s",
+                    type(_cache_err).__name__, _cache_err,
+                )
 
     from utils.orchestrator_status import get_orchestrator_status
     _orch_status = get_orchestrator_status()
@@ -3217,7 +3764,7 @@ with tab_discovery:
     _disc_col1, _disc_col2 = st.columns([1, 3])
     with _disc_col1:
         _run_discovery = st.button(
-            "🔎 Re-run Screener",
+            "Re-run screener",
             type="primary",
             use_container_width=True,
             disabled=_orch_status["running"],
@@ -3228,27 +3775,27 @@ with tab_discovery:
             if _ckpt and _ckpt["total"] > 0:
                 _pct = _ckpt["scored_count"] / _ckpt["total"]
                 _eta = _orch_status.get("eta_minutes")
-                _eta_str = f" · ~{_eta:.0f} min remaining" if _eta else ""
+                _eta_str = f" | about {_eta:.0f} min remaining" if _eta else ""
                 st.warning(
-                    f"⏳ Batch orchestrator running (PID {_orch_status['pid']}) · "
+                    f"Batch orchestrator running (PID {_orch_status['pid']}) | "
                     f"Scoring {_ckpt['scored_count']}/{_ckpt['total']} "
                     f"({_pct:.0%}){_eta_str}"
                 )
             else:
                 st.warning(
-                    f"⏳ Batch orchestrator running (PID {_orch_status['pid']}) · "
+                    f"Batch orchestrator running (PID {_orch_status['pid']}) | "
                     f"Screening phase (no scoring progress yet)"
                 )
         else:
             _cached_ts = st.session_state.get("discovery_cached_from")
             if _cached_ts and "discovery_results" in st.session_state:
-                st.info(f"Showing cached results · {format_freshness(_cached_ts)} · Click Re-run to refresh")
+                st.info(f"Showing cached results | {format_freshness(_cached_ts)} | Click Re-run to refresh")
             else:
                 st.info(
-                    f"Screens {len(config.DISCOVERY_EXCHANGES)} US exchanges + global universe · "
-                    f"Market cap ≥ £{config.DISCOVERY_MIN_MCAP / 1e6:.0f}M (no upper cap) · "
-                    f"Top {config.DISCOVERY_TOP_N_FULL_SCORE} fully scored · "
-                    f"~60-90 min runtime"
+                    f"Screens {len(config.DISCOVERY_EXCHANGES)} US exchanges plus global universe | "
+                    f"Market cap at least GBP {config.DISCOVERY_MIN_MCAP / 1e6:.0f}M | "
+                    f"Top {config.DISCOVERY_TOP_N_FULL_SCORE} fully scored | "
+                    f"about 60-90 min runtime"
                 )
 
     if _run_discovery:
@@ -3288,13 +3835,13 @@ with tab_discovery:
             # Funnel summary
             momentum_count = getattr(disc, "after_momentum_screen", "?")
             st.markdown(
-                f"**Funnel:** {disc.screened_count} screened → "
-                f"{momentum_count} momentum → "
-                f"{disc.after_quick_filter} filtered → "
-                f"{disc.after_corr_filter} uncorrelated → "
-                f"{disc.after_quick_rank} ranked → "
-                f"{disc.fully_scored} scored · "
-                f"⏱️ {disc.run_time_seconds:.0f}s"
+                f"**Screener path:** {disc.screened_count} checked -> "
+                f"{momentum_count} with trend -> "
+                f"{disc.after_quick_filter} passed quick checks -> "
+                f"{disc.after_corr_filter} not too similar -> "
+                f"{disc.after_quick_rank} ranked -> "
+                f"{disc.fully_scored} fully scored | "
+                f"{disc.run_time_seconds:.0f}s"
             )
 
             _best_idea, _best_idea_meta, _best_idea_sub = _pick_best_new_opportunity(disc.candidates)
@@ -3321,48 +3868,48 @@ with tab_discovery:
                 ),
             )
 
-            st.markdown("#### Discovery Command Center")
+            st.markdown("#### Recommendation summary")
             cc1, cc2, cc3, cc4 = st.columns(4)
             _command_cards = [
                 (
-                    cc1, "best", "Best New Opportunity", _best_idea,
-                    f"Final rank {safe_float(getattr(_best_idea, 'final_rank', 0)):.3f} · {getattr(_best_idea, 'action', 'NEUTRAL')}",
+                    cc1, "best", "Best new opportunity", _best_idea,
+                    f"Opportunity score {safe_float(getattr(_best_idea, 'final_rank', 0)):.3f} | {_plain_action(getattr(_best_idea, 'action', 'NEUTRAL'))}",
                 ),
                 (
-                    cc2, "fit", "Best Diversifier", _best_fit,
-                    f"Portfolio fit {safe_float(getattr(_best_fit, 'portfolio_fit_score', 0)):.2f} · Corr {safe_float(getattr(_best_fit, 'max_correlation', 0)):.2f}",
+                    cc2, "fit", "Best diversifier", _best_fit,
+                    f"Portfolio fit {safe_float(getattr(_best_fit, 'portfolio_fit_score', 0)):.2f} | Similarity {safe_float(getattr(_best_fit, 'max_correlation', 0)):.2f}",
                 ),
                 (
-                    cc3, "momentum", "Momentum Leader", _best_momentum,
-                    f"Momentum {safe_float(getattr(_best_momentum, 'momentum_score', 0)):.2f} · 90d {format_pct(safe_float(getattr(_best_momentum, 'return_90d', 0)) * 100)}",
+                    cc3, "momentum", "Trend leader", _best_momentum,
+                    f"Trend {safe_float(getattr(_best_momentum, 'momentum_score', 0)):.2f} | 90d {format_pct(safe_float(getattr(_best_momentum, 'return_90d', 0)) * 100)}",
                 ),
                 (
-                    cc4, "risk", "Biggest Watchout", _watch_candidate,
+                    cc4, "risk", "Biggest caution", _watch_candidate,
                     _candidate_risk_tags(_watch_candidate)[0] if _candidate_risk_tags(_watch_candidate) else "No major red-flag overlays in the current top tier",
                 ),
             ]
             _command_cards = [
-                (cc1, "best", "Best New Opportunity", _best_idea, _best_idea_meta, _best_idea_sub),
+                (cc1, "best", "Best new opportunity", _best_idea, _best_idea_meta, _best_idea_sub),
                 (
                     cc2,
                     "fit",
-                    "Best Diversifier",
+                    "Best diversifier",
                     _best_fit,
-                    f"Portfolio fit {safe_float(getattr(_best_fit, 'portfolio_fit_score', 0)):.2f} · Corr {safe_float(getattr(_best_fit, 'max_correlation', 0)):.2f}",
+                    f"Portfolio fit {safe_float(getattr(_best_fit, 'portfolio_fit_score', 0)):.2f} | Similarity {safe_float(getattr(_best_fit, 'max_correlation', 0)):.2f}",
                     _candidate_thesis(_best_fit),
                 ),
                 (
                     cc3,
                     "momentum",
-                    "Momentum Leader",
+                    "Trend leader",
                     _best_momentum,
-                    f"Momentum {safe_float(getattr(_best_momentum, 'momentum_score', 0)):.2f} · 90d {format_pct(safe_float(getattr(_best_momentum, 'return_90d', 0)) * 100)}",
+                    f"Trend {safe_float(getattr(_best_momentum, 'momentum_score', 0)):.2f} | 90d {format_pct(safe_float(getattr(_best_momentum, 'return_90d', 0)) * 100)}",
                     _candidate_thesis(_best_momentum),
                 ),
                 (
                     cc4,
                     "risk",
-                    "Biggest Watchout",
+                    "Biggest caution",
                     _watch_candidate,
                     _candidate_risk_tags(_watch_candidate)[0] if _candidate_risk_tags(_watch_candidate) else "No major red-flag overlays in the current top tier",
                     _candidate_thesis(_watch_candidate),
@@ -3383,26 +3930,35 @@ with tab_discovery:
                         unsafe_allow_html=True,
                     )
 
-            st.markdown("#### Recommendation Lens")
+            _setup_rows = _build_discovery_setup_rows(disc.candidates)
+            if _setup_rows:
+                st.markdown("#### Actionable setup board")
+                st.caption(
+                    "Ready-to-buy names surface first, then pullback setups. "
+                    "Identity warnings and weak execution plans are demoted."
+                )
+                st.dataframe(pd.DataFrame(_setup_rows), hide_index=True, use_container_width=True)
+
+            st.markdown("#### Recommendation view")
             _lens = st.radio(
-                "Recommendation lens",
-                ["Balanced Growth / Downside Protection", "Best Ideas", "Best Diversifiers", "Momentum Leaders", "Value / Quality"],
+                "Recommendation view",
+                ["Balanced growth and downside protection", "Best ideas", "Best diversifiers", "Trend leaders", "Value and quality"],
                 horizontal=True,
                 label_visibility="collapsed",
                 key="discovery_lens",
             )
             _lens_notes = {
-                "Balanced Growth / Downside Protection": "Prioritises ready entries, lower beta, portfolio fit, and income support over raw excitement.",
-                "Best Ideas": "Balanced view of conviction, confidence, momentum, and portfolio fit.",
-                "Best Diversifiers": "Highlights names that improve portfolio shape without giving up too much quality.",
-                "Momentum Leaders": "Pulls the strongest trend-following setups to the front.",
-                "Value / Quality": "Pushes fundamental strength and cleaner business quality higher in the stack.",
+                "Balanced growth and downside protection": "Prioritises ready entries, calmer stocks, portfolio fit, and income support over raw excitement.",
+                "Best ideas": "Balanced view of conviction, confidence, trend strength, and portfolio fit.",
+                "Best diversifiers": "Highlights names that improve portfolio shape without giving up too much quality.",
+                "Trend leaders": "Pulls the strongest trend-following setups to the front.",
+                "Value and quality": "Pushes fundamental strength and cleaner business quality higher in the stack.",
             }
             st.markdown(f'<div class="lens-note">{_html.escape(_lens_notes[_lens])}</div>', unsafe_allow_html=True)
 
             _featured = _lens_sorted_candidates(disc.candidates, _lens)[:3]
             if _featured:
-                st.markdown("#### Featured Recommendations")
+                st.markdown("#### Featured recommendations")
                 _feature_cols = st.columns(len(_featured))
                 _country_flags = {
                     "US": "US", "UK": "UK", "GB": "UK", "CA": "CA",
@@ -3413,132 +3969,37 @@ with tab_discovery:
                     with col:
                         _render_candidate_detail_card(cand, label=f"#{idx} in {_lens}")
 
-            # Top 3 recommendations
-            top_3 = disc.candidates[:3]
-            if False and top_3:
-                st.markdown("#### Top Recommendations")
-                rec_cols = st.columns(len(top_3))
-                for idx, (col, cand) in enumerate(zip(rec_cols, top_3)):
-                    with col:
-                        # Country flag approximation
-                        country_flags = {
-                            "US": "🇺🇸", "UK": "🇬🇧", "GB": "🇬🇧", "CA": "🇨🇦",
-                            "DE": "🇩🇪", "FR": "🇫🇷", "IT": "🇮🇹", "ES": "🇪🇸",
-                            "NL": "🇳🇱", "JP": "🇯🇵",
-                        }
-                        flag = country_flags.get(cand.country, "🌍")
-
-                        # Action color
-                        action_colors = {
-                            "STRONG BUY": "🟢", "BUY": "🟡",
-                            "NEUTRAL": "⚪", "AVOID": "🔴",
-                            "INSUFFICIENT DATA": "⚫",
-                        }
-                        dot = action_colors.get(cand.action, "⚪")
-
-                        st.markdown(f"**#{idx + 1} {flag} {cand.ticker}**")
-                        st.markdown(f"*{cand.name}*")
-                        st.metric("Final Rank", f"{cand.final_rank:.3f}", delta=f"{cand.action}")
-                        st.caption(f"📍 {cand.exchange} · {cand.sector}")
-                        _mcap = safe_float(cand.market_cap)
-                        st.caption(f"Market Cap: {format_currency(_mcap / 1e9, 'GBP', decimals=1)}B" if _mcap > 0 else "Market Cap: N/A")
-
-                        # Sub-scores
-                        st.markdown(
-                            f"Tech: `{cand.technical_score:.2f}` · "
-                            f"Fund: `{cand.fundamental_score:.2f}` · "
-                            f"Sent: `{cand.sentiment_score:.2f}` · "
-                            f"Fcast: `{cand.forecast_score:.2f}`"
-                        )
-
-                        # Momentum metrics
-                        if hasattr(cand, "momentum_score"):
-                            ret_90 = getattr(cand, "return_90d", 0) * 100
-                            ret_30 = getattr(cand, "return_30d", 0) * 100
-                            vol_r = getattr(cand, "volume_ratio", 1.0)
-                            st.caption(
-                                f"📈 Momentum: {cand.momentum_score:.2f} · "
-                                f"90d: {ret_90:+.1f}% · 30d: {ret_30:+.1f}% · "
-                                f"Vol: {vol_r:.1f}x"
-                            )
-
-                        # Risk overlay flags
-                        _cand_risk = []
-                        if getattr(cand, "is_parabolic", False):
-                            _cand_risk.append(f"⚠️ PARABOLIC (-{cand.parabolic_penalty:.2f})")
-                        if getattr(cand, "earnings_miss", False):
-                            _miss_pct = getattr(cand, "earnings_miss_pct", None)
-                            _miss_str = f" ({_miss_pct:+.0f}%)" if _miss_pct is not None else ""
-                            _days_ago = getattr(cand, "post_earnings_days", None)
-                            _days_str = f" {_days_ago}d ago" if _days_ago else ""
-                            _cand_risk.append(f"❌ EARNINGS MISS{_miss_str}{_days_str}")
-                        elif getattr(cand, "post_earnings_recent", False):
-                            _days_ago = getattr(cand, "post_earnings_days", None)
-                            _cand_risk.append(f"📊 Reported {_days_ago}d ago" if _days_ago else "📊 Recent earnings")
-                        if getattr(cand, "earnings_imminent", False):
-                            _cand_risk.append(f"⚠️ Earnings in {cand.earnings_days}d")
-                        elif getattr(cand, "earnings_near", False):
-                            _cand_risk.append(f"📅 Earnings in {cand.earnings_days}d")
-                        if getattr(cand, "near_52w_high", False):
-                            _pct = getattr(cand, "pct_from_52w_high", None)
-                            _pct_str = f" ({_pct:.1%} below)" if _pct is not None else ""
-                            _cand_risk.append(f"📈 NEAR 52W HIGH{_pct_str}")
-                        _tier = getattr(cand, "cap_tier", "unknown")
-                        if _tier in ("small", "micro"):
-                            _cand_risk.append(f"🏷️ {_tier.upper()} cap")
-                        if _cand_risk:
-                            st.caption(" · ".join(_cand_risk))
-
-                        # FX note
-                        if cand.fx_penalty_applied:
-                            st.caption(f"⚠️ FX penalty: -{cand.fx_penalty_pct:.1f}% ({cand.currency})")
-                        else:
-                            st.caption(f"✅ No FX fee (GBP-denominated)")
-
-                        # Portfolio fit
-                        fit_desc = []
-                        if cand.max_correlation < 0.40:
-                            fit_desc.append("low correlation to portfolio")
-                        elif cand.max_correlation < 0.60:
-                            fit_desc.append(f"moderate correlation ({cand.max_correlation:.2f})")
-                        else:
-                            fit_desc.append(f"correlation {cand.max_correlation:.2f} with {cand.correlated_with}")
-
-                        if cand.sector_weight_if_added < 0.25:
-                            fit_desc.append(f"adds {cand.sector} diversification")
-                        st.caption(f"🎯 Fit ({cand.portfolio_fit_score:.2f}): {'; '.join(fit_desc)}")
-
-                        # Why
-                        st.caption(f"**Why:** {cand.why}")
-
-            # Full results table — click a row to see the detail card
-            with st.expander("📋 All Scored Candidates"):
+            # Full results table: click a row to see the detail card.
+            with st.expander("All scored candidates"):
                 disc_rows = []
                 for c in disc.candidates:
                     _c_entry = safe_float(getattr(c, "entry_price", None))
                     _c_stop = safe_float(getattr(c, "stop_loss", None))
                     _c_rr = safe_float(getattr(c, "r_r_ratio", None))
                     disc_rows.append({
-                        "Rank": c.final_rank,
+                        "Opportunity score": c.final_rank,
+                        "Top idea": "Yes" if _is_top_pick(c) else "",
                         "Ticker": c.ticker,
                         "Name": c.name,
                         "Exchange": c.exchange,
                         "Sector": c.sector,
-                        "Entry Stance": _candidate_entry_stance(c),
-                        "↓ Score": c.aggregate_score,
+                        "Entry view": _candidate_entry_stance(c),
+                        "Base score": c.aggregate_score,
                         "Confidence": _discovery_confidence(c)[0],
-                        "Fit": c.portfolio_fit_score,
-                        "Beta": round(safe_float(getattr(c, "beta_90d", None), default=0.0), 2) if getattr(c, "beta_90d", None) is not None else "—",
-                        "Yield": f"{safe_float(getattr(c, 'dividend_yield', 0)) * 100:.1f}%" if getattr(c, "dividend_yield", None) is not None else "—",
-                        "Identity": "Verify" if getattr(c, "ticker_identity_warning", None) else "OK",
-                        "Action": c.action,
-                        "Tech": round(safe_float(c.technical_score), 2),
-                        "Fund": round(safe_float(c.fundamental_score), 2),
-                        "Sent": round(safe_float(c.sentiment_score), 2),
-                        "Fcast": round(safe_float(c.forecast_score), 2),
-                        "Entry": f"{_c_entry:.2f}" if _c_entry else "—",
-                        "Stop": f"{_c_stop:.2f}" if _c_stop else "—",
-                        "R/R": f"{_c_rr:.1f}x" if _c_rr and _c_rr > 0 else "—",
+                        "Portfolio fit": c.portfolio_fit_score,
+                        "Market sensitivity": round(safe_float(getattr(c, "beta_90d", None), default=0.0), 2) if getattr(c, "beta_90d", None) is not None else "-",
+                        "Dividend yield": f"{safe_float(getattr(c, 'dividend_yield', 0)) * 100:.1f}%" if getattr(c, "dividend_yield", None) is not None else "-",
+                        "Ticker check": "Verify" if getattr(c, "ticker_identity_warning", None) else "OK",
+                        "Recommendation": _plain_action(c.action),
+                        "Ready now": "Yes" if getattr(c, "ready_contract_status", None) == "PASS" else "No",
+                        "Next trigger": _candidate_entry_trigger(c),
+                        "Price trend": round(safe_float(c.technical_score), 2),
+                        "Business quality": round(safe_float(c.fundamental_score), 2),
+                        "News mood": round(safe_float(c.sentiment_score), 2),
+                        "Forecast": round(safe_float(c.forecast_score), 2),
+                        "Buy around": f"{_c_entry:.2f}" if _c_entry else "-",
+                        "Risk limit": f"{_c_stop:.2f}" if _c_stop else "-",
+                        "Reward/risk": f"{_c_rr:.1f}x" if _c_rr and _c_rr > 0 else "-",
                     })
                 if disc_rows:
                     _disc_df = pd.DataFrame(disc_rows)
@@ -3555,9 +4016,16 @@ with tab_discovery:
                             return "color: #ef4444"
                         return "color: #6b7280"
 
-                    _pillar_cols = ["Tech", "Fund", "Sent", "Fcast"]
+                    def _top_pick_style(val):
+                        if val == "Yes":
+                            return "background: rgba(234, 179, 8, 0.15); color: #eab308; font-weight: 700; text-align: center"
+                        return ""
+
+                    _pillar_cols = ["Price trend", "Business quality", "News mood", "Forecast"]
                     _styled = _disc_df.style.map(
                         _pillar_color, subset=_pillar_cols,
+                    ).map(
+                        _top_pick_style, subset=["Top idea"],
                     ).format(
                         {col: "{:+.2f}" for col in _pillar_cols},
                     )
@@ -3577,11 +4045,11 @@ with tab_discovery:
                         if 0 <= _sel_idx < len(disc.candidates):
                             _sel_cand = disc.candidates[_sel_idx]
                             st.divider()
-                            _render_candidate_detail_card(_sel_cand, label=f"{_sel_cand.ticker} Detail")
+                            _render_candidate_detail_card(_sel_cand, label=f"{_sel_cand.ticker} detail")
 
             # Rejection reasons
             if disc.rejections:
-                with st.expander(f"🚫 Rejected Candidates ({len(disc.rejections)})"):
+                with st.expander(f"Rejected candidates ({len(disc.rejections)})"):
                     rej_rows = []
                     for r in disc.rejections[:100]:  # Cap display
                         rej_rows.append({
@@ -3613,26 +4081,27 @@ with tab_discovery:
             _fcast_acc = get_forecast_accuracy()
 
             if _perf or _pending:
-                with st.expander(f"📊 Signal Track Record ({len(_perf)} evaluated, {_pending} pending)"):
+                with st.expander(f"Screener track record ({len(_perf)} evaluated, {_pending} pending)"):
                     # --- Pillar Effectiveness ---
                     if _pstats:
-                        st.markdown("**Pillar Effectiveness (which signals predict 90-day returns)**")
+                        st.markdown("**Which score drivers have worked**")
+                        st.caption(_help("ic"))
                         ps_rows = [{
-                            "Pillar": s["pillar"].title(),
-                            "IC": f"{s['information_coefficient']:+.3f}",
-                            "Hit Rate": f"{s['hit_rate']:.0%}",
-                            "Avg Return (High)": f"{s['avg_return_high']:+.1f}%",
-                            "Avg Return (Low)": f"{s['avg_return_low']:+.1f}%",
+                            "Score driver": _plain_pillar(s["pillar"]),
+                            "Predictive link": f"{s['information_coefficient']:+.3f}",
+                            "Hit rate": f"{s['hit_rate']:.0%}",
+                            "Avg return - high score": f"{s['avg_return_high']:+.1f}%",
+                            "Avg return - low score": f"{s['avg_return_low']:+.1f}%",
                             "Samples": s["sample_size"],
                         } for s in _pstats]
                         st.dataframe(pd.DataFrame(ps_rows), hide_index=True, use_container_width=True)
 
                     # --- Action Calibration ---
                     if _acal:
-                        st.markdown("**Action Calibration (are action labels accurate?)**")
+                        st.markdown("**Are recommendations calibrated?**")
                         ac_rows = [{
-                            "Action": a["action"],
-                            "Avg 90d Return": f"{a['avg_return_90d']:+.1f}%",
+                            "Recommendation": _plain_action(a["action"]),
+                            "Avg 90d return": f"{a['avg_return_90d']:+.1f}%",
                             "Accuracy": f"{a['hit_rate']:.0%}",
                             "Samples": a["sample_size"],
                         } for a in _acal]
@@ -3640,11 +4109,11 @@ with tab_discovery:
 
                     # --- Regime Effectiveness ---
                     if _rstats:
-                        st.markdown("**Regime Effectiveness (which regime works best?)**")
+                        st.markdown("**Which market backdrop works best?**")
                         re_rows = [{
-                            "Regime": r["regime"],
-                            "Avg 90d Return": f"{r['avg_return_90d']:+.1f}%",
-                            "Best Pillar": (r["best_pillar"] or "—").title(),
+                            "Market backdrop": r["regime"],
+                            "Avg 90d return": f"{r['avg_return_90d']:+.1f}%",
+                            "Best score driver": _plain_pillar(r["best_pillar"] or "-"),
                             "Samples": r["sample_size"],
                         } for r in _rstats]
                         st.dataframe(pd.DataFrame(re_rows), hide_index=True, use_container_width=True)
@@ -3653,39 +4122,39 @@ with tab_discovery:
                     st_col, fc_col = st.columns(2)
                     with st_col:
                         if _st_stats and _st_stats.get("with_stops"):
-                            st.markdown("**Stop-Loss / Take-Profit Hits**")
+                            st.markdown("**Risk limit and target hits**")
                             total_w = _st_stats["with_stops"]
                             s_hit = _st_stats.get("stops_hit") or 0
                             t_hit = _st_stats.get("targets_hit") or 0
                             st.caption(
-                                f"Stops hit: {s_hit}/{total_w} ({s_hit/total_w:.0%})"
-                                + (f" — avg day {_st_stats['avg_stop_day']:.0f}" if _st_stats.get("avg_stop_day") else "")
+                                f"Risk limits hit: {s_hit}/{total_w} ({s_hit/total_w:.0%})"
+                                + (f" - avg day {_st_stats['avg_stop_day']:.0f}" if _st_stats.get("avg_stop_day") else "")
                             )
                             st.caption(
                                 f"Targets hit: {t_hit}/{total_w} ({t_hit/total_w:.0%})"
-                                + (f" — avg day {_st_stats['avg_target_day']:.0f}" if _st_stats.get("avg_target_day") else "")
+                                + (f" - avg day {_st_stats['avg_target_day']:.0f}" if _st_stats.get("avg_target_day") else "")
                             )
                     with fc_col:
                         if _st_stats and _st_stats.get("avg_forecast_err_5d") is not None:
-                            st.markdown("**Forecast Accuracy**")
-                            st.caption(f"5-day avg error: {_st_stats['avg_forecast_err_5d']:.1f}%")
+                            st.markdown("**Forecast accuracy**")
+                            st.caption(f"5-day average miss: {_st_stats['avg_forecast_err_5d']:.1f}%")
                             if _st_stats.get("avg_forecast_err_63d") is not None:
-                                st.caption(f"63-day avg error: {_st_stats['avg_forecast_err_63d']:.1f}%")
+                                st.caption(f"63-day average miss: {_st_stats['avg_forecast_err_63d']:.1f}%")
 
                     # --- Multi-horizon signal performance ---
                     if _perf:
-                        st.markdown("**Signal Performance — Multi-Horizon Returns**")
+                        st.markdown("**Recommendation performance across time**")
                         perf_rows = [{
                             "Date": p["run_date"][:10],
                             "Ticker": p["ticker"],
-                            "Source": p.get("source", "—"),
-                            "Action": p.get("action", "—"),
+                            "Source": p.get("source", "-"),
+                            "Recommendation": _plain_action(p.get("action", "-")),
                             "Score": f"{p['aggregate_score']:.3f}",
-                            "30d": f"{p['return_30d']:+.1f}%" if p.get("return_30d") is not None else "—",
-                            "60d": f"{p['return_60d']:+.1f}%" if p.get("return_60d") is not None else "—",
-                            "90d": f"{p['return_90d']:+.1f}%" if p.get("return_90d") is not None else "—",
+                            "30d": f"{p['return_30d']:+.1f}%" if p.get("return_30d") is not None else "-",
+                            "60d": f"{p['return_60d']:+.1f}%" if p.get("return_60d") is not None else "-",
+                            "90d": f"{p['return_90d']:+.1f}%" if p.get("return_90d") is not None else "-",
                             "Beat SPY": "Yes" if p.get("beat_market") else "No",
-                            "Action OK": "Yes" if p.get("action_correct") else "No",
+                            "Recommendation OK": "Yes" if p.get("action_correct") else "No",
                         } for p in _perf]
                         st.dataframe(pd.DataFrame(perf_rows), hide_index=True, use_container_width=True)
 
@@ -3693,17 +4162,17 @@ with tab_discovery:
                         returns = [p["return_90d"] for p in _perf if p.get("return_90d") is not None]
                         if returns:
                             bc1, bc2, bc3, bc4 = st.columns(4)
-                            bc1.metric("Avg Return", f"{sum(returns)/len(returns):+.1f}%")
-                            bc2.metric("Win Rate", f"{sum(1 for r in returns if r > 0)/len(returns):.0%}")
-                            bc3.metric("Best Pick", f"{max(returns):+.1f}%")
-                            bc4.metric("Worst Pick", f"{min(returns):+.1f}%")
+                            bc1.metric("Avg return", f"{sum(returns)/len(returns):+.1f}%")
+                            bc2.metric("Win rate", f"{sum(1 for r in returns if r > 0)/len(returns):.0%}")
+                            bc3.metric("Best pick", f"{max(returns):+.1f}%")
+                            bc4.metric("Worst pick", f"{min(returns):+.1f}%")
 
                         # Beat market rate
                         beat = [p for p in _perf if p.get("beat_market") is not None]
                         if beat:
                             beat_rate = sum(1 for p in beat if p["beat_market"]) / len(beat)
                             st.caption(f"Beat SPY: {beat_rate:.0%} of signals | "
-                                       f"Action accuracy: {sum(1 for p in _perf if p.get('action_correct'))/len(_perf):.0%}")
+                                       f"Recommendation accuracy: {sum(1 for p in _perf if p.get('action_correct'))/len(_perf):.0%}")
         except Exception:
             pass
 
@@ -3713,30 +4182,30 @@ with tab_discovery:
 
             _sc = compute_scorecard(source="all", min_signals=5)
             if _sc and _sc.evaluated_signals >= 5 and _sc.sharpe_ratio is not None:
-                with st.expander(f"📈 **Performance Scorecard** ({_sc.evaluated_signals} signals evaluated)"):
+                with st.expander(f"Performance scorecard ({_sc.evaluated_signals} recommendations evaluated)"):
                     # Top-level risk/return metrics
                     ev1, ev2, ev3, ev4 = st.columns(4)
-                    ev1.metric("Sharpe Ratio", f"{_sc.sharpe_ratio:.2f}")
-                    ev2.metric("Sortino Ratio", f"{_sc.sortino_ratio:.2f}" if _sc.sortino_ratio else "—")
-                    ev3.metric("Max Drawdown", f"{_sc.max_drawdown:+.1f}%" if _sc.max_drawdown else "—")
-                    ev4.metric("Calmar Ratio", f"{_sc.calmar_ratio:.2f}" if _sc.calmar_ratio else "—")
+                    ev1.metric("Return per unit of risk", f"{_sc.sharpe_ratio:.2f}", help="Sharpe ratio: higher means more return for each unit of volatility.")
+                    ev2.metric("Downside risk quality", f"{_sc.sortino_ratio:.2f}" if _sc.sortino_ratio else "-", help="Sortino ratio: like Sharpe, but focuses on downside moves.")
+                    ev3.metric("Worst drawdown", f"{_sc.max_drawdown:+.1f}%" if _sc.max_drawdown else "-")
+                    ev4.metric("Recovery quality", f"{_sc.calmar_ratio:.2f}" if _sc.calmar_ratio else "-", help="Calmar ratio: return compared with worst drawdown.")
 
                     ev5, ev6, ev7, ev8 = st.columns(4)
-                    ev5.metric("Hit Rate (90d)", f"{_sc.overall_hit_rate:.0%}" if _sc.overall_hit_rate else "—")
-                    ev6.metric("Action Accuracy", f"{_sc.action_accuracy:.0%}" if _sc.action_accuracy else "—")
-                    ev7.metric("Beat SPY Rate", f"{_sc.beat_benchmark_rate:.0%}" if _sc.beat_benchmark_rate else "—")
-                    ev8.metric("IC Stability", f"{_sc.ic_stability:.4f}" if _sc.ic_stability else "—")
+                    ev5.metric("Hit rate (90d)", f"{_sc.overall_hit_rate:.0%}" if _sc.overall_hit_rate else "-")
+                    ev6.metric("Recommendation accuracy", f"{_sc.action_accuracy:.0%}" if _sc.action_accuracy else "-")
+                    ev7.metric("Beat SPY rate", f"{_sc.beat_benchmark_rate:.0%}" if _sc.beat_benchmark_rate else "-")
+                    ev8.metric("Rank stability", f"{_sc.ic_stability:.4f}" if _sc.ic_stability else "-", help=_help("ic"))
 
                     # Per-horizon table
                     if _sc.horizons:
-                        st.markdown("**Returns by Horizon**")
+                        st.markdown("**Returns by time window**")
                         _h_rows = pd.DataFrame([{
                             "Horizon": h.horizon,
-                            "Avg Return": f"{h.avg_return:+.1f}%",
+                            "Avg return": f"{h.avg_return:+.1f}%",
                             "Median": f"{h.median_return:+.1f}%",
-                            "Std Dev": f"{h.std_return:.1f}%",
-                            "Hit Rate": f"{h.hit_rate:.0%}",
-                            "Alpha vs SPY": f"{h.alpha:+.1f}%" if h.horizon == "90d" else "—",
+                            "Typical swing": f"{h.std_return:.1f}%",
+                            "Hit rate": f"{h.hit_rate:.0%}",
+                            "Return vs SPY": f"{h.alpha:+.1f}%" if h.horizon == "90d" else "-",
                             "Best": f"{h.best:+.1f}%",
                             "Worst": f"{h.worst:+.1f}%",
                             "N": h.sample_size,
@@ -3745,12 +4214,12 @@ with tab_discovery:
 
                     # Per-regime table
                     if _sc.regimes:
-                        st.markdown("**Performance by Market Regime**")
+                        st.markdown("**Performance by market backdrop**")
                         _r_rows = pd.DataFrame([{
-                            "Regime": r.regime,
-                            "Avg 90d Return": f"{r.avg_return_90d:+.1f}%",
-                            "Hit Rate": f"{r.hit_rate:.0%}",
-                            "Best Pillar": (r.best_pillar or "—").title(),
+                            "Market backdrop": r.regime,
+                            "Avg 90d return": f"{r.avg_return_90d:+.1f}%",
+                            "Hit rate": f"{r.hit_rate:.0%}",
+                            "Best score driver": _plain_pillar(r.best_pillar or "-"),
                             "N": r.sample_size,
                         } for r in _sc.regimes])
                         st.dataframe(_r_rows, hide_index=True, use_container_width=True)
@@ -3759,17 +4228,17 @@ with tab_discovery:
                     st_c, fc_c = st.columns(2)
                     with st_c:
                         if _sc.stop_hit_rate is not None:
-                            st.markdown("**Stop/Target Effectiveness**")
-                            st.caption(f"Stop-loss hit rate: {_sc.stop_hit_rate:.0%}"
+                            st.markdown("**Risk limit and target effectiveness**")
+                            st.caption(f"Risk limit hit rate: {_sc.stop_hit_rate:.0%}"
                                        + (f" (avg day {_sc.avg_stop_day:.0f})" if _sc.avg_stop_day else ""))
-                            st.caption(f"Take-profit hit rate: {_sc.target_hit_rate:.0%}"
+                            st.caption(f"Target hit rate: {_sc.target_hit_rate:.0%}"
                                        + (f" (avg day {_sc.avg_target_day:.0f})" if _sc.avg_target_day else ""))
                     with fc_c:
                         if _sc.avg_forecast_error_5d is not None:
-                            st.markdown("**Forecast Accuracy**")
-                            st.caption(f"5-day avg error: {_sc.avg_forecast_error_5d:.1f}%")
+                            st.markdown("**Forecast accuracy**")
+                            st.caption(f"5-day average miss: {_sc.avg_forecast_error_5d:.1f}%")
                             if _sc.avg_forecast_error_63d is not None:
-                                st.caption(f"63-day avg error: {_sc.avg_forecast_error_63d:.1f}%")
+                                st.caption(f"63-day average miss: {_sc.avg_forecast_error_63d:.1f}%")
 
         except Exception as _sc_err:
             import logging as _logging
@@ -3782,17 +4251,17 @@ with tab_discovery:
             _disc_sc = get_discovery_scorecard()
             if _disc_sc and _disc_sc.get("total_evaluated", 0) >= 5:
                 with st.expander(
-                    f"🎯 **Discovery Quality** ({_disc_sc['total_evaluated']} evaluated picks)"
+                    f"New-idea quality ({_disc_sc['total_evaluated']} evaluated picks)"
                 ):
                     dc1, dc2, dc3, dc4 = st.columns(4)
-                    dc1.metric("Top-10 Hit Rate", f"{safe_float(_disc_sc.get('top10_hit_rate_90d')):.0%}")
-                    dc2.metric("Top-10 Avg Return", format_pct(_disc_sc.get("top10_avg_return_90d")))
-                    dc3.metric("Excess vs SPY", format_pct(_disc_sc.get("excess_vs_spy_90d")))
-                    dc4.metric("Ranking Stability", f"{safe_float(_disc_sc.get('ranking_stability')):.0%}")
+                    dc1.metric("Top-10 hit rate", f"{safe_float(_disc_sc.get('top10_hit_rate_90d')):.0%}")
+                    dc2.metric("Top-10 avg return", format_pct(_disc_sc.get("top10_avg_return_90d")))
+                    dc3.metric("Return vs SPY", format_pct(_disc_sc.get("excess_vs_spy_90d")))
+                    dc4.metric("Ranking stability", f"{safe_float(_disc_sc.get('ranking_stability')):.0%}")
 
                     dc5, dc6 = st.columns(2)
-                    dc5.metric("Top-30 Hit Rate", f"{safe_float(_disc_sc.get('top30_hit_rate_90d')):.0%}")
-                    dc6.metric("Swap Success Rate", f"{safe_float(_disc_sc.get('swap_success_rate')):.0%}")
+                    dc5.metric("Top-30 hit rate", f"{safe_float(_disc_sc.get('top30_hit_rate_90d')):.0%}")
+                    dc6.metric("Swap success rate", f"{safe_float(_disc_sc.get('swap_success_rate')):.0%}")
 
                     if _disc_sc.get("summary"):
                         st.caption(_disc_sc["summary"])
@@ -3806,14 +4275,14 @@ with tab_analytics:
     # ---------------------------------------------------------------------------
     # Trade History — Record Sales
     # ---------------------------------------------------------------------------
-    st.markdown("### Trade History")
+    st.markdown("### Trade history")
 
     from utils.data_fetch import load_portfolio_full, record_sale
 
     _portfolio_full = load_portfolio_full()
     _trade_history = _portfolio_full.get("trade_history", [])
 
-    tab_record, tab_history = st.tabs(["Record a Sale", "Past Trades"])
+    tab_record, tab_history = st.tabs(["Record a sale", "Past trades"])
 
     with tab_record:
         st.caption("When you sell a stock on your broker, record it here to track P&L and update your portfolio.")
@@ -3830,8 +4299,8 @@ with tab_analytics:
                 _sel_holding = next((h for h in holdings if h["ticker"] == _sell_ticker), None)
                 if _sel_result and _sel_holding:
                     st.caption(
-                        f"Current price: {_sel_result.get('current_price', 0):.2f} · "
-                        f"Avg buy: {_sel_holding['avg_buy_price']:.2f} · "
+                        f"Current price: {_sel_result.get('current_price', 0):.2f} | "
+                        f"Avg buy: {_sel_holding['avg_buy_price']:.2f} | "
                         f"Qty held: {_sel_holding['quantity']}"
                     )
 
@@ -3860,7 +4329,7 @@ with tab_analytics:
                     f"**Estimated P&L:** :{_pnl_color}[{_preview_pnl:+,.2f} ({_preview_pct:+.1f}%)]"
                 )
 
-            if st.button("Confirm Sale", type="primary"):
+            if st.button("Confirm sale", type="primary"):
                 trade = record_sale(
                     ticker=_sell_ticker,
                     sell_price=_sell_price,
@@ -3870,8 +4339,8 @@ with tab_analytics:
                 )
                 if trade:
                     st.success(
-                        f"Recorded: Sold {trade['quantity']} × {trade['ticker']} @ {trade['sell_price']:.4f} "
-                        f"— P&L: {trade['pnl']:+,.2f} ({trade['pnl_pct']:+.1f}%)"
+                        f"Recorded: sold {trade['quantity']} x {trade['ticker']} at {trade['sell_price']:.4f} "
+                        f"- gain/loss: {trade['pnl']:+,.2f} ({trade['pnl_pct']:+.1f}%)"
                     )
                     st.rerun()
                 else:
@@ -3888,20 +4357,20 @@ with tab_analytics:
                     "Date": t.get("sell_date", "—"),
                     "Ticker": t["ticker"],
                     "Name": t.get("name", ""),
-                    "Qty": t["quantity"],
-                    "Buy Price": f"{t['buy_price']:.4f}",
-                    "Sell Price": f"{t['sell_price']:.4f}",
-                    "P&L": f"{t['pnl']:+,.2f}",
+                    "Quantity": t["quantity"],
+                    "Buy price": f"{t['buy_price']:.4f}",
+                    "Sell price": f"{t['sell_price']:.4f}",
+                    "Gain/loss": f"{t['pnl']:+,.2f}",
                     "Return": f"{t['pnl_pct']:+.1f}%",
                     "Notes": t.get("notes", ""),
                 })
                 _total_realized += t.get("pnl", 0)
 
             tc1, tc2, tc3 = st.columns(3)
-            tc1.metric("Total Trades", len(_trade_history))
-            tc2.metric("Realized P&L", f"{_total_realized:+,.2f}")
+            tc1.metric("Total trades", len(_trade_history))
+            tc2.metric("Realised gain/loss", f"{_total_realized:+,.2f}")
             _winners = sum(1 for t in _trade_history if t.get("pnl", 0) > 0)
-            tc3.metric("Win Rate", f"{_winners / len(_trade_history) * 100:.0f}%" if _trade_history else "—")
+            tc3.metric("Win rate", f"{_winners / len(_trade_history) * 100:.0f}%" if _trade_history else "-")
 
             st.dataframe(pd.DataFrame(_th_rows), hide_index=True, use_container_width=True)
         else:
@@ -3912,7 +4381,7 @@ with tab_analytics:
     # Paper Trading Ledger
     # ---------------------------------------------------------------------------
     st.divider()
-    st.markdown("### Paper Trading Ledger")
+    st.markdown("### Paper trading ledger")
 
     if getattr(config, "PAPER_TRADING_ENABLED", False):
         from engine.paper_trading import (
@@ -3923,7 +4392,7 @@ with tab_analytics:
         _pt_init()
 
         tab_overview, tab_signals, tab_positions, tab_slippage = st.tabs([
-            "Overview", "Signal Log", "Paper Positions", "Slippage Analysis",
+            "Overview", "Signal log", "Paper positions", "Execution drift",
         ])
 
         # --- Overview tab ---
@@ -3934,42 +4403,42 @@ with tab_analytics:
             col1, col2, col3, col4 = st.columns(4)
             total_trades = pnl_sum.get("total_trades") or 0
             with col1:
-                st.metric("Total Closed Trades", total_trades)
+                st.metric("Total closed trades", total_trades)
             with col2:
                 total_pnl = pnl_sum.get("total_pnl") or 0
-                st.metric("Total P&L", f"{'+'if total_pnl>=0 else ''}{total_pnl:,.2f}")
+                st.metric("Total gain/loss", f"{'+'if total_pnl>=0 else ''}{total_pnl:,.2f}")
             with col3:
                 win_rate = (
                     (pnl_sum["winners"] / total_trades * 100)
                     if total_trades > 0 and pnl_sum.get("winners") is not None else 0
                 )
-                st.metric("Win Rate", f"{win_rate:.0f}%")
+                st.metric("Win rate", f"{win_rate:.0f}%")
             with col4:
                 avg_slip = slip_stats.get("avg_slippage_bps") or 0
-                st.metric("Avg Slippage", f"{avg_slip:+.1f} bps")
+                st.metric("Avg execution drift", f"{avg_slip:+.1f} bps", help="Execution drift is the difference between signal price and fill price. bps means basis points: 100 bps = 1%.")
 
             col5, col6, col7, col8 = st.columns(4)
             with col5:
-                st.metric("Avg Return", f"{pnl_sum.get('avg_return_pct') or 0:+.1f}%")
+                st.metric("Avg return", f"{pnl_sum.get('avg_return_pct') or 0:+.1f}%")
             with col6:
-                st.metric("Best Trade", f"{pnl_sum.get('best_trade_pct') or 0:+.1f}%")
+                st.metric("Best trade", f"{pnl_sum.get('best_trade_pct') or 0:+.1f}%")
             with col7:
-                st.metric("Worst Trade", f"{pnl_sum.get('worst_trade_pct') or 0:+.1f}%")
+                st.metric("Worst trade", f"{pnl_sum.get('worst_trade_pct') or 0:+.1f}%")
             with col8:
-                st.metric("Avg Hold", f"{pnl_sum.get('avg_hold_days') or 0:.0f} days")
+                st.metric("Avg hold", f"{pnl_sum.get('avg_hold_days') or 0:.0f} days")
 
             # Unrealized P&L for open positions
             unrealized = get_unrealized_pnl()
             if unrealized:
-                st.markdown("#### Open Paper Positions — Unrealized P&L")
+                st.markdown("#### Open paper positions - unrealised gain/loss")
                 ur_rows = []
                 for u in unrealized:
                     ur_rows.append({
                         "Ticker": u["ticker"],
-                        "Qty": u["quantity"],
-                        "Entry": f"{u['avg_entry_price']:.4f}",
-                        "Current": f"{u['current_price']:.4f}",
-                        "P&L": f"{u['unrealized_pnl']:+,.2f}",
+                        "Quantity": u["quantity"],
+                        "Entry price": f"{u['avg_entry_price']:.4f}",
+                        "Current price": f"{u['current_price']:.4f}",
+                        "Gain/loss": f"{u['unrealized_pnl']:+,.2f}",
                         "Return": f"{u['unrealized_pnl_pct']:+.1f}%",
                     })
                 st.dataframe(pd.DataFrame(ur_rows), hide_index=True, use_container_width=True)
@@ -3985,12 +4454,12 @@ with tab_analytics:
                         "Ticker": s["ticker"],
                         "Side": s["side"],
                         "Source": s["source"],
-                        "Signal Price": f"{s['signal_price']:.4f}" if s["signal_price"] else "—",
+                        "Signal price": f"{s['signal_price']:.4f}" if s["signal_price"] else "-",
                         "Fill Price": f"{s['fill_price']:.4f}" if s.get("fill_price") else "Pending",
-                        "Slippage (bps)": f"{s['slippage_bps']:+.1f}" if s.get("slippage_bps") is not None else "—",
+                        "Execution drift (bps)": f"{s['slippage_bps']:+.1f}" if s.get("slippage_bps") is not None else "-",
                         "Score": f"{s['score']:.3f}" if s.get("score") is not None else "—",
-                        "Action": s.get("action") or "—",
-                        "Swap From": s.get("swap_from") or "—",
+                        "Recommendation": _plain_action(s.get("action")) if s.get("action") else "-",
+                        "Swap from": s.get("swap_from") or "-",
                     })
                 st.dataframe(pd.DataFrame(sig_rows), hide_index=True, use_container_width=True)
             else:
@@ -4002,25 +4471,25 @@ with tab_analytics:
             realized = get_realized_pnl()
 
             if positions:
-                st.markdown("#### Open Positions")
+                st.markdown("#### Open positions")
                 pos_rows = [{
                     "Ticker": p["ticker"],
-                    "Qty": p["quantity"],
-                    "Avg Entry": f"{p['avg_entry_price']:.4f}",
+                    "Quantity": p["quantity"],
+                    "Avg entry": f"{p['avg_entry_price']:.4f}",
                     "Opened": p["opened_at"],
                 } for p in positions]
                 st.dataframe(pd.DataFrame(pos_rows), hide_index=True, use_container_width=True)
 
             if realized:
-                st.markdown("#### Closed Trades")
+                st.markdown("#### Closed trades")
                 rl_rows = [{
                     "Ticker": r["ticker"],
                     "Entry": f"{r['entry_price']:.4f}",
                     "Exit": f"{r['exit_price']:.4f}",
-                    "Qty": r["quantity"],
-                    "P&L": f"{r['pnl']:+,.2f}",
+                    "Quantity": r["quantity"],
+                    "Gain/loss": f"{r['pnl']:+,.2f}",
                     "Return": f"{r['pnl_pct']:+.1f}%",
-                    "Hold": f"{r['hold_days']}d" if r.get("hold_days") else "—",
+                    "Hold": f"{r['hold_days']}d" if r.get("hold_days") else "-",
                     "Closed": r["closed_at"],
                 } for r in realized]
                 st.dataframe(pd.DataFrame(rl_rows), hide_index=True, use_container_width=True)
@@ -4028,16 +4497,17 @@ with tab_analytics:
             if not positions and not realized:
                 st.info("No paper positions yet. Positions are created when pending signals are filled at next-session open.")
 
-        # --- Slippage Analysis tab ---
+        # --- Execution drift tab ---
         with tab_slippage:
             slip_by_ticker = get_slippage_by_ticker()
             if slip_by_ticker:
-                st.markdown("#### Slippage by Ticker")
+                st.markdown("#### Execution drift by ticker")
+                st.caption("Execution drift is the difference between the signal price and fill price. bps means basis points: 100 bps = 1%.")
                 sl_rows = [{
                     "Ticker": t["ticker"],
                     "Fills": t["fills"],
-                    "Avg Slippage (bps)": f"{t['avg_slippage_bps']:+.1f}",
-                    "Avg |Slippage| (bps)": f"{t['avg_abs_slippage_bps']:.1f}",
+                    "Avg drift (bps)": f"{t['avg_slippage_bps']:+.1f}",
+                    "Avg absolute drift (bps)": f"{t['avg_abs_slippage_bps']:.1f}",
                     "Min (bps)": f"{t['min_slippage_bps']:+.1f}",
                     "Max (bps)": f"{t['max_slippage_bps']:+.1f}",
                 } for t in slip_by_ticker]
@@ -4046,19 +4516,19 @@ with tab_analytics:
                 # Overall stats
                 stats = get_slippage_stats()
                 if stats.get("total_fills"):
-                    st.markdown("#### Overall Slippage Distribution")
+                    st.markdown("#### Overall execution drift")
                     mc1, mc2, mc3 = st.columns(3)
                     with mc1:
-                        st.metric("Total Fills", stats["total_fills"])
-                        st.metric("Buy Fills", stats.get("buy_fills") or 0)
+                        st.metric("Total fills", stats["total_fills"])
+                        st.metric("Buy fills", stats.get("buy_fills") or 0)
                     with mc2:
-                        st.metric("Avg Slippage", f"{stats['avg_slippage_bps']:+.1f} bps")
-                        st.metric("Avg Buy Slippage", f"{stats.get('avg_buy_slippage') or 0:+.1f} bps")
+                        st.metric("Avg drift", f"{stats['avg_slippage_bps']:+.1f} bps")
+                        st.metric("Avg buy drift", f"{stats.get('avg_buy_slippage') or 0:+.1f} bps")
                     with mc3:
-                        st.metric("Avg |Slippage|", f"{stats['avg_abs_slippage_bps']:.1f} bps")
-                        st.metric("Avg Sell Slippage", f"{stats.get('avg_sell_slippage') or 0:+.1f} bps")
+                        st.metric("Avg absolute drift", f"{stats['avg_abs_slippage_bps']:.1f} bps")
+                        st.metric("Avg sell drift", f"{stats.get('avg_sell_slippage') or 0:+.1f} bps")
             else:
-                st.info("No fill data yet. Slippage is calculated when pending signals are resolved at next-session open.")
+                st.info("No fill data yet. Execution drift is calculated when pending signals are resolved at next-session open.")
     else:
         st.info("Paper trading is disabled. Set `PAPER_TRADING_ENABLED = True` in config.py to enable.")
 

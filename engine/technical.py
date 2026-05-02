@@ -70,6 +70,18 @@ def analyse_from_df(df: pd.DataFrame, fmp_data: dict | None = None) -> dict:
     low = df["Low"]
     volume = df["Volume"] if "Volume" in df.columns else None
 
+    # Guard: if latest close is NaN/0, drop trailing invalid rows
+    if pd.isna(close.iloc[-1]) or close.iloc[-1] == 0:
+        _valid = close.last_valid_index()
+        if _valid is not None:
+            df = df.loc[:_valid]
+            close = df["Close"]
+            high = df["High"]
+            low = df["Low"]
+            volume = df["Volume"] if "Volume" in df.columns else None
+        if len(df) < 200:
+            return _empty_result("Insufficient valid price data")
+
     # Moving averages (NaN-safe extraction — prevents nan propagation to aggregate)
     sma_50 = _safe_last(SMAIndicator(close, window=50).sma_indicator())
     sma_200 = _safe_last(SMAIndicator(close, window=200).sma_indicator())
@@ -110,7 +122,8 @@ def analyse_from_df(df: pd.DataFrame, fmp_data: dict | None = None) -> dict:
             obv_trend = "rising" if float(obv_series.iloc[-1]) > float(obv_sma.iloc[-1]) else "falling"
 
             # Check for divergence: price up but OBV down (bearish) or price down but OBV up (bullish)
-            price_change_20d = (close.iloc[-1] - close.iloc[-20]) / close.iloc[-20]
+            _p20 = float(close.iloc[-20])
+            price_change_20d = (float(close.iloc[-1]) - _p20) / _p20 if _p20 else 0.0
             obv_change_20d = obv_series.iloc[-1] - obv_series.iloc[-20]
             if price_change_20d > 0.02 and obv_change_20d < 0:
                 obv_divergence = "bearish"

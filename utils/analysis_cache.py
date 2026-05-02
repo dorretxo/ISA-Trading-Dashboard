@@ -8,9 +8,10 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 from datetime import datetime, timezone
 from pathlib import Path
+
+from utils.atomic_io import atomic_write_json
 
 logger = logging.getLogger(__name__)
 
@@ -81,12 +82,7 @@ class PersistentAnalysisCache:
                 "entry_count": len(self._data),
                 "entries": self._data,
             }
-            tmp = self.path.with_suffix(".tmp")
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(payload, f, separators=(",", ":"))
-                f.flush()
-                os.fsync(f.fileno())
-            tmp.replace(self.path)
+            atomic_write_json(self.path, payload, separators=(",", ":"))
             self._dirty = False
         except OSError as e:
             logger.warning("Persistent cache save failed for %s: %s", self.namespace, e)

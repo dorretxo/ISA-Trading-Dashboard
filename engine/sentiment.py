@@ -7,6 +7,7 @@ with VADER as a fallback if FinBERT is unavailable (missing torch/transformers).
 import calendar
 import logging
 import math
+import threading
 import time
 from datetime import datetime
 
@@ -34,6 +35,7 @@ _last_news_fetch_time: float = 0.0
 
 # FinBERT singleton — lazy-loaded on first use
 _finbert = None
+_finbert_lock = threading.Lock()
 
 
 def _cache_key(ticker: str, company_name: str) -> str:
@@ -45,28 +47,40 @@ def _get_finbert():
     """Lazy-load FinBERT pipeline. Returns pipeline or None if unavailable."""
     global _finbert
     if _finbert is None:
-        try:
-            import os
-            os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
-            # Suppress noisy HF Hub warnings
-            import warnings
-            warnings.filterwarnings("ignore", message=".*unauthenticated.*")
-            warnings.filterwarnings("ignore", message=".*UNEXPECTED.*")
-            from transformers import logging as hf_logging
-            hf_logging.set_verbosity_error()
+        with _finbert_lock:
+            if _finbert is None:
+                try:
+                    import os
+                    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+                    hf_token = getattr(config, "HF_TOKEN", "") or ""
+                    if hf_token:
+                        # huggingface_hub reads HF_TOKEN during import; set it before
+                        # importing transformers so Stage 6 uses authenticated requests.
+                        os.environ.setdefault("HF_TOKEN", hf_token)
+                    # Suppress noisy HF Hub warnings
+                    import warnings
+                    warnings.filterwarnings("ignore", message=".*unauthenticated.*")
+                    warnings.filterwarnings("ignore", message=".*UNEXPECTED.*")
+                    from transformers import logging as hf_logging
+                    hf_logging.set_verbosity_error()
 
-            from transformers import pipeline
-            _finbert = pipeline(
-                "sentiment-analysis",
-                model="ProsusAI/finbert",
-                top_k=None,
-                truncation=True,
-                max_length=512,
-            )
-            logger.info("FinBERT loaded successfully")
-        except Exception as e:
-            logger.warning("FinBERT unavailable, falling back to VADER: %s", e)
-            _finbert = "unavailable"
+                    from transformers import pipeline
+                    pipeline_kwargs = {
+                        "task": "sentiment-analysis",
+                        "model": "ProsusAI/finbert",
+                        "top_k": None,
+                        "truncation": True,
+                        "max_length": 512,
+                    }
+                    if hf_token:
+                        pipeline_kwargs["token"] = hf_token
+                    _finbert = pipeline(
+                        **pipeline_kwargs,
+                    )
+                    logger.info("FinBERT loaded successfully%s", " with HF_TOKEN" if hf_token else "")
+                except Exception as e:
+                    logger.warning("FinBERT unavailable, falling back to VADER: %s", e)
+                    _finbert = "unavailable"
     return _finbert if _finbert != "unavailable" else None
 
 
@@ -230,6 +244,66 @@ def analyse(ticker: str, company_name: str = "") -> dict:
     _persistent_cache.put(cache_key, result)
     _persistent_cache.save()
     return result
+
+
+def extract_qa_section(transcript_text: str) -> str | None:
+    """Extract the unscripted earnings-call Q&A section when available."""
+    if not transcript_text:
+        return None
+
+    lower = transcript_text.lower()
+    start_markers = (
+        "question-and-answer session",
+        "question and answer session",
+        "q&a",
+        "questions and answers",
+        "operator: our first question",
+    )
+    end_markers = (
+        "this concludes",
+        "conference call has now concluded",
+        "that concludes our call",
+    )
+
+    start = None
+    for marker in start_markers:
+        idx = lower.find(marker)
+        if idx != -1:
+            start = idx
+            break
+
+    if start is None:
+        return None
+
+    end = len(transcript_text)
+    for marker in end_markers:
+        idx = lower.find(marker, start)
+        if idx != -1:
+            end = min(end, idx)
+
+    qa_text = transcript_text[start:end].strip()
+    return qa_text or None
+
+
+def score_qa_sentiment(transcript_text: str) -> float | None:
+    """Score the unscripted earnings-call Q&A portion of a transcript.
+
+    This is intentionally separate from the news sentiment pipeline. The
+    function expects raw transcript text and applies the same FinBERT/VADER
+    scorer only to the extracted Q&A section.
+    """
+    qa_text = extract_qa_section(transcript_text)
+    if not qa_text:
+        return None
+
+    # Split into paragraph-sized chunks so long transcripts do not overflow
+    # the model context. FinBERT remains the preferred scorer here.
+    chunks = [chunk.strip() for chunk in qa_text.split("\n\n") if chunk.strip()]
+    if not chunks:
+        chunks = [qa_text]
+
+    score, _ = _score_texts(chunks[:24])
+    return round(float(score), 4)
 
 
 # ---------------------------------------------------------------------------

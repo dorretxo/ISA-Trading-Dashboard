@@ -138,6 +138,13 @@ def _load_from_cache(holdings: list[dict]) -> DashboardData | None:
 
     # Cached optimizer
     cached_opt = state.get("cached_optimizer")
+    if cached_opt:
+        cached_opt = dict(cached_opt)
+        cached_opt["per_method_weights"] = cached_opt.get("per_method_weights") or {}
+        cached_opt["method_weights"] = cached_opt.get("method_weights") or {}
+        cached_opt["mu_version"] = cached_opt.get("mu_version") or "legacy"
+        cached_opt["cov_method"] = cached_opt.get("cov_method") or "lw_ewma"
+        cached_opt["history_run_count"] = int(cached_opt.get("history_run_count") or 0)
     opt_ts = cached_opt.get("timestamp") if cached_opt else None
 
     # Cached exit signals
@@ -214,6 +221,12 @@ def _compute_live(holdings: list[dict]) -> DashboardData:
             "turnover": alloc.turnover,
             "rebalance_trades": alloc.rebalance_trades,
             "warnings": alloc.warnings,
+            # Additive ensemble fields (readers must default to {} / "legacy")
+            "per_method_weights": getattr(alloc, "per_method_weights", {}) or {},
+            "method_weights": getattr(alloc, "method_weights", {}) or {},
+            "mu_version": getattr(alloc, "mu_version", "legacy"),
+            "cov_method": getattr(alloc, "cov_method", "lw_ewma"),
+            "history_run_count": int(getattr(alloc, "history_run_count", 0) or 0),
             "timestamp": now,
         }
     except Exception as e:

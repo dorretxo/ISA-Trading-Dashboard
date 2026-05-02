@@ -389,20 +389,33 @@ def calculate_entry_strategy(
 def calculate_position_size(
     portfolio_value: float, entry_price: float, stop_loss: float,
     take_profit: float | None = None,
-    risk_per_trade_pct: float = 0.01,
+    risk_per_trade_pct: float | None = None,
     kelly_cap_fraction: float | None = None,
+    *,
+    avg_daily_volume_shares: float | None = None,
+    participation_cap: float | None = None,
 ) -> dict:
     """Size positions from stop risk, optionally capped by empirical Kelly.
 
     Base rule: risk a fixed fraction of portfolio capital if the stop is hit.
-    Optional cap: if the backtest has enough evidence for the action tier,
-    also cap notional exposure by the empirical half-Kelly fraction.
+    Additional caps:
+      * empirical half-Kelly on notional exposure (if ``kelly_cap_fraction`` set),
+      * ``MAX_POSITION_WEIGHT`` global notional cap,
+      * liquidity cap: ≤ ``participation_cap`` × 20-day average daily volume
+        (Almgren & Chriss 2000; Kyle 1985 — keeps permanent price impact
+        below ~50 bps for liquid equities).
     """
+    if risk_per_trade_pct is None:
+        risk_per_trade_pct = float(getattr(config, "POSITION_RISK_BUDGET_PCT", 0.01))
+    if participation_cap is None:
+        participation_cap = float(getattr(config, "POSITION_ADV_PARTICIPATION_CAP", 0.10))
+
     if (entry_price <= 0 or stop_loss <= 0 or stop_loss >= entry_price
             or portfolio_value <= 0):
         return {"shares": 0, "position_value": 0, "position_weight": 0,
                 "risk_amount": 0, "risk_per_share": 0, "stop_distance_pct": 0,
-                "r_r_ratio": None, "sizing_method": "invalid", "kelly_cap_fraction": None}
+                "r_r_ratio": None, "sizing_method": "invalid",
+                "kelly_cap_fraction": None, "adv_capped": False}
 
     risk_per_share = entry_price - stop_loss
     stop_distance_pct = risk_per_share / entry_price
@@ -411,7 +424,6 @@ def calculate_position_size(
     shares = int(risk_budget / risk_per_share)
     sizing_method = "fixed_fraction_stop"
 
-    # Risk/reward ratio
     r_r_ratio = None
     if take_profit is not None and take_profit > entry_price:
         reward_per_share = take_profit - entry_price
@@ -423,11 +435,18 @@ def calculate_position_size(
             shares = min(shares, kelly_shares)
             sizing_method = "fixed_fraction_stop + half_kelly_cap"
 
-    # Cap at max position weight from config
     max_weight = getattr(config, "MAX_POSITION_WEIGHT", 0.25)
     max_weight_shares = int((portfolio_value * max_weight) / entry_price)
     if max_weight_shares > 0:
         shares = min(shares, max_weight_shares)
+
+    adv_capped = False
+    if avg_daily_volume_shares is not None and avg_daily_volume_shares > 0:
+        adv_share_cap = int(avg_daily_volume_shares * participation_cap)
+        if 0 < adv_share_cap < shares:
+            shares = adv_share_cap
+            adv_capped = True
+            sizing_method += f" + adv_cap({int(participation_cap*100)}%)"
 
     position_value = shares * entry_price
     position_weight = position_value / portfolio_value if portfolio_value > 0 else 0
@@ -443,4 +462,5 @@ def calculate_position_size(
         "r_r_ratio": r_r_ratio,
         "sizing_method": sizing_method,
         "kelly_cap_fraction": round(kelly_cap_fraction, 4) if kelly_cap_fraction else None,
+        "adv_capped": adv_capped,
     }

@@ -11,6 +11,8 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
 import config
+from utils.discovery_digest import sort_trade_packets
+from utils.safe_numeric import format_currency, format_pct, safe_float
 
 logger = logging.getLogger(__name__)
 
@@ -109,11 +111,26 @@ td { padding: 7px 8px; border-bottom: 1px solid #e5e7eb; }
 .pill-grade-b { background: #dbeafe; color: #1e40af; }
 .pill-grade-c { background: #fef3c7; color: #92400e; }
 .pill-grade-d { background: #fecaca; color: #991b1b; }
+.pill-top-pick { background: #eab308; color: #1a1a2e; font-weight: 700; }
+.pill-ready { background: #d1fae5; color: #065f46; }
+.pill-pullback { background: #dbeafe; color: #1d4ed8; }
+.pill-watch { background: #fef3c7; color: #92400e; }
+.pill-confidence-high { background: #dcfce7; color: #166534; }
+.pill-confidence-medium { background: #fef3c7; color: #92400e; }
+.pill-confidence-low { background: #fee2e2; color: #991b1b; }
+.pill-confidence-data { background: #e5e7eb; color: #374151; }
+.top-pick-row td { background: #fffbeb !important; }
 .metric-grid { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 8px; }
 .metric-card { flex: 1 1 140px; background: #f9fafb; border: 1px solid #e5e7eb; border-radius: 6px;
                padding: 10px 12px; text-align: center; }
 .metric-label { font-size: 11px; color: #6b7280; text-transform: uppercase; letter-spacing: 0.5px; }
 .metric-value { font-size: 20px; font-weight: 700; margin-top: 2px; }
+.meta-strip { margin-top: 10px; padding: 8px 10px; background: #f8fafc; border: 1px solid #e5e7eb;
+              border-radius: 6px; font-size: 12px; color: #475569; }
+.hero-setup { margin-top: 10px; padding: 14px 16px; background: #f8fafc; border: 1px solid #dbeafe;
+              border-left: 4px solid #2563eb; border-radius: 8px; }
+.hero-setup h4 { margin: 0 0 6px 0; font-size: 18px; color: #0f172a; }
+.hero-setup .setup-meta { margin-top: 6px; font-size: 12px; color: #475569; }
 .footer { background: #f9fafb; padding: 12px 20px; font-size: 11px; color: #6b7280;
           border-radius: 0 0 8px 8px; border: 1px solid #e5e7eb; border-top: none; }
 .delta { font-size: 18px; font-weight: 700; color: #2563eb; }
@@ -129,6 +146,7 @@ def _action_pill(action: str) -> str:
         "SELL": "pill-sell",
         "KEEP": "pill-keep",
         "NEUTRAL": "pill-keep",
+        "MANUAL REVIEW": "pill-keep",
         "AVOID": "pill-sell",
         "BUY": "pill-buy",
         "STRONG BUY": "pill-strong-buy",
@@ -154,6 +172,73 @@ def _grade_pill(grade: str | None) -> str:
         return ""
     cls = {"A": "pill-grade-a", "B": "pill-grade-b", "C": "pill-grade-c", "D": "pill-grade-d"}.get(grade, "pill-keep")
     return f'<span class="pill {cls}">{grade}</span>'
+
+
+def _stance_pill(stance: str) -> str:
+    cls = {
+        "Ready": "pill-ready",
+        "Pullback Preferred": "pill-pullback",
+        "Watch Only": "pill-watch",
+    }.get(stance, "pill-watch")
+    return f'<span class="pill {cls}">{stance}</span>'
+
+
+def _confidence_pill(label: str, tone: str) -> str:
+    cls = {
+        "high": "pill-confidence-high",
+        "medium": "pill-confidence-medium",
+        "low": "pill-confidence-low",
+        "data": "pill-confidence-data",
+    }.get(tone, "pill-confidence-low")
+    return f'<span class="pill {cls}">{label}</span>'
+
+
+def _format_price(val, currency: str = "USD") -> str:
+    if val is None:
+        return "&mdash;"
+    if safe_float(val, default=0.0) <= 0:
+        return "&mdash;"
+    return format_currency(val, currency, decimals=2)
+
+
+def _format_freshness(iso_timestamp: str | None) -> str:
+    if not iso_timestamp:
+        return "missing"
+    try:
+        dt = datetime.fromisoformat(iso_timestamp)
+    except (TypeError, ValueError):
+        return "unknown"
+    delta = datetime.now() - dt
+    minutes = int(delta.total_seconds() / 60)
+    if minutes < 1:
+        return "just now"
+    if minutes < 60:
+        return f"{minutes}m ago"
+    hours = minutes // 60
+    if hours < 24:
+        return f"{hours}h ago"
+    return f"{hours // 24}d ago"
+
+
+def _is_top_pick_dict(d: dict) -> bool:
+    """Check if a discovery candidate dict qualifies as a Top Pick."""
+    if d.get("ticker_identity_warning"):
+        return False
+    if d.get("action") != "STRONG BUY":
+        return False
+    stance = d.get("entry_stance", "")
+    if stance != "Ready":
+        return False
+    # Replicate confidence score logic from app.py _discovery_confidence
+    sent_conf = float(d.get("sentiment_score", 0) or 0)
+    data_discount = float(d.get("confidence_discount", 1.0) or 1.0)
+    has_data = 0.0 if d.get("action") == "INSUFFICIENT DATA" else 1.0
+    score = max(0.0, min(1.0,
+        0.35 * has_data + 0.30 * data_discount
+        + 0.35 * (0.5 + 0.5 * max(min(sent_conf, 1.0), -1.0))))
+    if score < 0.75:
+        return False
+    return True
 
 
 def _flag_pills(data: dict) -> str:
@@ -188,6 +273,9 @@ def build_alert_email(
     optimizer_alloc=None,
     discovery_candidates: list[dict] | None = None,
     exit_signals: list[dict] | None = None,
+    discovery_meta: dict | None = None,
+    artifact_timestamps: dict | None = None,
+    discovery_ran: bool = False,
 ) -> tuple[str, str]:
     """Build the subject line and HTML body for an alert email.
 
@@ -205,6 +293,11 @@ def build_alert_email(
     Returns:
         (subject, html_body)
     """
+    discovery_meta = discovery_meta or {}
+    artifact_timestamps = artifact_timestamps or {}
+    discovery_packets = sort_trade_packets(discovery_candidates or [])
+    lead_packet = discovery_packets[0] if discovery_packets else None
+
     # --- Subject line ---
     parts = []
     if alerts:
@@ -215,6 +308,17 @@ def build_alert_email(
         top_action = top["candidate"].get("action", "NEUTRAL")
         top_verb = "buy" if top_action in ("BUY", "STRONG BUY") else "review"
         parts.append(f"Swap: {top_verb} {top['candidate']['ticker']} +{top['score_delta']:.2f} delta")
+    if not parts and lead_packet:
+        if lead_packet.get("trade_ready"):
+            parts.append(f"Discovery: {lead_packet['ticker']} ready")
+        elif lead_packet.get("clean_entry"):
+            parts.append(f"Discovery: {lead_packet['ticker']} {lead_packet['entry_stance'].lower()}")
+        elif discovery_ran:
+            parts.append(f"Discovery refresh ({len(discovery_packets)} names)")
+    if not parts and exit_signals:
+        parts.append(f"Exit watch {len(exit_signals)}")
+    if not parts:
+        parts.append("Portfolio review")
 
     _regime_label = vix_regime.get("regime_label", "NEUTRAL")
     subject = f"[ISA Alert] {' | '.join(parts)} | VIX: {_regime_label}"
@@ -240,6 +344,16 @@ def build_alert_email(
         </div>
     </div>
     """)
+
+    freshness = [
+        f"Portfolio: {_format_freshness(artifact_timestamps.get('portfolio'))}",
+        f"Screener: {_format_freshness(artifact_timestamps.get('discovery'))}",
+        f"Optimizer: {_format_freshness(artifact_timestamps.get('optimizer'))}",
+        f"Exit: {_format_freshness(artifact_timestamps.get('exit'))}",
+    ]
+    html_parts.append(
+        f'<div class="section"><div class="meta-strip">{" &bull; ".join(freshness)}</div></div>'
+    )
 
     # Trading Strategy & Portfolio Metrics
     regime_label = vix_regime.get("regime_label", "NEUTRAL")
@@ -330,45 +444,116 @@ def build_alert_email(
 
     html_parts.append('</div>')  # section
 
-    # Discovery Highlights (top 5 candidates if available)
-    if discovery_candidates:
-        top_disc = sorted(discovery_candidates, key=lambda d: d.get("final_rank", 0), reverse=True)[:5]
+    # Discovery command center
+    if discovery_packets:
         html_parts.append('<div class="section alert-discovery">')
-        html_parts.append('<h3 style="margin:0 0 8px 0; color:#0e7490;">Discovery Highlights (Top 5)</h3>')
+        html_parts.append('<h3 style="margin:0 0 8px 0; color:#0e7490;">Discovery Command Center</h3>')
+
+        if lead_packet and lead_packet.get("clean_entry"):
+            lead_flags = []
+            if lead_packet.get("top_pick"):
+                lead_flags.append('<span class="pill pill-top-pick">&#9733; TOP PICK</span>')
+            lead_flags.append(_action_pill(lead_packet["action"]))
+            lead_flags.append(_stance_pill(lead_packet["entry_stance"]))
+            lead_flags.append(_confidence_pill(lead_packet["confidence_label"], lead_packet["confidence_tone"]))
+            plan_bits = [
+                f"Rank {safe_float(lead_packet['final_rank']):.3f}",
+                f"90d model {format_pct(safe_float(lead_packet['expected_return_90d']) * 100)}",
+                f"Entry {_format_price(lead_packet['entry_price'], lead_packet['currency'])}",
+                f"Stop {_format_price(lead_packet['stop_loss'], lead_packet['currency'])}",
+                f"Target {_format_price(lead_packet['take_profit'], lead_packet['currency'])}",
+                f"R/R {safe_float(lead_packet['r_r_ratio']):.1f}x" if lead_packet.get("r_r_ratio") else "R/R unavailable",
+                f"Position {format_pct(safe_float(lead_packet['position_weight']) * 100, plus_sign=False)}"
+                if lead_packet.get("position_weight") else "Position pending",
+                f"Prior {safe_float(lead_packet.get('institutional_prior_percentile')):.0%}"
+                if lead_packet.get("institutional_prior_percentile") else "Prior pending",
+                f"Fit {safe_float(lead_packet['portfolio_fit_score']):.2f}",
+                f"Corr {safe_float(lead_packet['max_correlation']):.2f}",
+            ]
+            if lead_packet.get("key_risk"):
+                plan_bits.append(f"Watch: {lead_packet['key_risk']}")
+            html_parts.append(f"""
+            <div class="hero-setup">
+                <h4>{lead_packet['ticker']} - {lead_packet['name']}</h4>
+                <div>{' '.join(lead_flags)}</div>
+                <div style="margin-top:8px; font-size:13px; color:#334155;">{lead_packet.get('why', '')}</div>
+                <div style="margin-top:6px; font-size:13px; color:#92400e;">{lead_packet.get('readiness_summary', '')}</div>
+                <div class="setup-meta">{' &bull; '.join(plan_bits)}</div>
+            </div>
+            """)
+        else:
+            html_parts.append("""
+            <div class="hero-setup">
+                <h4>No clean new entry</h4>
+                <div style="font-size:13px; color:#334155;">
+                    The highest-ranked discovery names are currently gated by timing, data quality, or identity risk.
+                    Keep the list on watch rather than forcing a fresh entry.
+                </div>
+            </div>
+            """)
+
+        if discovery_meta:
+            funnel_bits = []
+            if discovery_meta.get("screened_count") is not None:
+                funnel_bits.append(f"Screened {int(discovery_meta['screened_count'])}")
+            if discovery_meta.get("after_momentum_screen") is not None:
+                funnel_bits.append(f"Momentum {int(discovery_meta['after_momentum_screen'])}")
+            if discovery_meta.get("after_quick_filter") is not None:
+                funnel_bits.append(f"Filtered {int(discovery_meta['after_quick_filter'])}")
+            if discovery_meta.get("after_corr_filter") is not None:
+                funnel_bits.append(f"Uncorrelated {int(discovery_meta['after_corr_filter'])}")
+            if discovery_meta.get("after_quick_rank") is not None:
+                funnel_bits.append(f"Ranked {int(discovery_meta['after_quick_rank'])}")
+            if discovery_meta.get("fully_scored") is not None:
+                funnel_bits.append(f"Scored {int(discovery_meta['fully_scored'])}")
+            if discovery_meta.get("run_time_seconds") is not None:
+                funnel_bits.append(f"Runtime {safe_float(discovery_meta['run_time_seconds']):.0f}s")
+            if funnel_bits:
+                html_parts.append(f'<div class="meta-strip">{" &bull; ".join(funnel_bits)}</div>')
+
+        html_parts.append('<h4 style="margin:14px 0 8px 0; color:#0f172a;">Actionable Discovery Setups</h4>')
         html_parts.append("""
         <table>
-            <tr><th>Ticker</th><th>Name</th><th>Lens</th><th>Score</th><th>90d Ret</th><th>Yield</th><th>B/S</th><th>Flags</th></tr>
+            <tr><th>Ticker</th><th>Status</th><th>Rank</th><th>Prior</th><th>90d Model</th><th>Entry</th><th>Stop</th><th>Target</th><th>R/R</th><th>Pos</th><th>Fit</th><th>Next trigger</th></tr>
         """)
-        for d in top_disc:
-            score = d.get("aggregate_score", 0)
-            ret_90 = d.get("return_90d", 0)
-            lens = d.get("entry_lens", "momentum")
-            div_y = d.get("dividend_yield")
-            div_str = f"{div_y:.1%}" if div_y else "&mdash;"
-            bs_grade = d.get("balance_sheet_grade")
-            flags = _flag_pills(d)
+        for packet in discovery_packets[:5]:
+            row_class = ' class="top-pick-row"' if packet.get("top_pick") else ''
+            status_bits = []
+            if packet.get("top_pick"):
+                status_bits.append('<span class="pill pill-top-pick">&#9733; TOP PICK</span>')
+            status_bits.append(_action_pill(packet["action"]))
+            status_bits.append(_stance_pill(packet["entry_stance"]))
+            status_bits.append(_confidence_pill(packet["confidence_label"], packet["confidence_tone"]))
             html_parts.append(f"""
-            <tr>
-                <td><strong>{d.get('ticker', '')}</strong></td>
-                <td style="max-width:120px; overflow:hidden; text-overflow:ellipsis;">{d.get('name', '')[:25]}</td>
-                <td>{_lens_pill(lens)}</td>
-                <td>{_score_html(score)}</td>
-                <td>{_score_html(ret_90*100) if ret_90 else 'N/A'}</td>
-                <td>{div_str}</td>
-                <td>{_grade_pill(bs_grade)}</td>
-                <td>{flags}</td>
+            <tr{row_class}>
+                <td>
+                    <strong>{packet['ticker']}</strong><br>
+                    <span style="font-size:11px; color:#6b7280;">{packet['name'][:28]}</span>
+                </td>
+                <td>{' '.join(status_bits)}</td>
+                <td>{safe_float(packet['final_rank']):.3f}</td>
+                <td>{f"{safe_float(packet.get('institutional_prior_percentile')):.0%}" if packet.get('institutional_prior_percentile') else '&mdash;'}</td>
+                <td>{format_pct(safe_float(packet['expected_return_90d']) * 100)}</td>
+                <td>{_format_price(packet['entry_price'], packet['currency'])}</td>
+                <td>{_format_price(packet['stop_loss'], packet['currency'])}</td>
+                <td>{_format_price(packet['take_profit'], packet['currency'])}</td>
+                <td>{f"{safe_float(packet['r_r_ratio']):.1f}x" if packet.get('r_r_ratio') else '&mdash;'}</td>
+                <td>{format_pct(safe_float(packet['position_weight']) * 100, plus_sign=False) if packet.get('position_weight') else '&mdash;'}</td>
+                <td>{safe_float(packet['portfolio_fit_score']):.2f}</td>
+                <td>{packet.get('entry_trigger') or packet.get('key_risk') or '&mdash;'}</td>
             </tr>
             """)
         html_parts.append("</table>")
 
-        # Lens distribution summary
         lens_counts = {}
-        for d in discovery_candidates[:20]:
+        for d in (discovery_candidates or [])[:20]:
             lens = d.get("entry_lens", "momentum")
             lens_counts[lens] = lens_counts.get(lens, 0) + 1
-        lens_summary = " &bull; ".join(f"{_lens_pill(l)} {c}" for l, c in sorted(lens_counts.items()))
-        html_parts.append(f'<div style="margin-top:8px; font-size:11px; color:#6b7280;">'
-                          f'Top 20 by lens: {lens_summary}</div>')
+        if lens_counts:
+            lens_summary = " &bull; ".join(f"{_lens_pill(l)} {c}" for l, c in sorted(lens_counts.items()))
+            html_parts.append(
+                f'<div style="margin-top:8px; font-size:11px; color:#6b7280;">Top 20 by lens: {lens_summary}</div>'
+            )
         html_parts.append('</div>')
 
     # SELL / STRONG SELL alerts
@@ -568,6 +753,62 @@ def build_alert_email(
         for t1, t2, corr in high_corrs[:5]:
             html_parts.append(f"<li>{t1} / {t2} correlation: {corr:.2f}</li>")
         html_parts.append("</ul></div>")
+
+    # Institutional risk metrics (VaR / ES / β / stress replays)
+    var_es = risk_data.get("var_es") or {}
+    beta_info = risk_data.get("beta") or {}
+    stress_scenarios = risk_data.get("stress_scenarios") or []
+
+    if var_es or beta_info or stress_scenarios:
+        html_parts.append('<div class="section">')
+        html_parts.append('<h3 style="margin:0 0 8px 0;">Risk Metrics</h3>')
+
+        _v = var_es.get("var_1d")
+        _e = var_es.get("es_1d")
+        _va = var_es.get("vol_annual")
+        _b = beta_info.get("beta")
+        _r2 = beta_info.get("r_squared")
+        _bench = beta_info.get("benchmark", "SPY")
+
+        def _pct(v):
+            return f"{v*100:+.2f}%" if v is not None else "&mdash;"
+
+        html_parts.append("""
+        <table>
+            <tr><th>95% 1-day VaR</th><th>95% 1-day ES</th><th>Annual Vol</th><th>&beta; vs """ + _bench + """</th></tr>
+            <tr>
+                <td>""" + _pct(_v) + """</td>
+                <td>""" + _pct(_e) + """</td>
+                <td>""" + (f"{_va*100:.1f}%" if _va is not None else "&mdash;") + """</td>
+                <td>""" + (f"{_b:.2f}" + (f" (R²={_r2:.2f})" if _r2 is not None else "") if _b is not None else "&mdash;") + """</td>
+            </tr>
+        </table>
+        """)
+
+        if stress_scenarios:
+            html_parts.append('<h4 style="margin:10px 0 4px 0;">Historical Stress Replays</h4>')
+            html_parts.append("""
+            <table>
+                <tr><th>Scenario</th><th>Window</th><th>Portfolio</th><th>Worst Name</th><th>Coverage</th></tr>
+            """)
+            for s in stress_scenarios:
+                port_r = s.get("portfolio_return")
+                port_cls = "score-neg" if (port_r is not None and port_r < 0) else "score-pos"
+                worst = s.get("worst_name") or "&mdash;"
+                worst_r = s.get("worst_return")
+                worst_str = f"{worst} ({worst_r*100:+.1f}%)" if worst_r is not None else worst
+                html_parts.append(f"""
+                <tr>
+                    <td><strong>{s.get('name','')}</strong></td>
+                    <td style="font-size:11px;color:#64748b;">{s.get('window','')}</td>
+                    <td><span class="{port_cls}">{port_r*100:+.1f}%</span></td>
+                    <td>{worst_str}</td>
+                    <td>{s.get('coverage',0)*100:.0f}%</td>
+                </tr>
+                """)
+            html_parts.append("</table>")
+
+        html_parts.append("</div>")
 
     # Rebalance suggestions (only show deltas > 5%)
     big_rebalances = [pw for pw in position_weights if abs(pw.get("rebalance_delta", 0)) > 0.05]

@@ -3,14 +3,16 @@
 Provides a tiered, metadata-rich universe across major global exchanges.
 Each ticker has region, tier, index source, and validation metadata.
 
-Tier 1: Core liquid leaders (index constituents, large caps) — screened daily
-Tier 2: Mid-cap opportunity set — screened 2x/week (Mon, Thu)
+The original implementation exposed Tier 2 names only on selected weekdays.
+Phase 1 replaces that rotation with a daily systematic snapshot so the
+discovery engine can screen the same investable universe every day.
 """
 
 from __future__ import annotations
 
-import datetime as _dt
 from typing import NamedTuple
+
+import config
 
 
 class UniverseEntry(NamedTuple):
@@ -26,6 +28,43 @@ class UniverseEntry(NamedTuple):
 
 # Last manual refresh date — bump when updating ticker lists
 UNIVERSE_LAST_REFRESHED = "2026-03-22"
+
+
+def _excluded_country_tokens() -> set[str]:
+    return {
+        str(value).strip().upper()
+        for value in getattr(config, "DISCOVERY_EXCLUDED_COUNTRIES", set())
+        if str(value).strip()
+    }
+
+
+def is_excluded_ticker(ticker: str, country: str | None = None, region: str | None = None) -> bool:
+    """Return True when a ticker is outside the configured investable universe."""
+    symbol = str(ticker or "").upper().strip()
+    if not symbol:
+        return False
+
+    excluded_tickers = {
+        str(value).upper().strip()
+        for value in getattr(config, "DISCOVERY_EXCLUDED_TICKERS", set())
+    }
+    if symbol in excluded_tickers:
+        return True
+
+    excluded_suffixes = tuple(
+        str(value).upper().strip()
+        for value in getattr(config, "DISCOVERY_EXCLUDED_TICKER_SUFFIXES", ())
+        if str(value).strip()
+    )
+    if excluded_suffixes and symbol.endswith(excluded_suffixes):
+        return True
+
+    country_tokens = _excluded_country_tokens()
+    for value in (country, region):
+        token = str(value or "").strip().upper()
+        if token and token in country_tokens:
+            return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -716,28 +755,6 @@ _SINGAPORE = [
 ]
 
 # ---------------------------------------------------------------------------
-# South Korea — KOSPI top
-# ---------------------------------------------------------------------------
-_KOREA = [
-    ("005930.KS", "KR", "KRX", 1, "KOSPI", "Technology"),
-    ("000660.KS", "KR", "KRX", 1, "KOSPI", "Technology"),
-    ("035420.KS", "KR", "KRX", 1, "KOSPI", "Technology"),
-    ("051910.KS", "KR", "KRX", 1, "KOSPI", "Materials"),
-    ("006400.KS", "KR", "KRX", 1, "KOSPI", "Consumer Discretionary"),
-    ("035720.KS", "KR", "KRX", 1, "KOSPI", "Technology"),
-    ("068270.KS", "KR", "KRX", 1, "KOSPI", "Consumer Discretionary"),
-    ("028260.KS", "KR", "KRX", 1, "KOSPI", "Consumer Discretionary"),
-    ("105560.KS", "KR", "KRX", 1, "KOSPI", "Consumer Staples"),
-    ("055550.KS", "KR", "KRX", 1, "KOSPI", "Financials"),
-    ("003670.KS", "KR", "KRX", 1, "KOSPI", "Materials"),
-    ("034730.KS", "KR", "KRX", 1, "KOSPI", "Technology"),
-    ("066570.KS", "KR", "KRX", 1, "KOSPI", "Industrials"),
-    ("032830.KS", "KR", "KRX", 1, "KOSPI", "Consumer Discretionary"),
-    ("096770.KS", "KR", "KRX", 1, "KOSPI", "Technology"),
-]
-
-
-# ---------------------------------------------------------------------------
 # Internal: all region lists for iteration
 # ---------------------------------------------------------------------------
 _ALL_REGIONS: dict[str, list[tuple]] = {
@@ -754,7 +771,6 @@ _ALL_REGIONS: dict[str, list[tuple]] = {
     "Japan": _JAPAN,
     "Hong Kong": _HONG_KONG,
     "Singapore": _SINGAPORE,
-    "South Korea": _KOREA,
 }
 
 
@@ -777,14 +793,99 @@ for _e in _UNIVERSE:
 _UNIVERSE = _UNIVERSE_DEDUPED
 del _SEEN_TICKERS, _UNIVERSE_DEDUPED
 
+_TICKER_TO_REGION = {
+    entry[0].upper(): region_name
+    for region_name, region_entries in _ALL_REGIONS.items()
+    for entry in region_entries
+}
+
+
+def _iter_filtered_entries(
+    exclude_tickers: set[str] | None = None,
+    *,
+    max_tier: int = 2,
+    countries: list[str] | None = None,
+    regions: list[str] | None = None,
+    include_tier2: bool = True,
+):
+    """Yield universe entries that satisfy the requested filters."""
+    exclude = {t.upper() for t in (exclude_tickers or set())}
+    allowed_countries = set(countries or [])
+    allowed_regions = set(regions or [])
+
+    for entry in _UNIVERSE:
+        if entry.ticker.upper() in exclude:
+            continue
+        if entry.tier > max_tier:
+            continue
+        if not include_tier2 and entry.tier > 1:
+            continue
+        if allowed_countries and entry.country not in allowed_countries:
+            continue
+        region = _TICKER_TO_REGION.get(entry.ticker.upper(), "")
+        if is_excluded_ticker(entry.ticker, country=entry.country, region=region):
+            continue
+        if allowed_regions and region not in allowed_regions:
+            continue
+        yield entry
+
+
+def get_region_for_ticker(ticker: str) -> str:
+    """Return the configured universe region for a ticker, if known."""
+    region = _TICKER_TO_REGION.get((ticker or "").upper(), "")
+    return "" if is_excluded_ticker(ticker, region=region) else region
+
+
+def build_daily_universe_snapshot(
+    exclude_tickers: set[str] | None = None,
+    *,
+    max_tier: int = 2,
+    countries: list[str] | None = None,
+    regions: list[str] | None = None,
+    include_tier2: bool = True,
+    region_caps: dict[str, int] | None = None,
+) -> list[UniverseEntry]:
+    """Return the daily systematic universe snapshot with metadata.
+
+    The default behavior is intentionally broad: include all configured
+    regions every day, optionally capped per region when callers need a
+    smaller operational subset.
+    """
+    per_region_caps = region_caps or {}
+    region_counts: dict[str, int] = {}
+    selected: list[UniverseEntry] = []
+
+    for entry in _iter_filtered_entries(
+        exclude_tickers=exclude_tickers,
+        max_tier=max_tier,
+        countries=countries,
+        regions=regions,
+        include_tier2=include_tier2,
+    ):
+        region = _TICKER_TO_REGION.get(entry.ticker.upper(), "Unknown")
+        cap = per_region_caps.get(region)
+        if cap is not None and region_counts.get(region, 0) >= cap:
+            continue
+        selected.append(entry)
+        region_counts[region] = region_counts.get(region, 0) + 1
+
+    return selected
+
 
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
 def get_full_universe() -> list[UniverseEntry]:
-    """Return the complete structured universe with metadata."""
-    return list(_UNIVERSE)
+    """Return the active structured universe with metadata."""
+    return [
+        entry for entry in _UNIVERSE
+        if not is_excluded_ticker(
+            entry.ticker,
+            country=entry.country,
+            region=_TICKER_TO_REGION.get(entry.ticker.upper(), ""),
+        )
+    ]
 
 
 def get_global_universe(
@@ -792,6 +893,7 @@ def get_global_universe(
     *,
     max_tier: int = 2,
     countries: list[str] | None = None,
+    include_dynamic: bool = True,
 ) -> list[str]:
     """Return ticker symbols from the universe, with optional filters.
 
@@ -799,44 +901,52 @@ def get_global_universe(
         exclude_tickers: Tickers to exclude (e.g. existing holdings).
         max_tier: Maximum tier to include (1 = core only, 2 = core + mid-cap).
         countries: ISO country codes to include (None = all).
+        include_dynamic: Include dynamically validated tickers from reconstitution.
 
     Returns:
         Deduplicated list of ticker strings.
     """
-    exclude = {t.upper() for t in (exclude_tickers or set())}
-    result = []
-    for entry in _UNIVERSE:
-        if entry.tier > max_tier:
-            continue
-        if countries and entry.country not in countries:
-            continue
-        if entry.ticker.upper() in exclude:
-            continue
-        result.append(entry.ticker)
-    return result
+    static = [
+        entry.ticker
+        for entry in build_daily_universe_snapshot(
+            exclude_tickers=exclude_tickers,
+            max_tier=max_tier,
+            countries=countries,
+        )
+    ]
+    if not include_dynamic:
+        return static
+
+    # Merge dynamic supplement (non-stale, non-excluded, non-duplicate)
+    seen = {t.upper() for t in static}
+    excluded = {t.upper() for t in (exclude_tickers or set())}
+    dynamic = get_dynamic_tickers()
+    for t in dynamic:
+        t_upper = t.upper()
+        if t_upper not in seen and t_upper not in excluded:
+            static.append(t)
+            seen.add(t_upper)
+    return static
 
 
 def get_universe_for_rotation(
     day_of_week: int,
     exclude_tickers: set[str] | None = None,
 ) -> list[str]:
-    """Return tickers for today's rotation schedule.
+    """Backward-compatible alias for the daily systematic snapshot.
 
-    Rotation logic:
-        - Tier 1 (core): screened every day
-        - Tier 2 (mid-cap): screened on Monday (0) and Thursday (3) only
-
-    Args:
-        day_of_week: 0=Mon, 1=Tue, ..., 6=Sun (from datetime.weekday())
-        exclude_tickers: Tickers to skip.
-
-    Returns:
-        List of ticker symbols to screen today.
+    ``day_of_week`` is retained for API compatibility but no longer affects
+    membership. Tier 2 names are now available every day by default.
     """
-    tier2_days = {0, 3}  # Monday, Thursday
-    include_tier2 = day_of_week in tier2_days
-    max_tier = 2 if include_tier2 else 1
-    return get_global_universe(exclude_tickers=exclude_tickers, max_tier=max_tier)
+    _ = day_of_week
+    return [
+        entry.ticker
+        for entry in build_daily_universe_snapshot(
+            exclude_tickers=exclude_tickers,
+            max_tier=2,
+            include_tier2=True,
+        )
+    ]
 
 
 def get_universe_by_region(
@@ -848,10 +958,13 @@ def get_universe_by_region(
         max_tier: Maximum tier to include.
     """
     result: dict[str, list[str]] = {}
-    for region_name, region_list in _ALL_REGIONS.items():
+    for region_name in _ALL_REGIONS:
         tickers = [
-            e[0] for e in region_list
-            if e[3] <= max_tier  # e[3] is tier
+            entry.ticker
+            for entry in build_daily_universe_snapshot(
+                max_tier=max_tier,
+                regions=[region_name],
+            )
         ]
         if tickers:
             result[region_name] = tickers
@@ -860,16 +973,433 @@ def get_universe_by_region(
 
 def get_universe_stats() -> dict:
     """Return summary statistics about the universe."""
-    total = len(_UNIVERSE)
-    tier1 = sum(1 for e in _UNIVERSE if e.tier == 1)
-    tier2 = sum(1 for e in _UNIVERSE if e.tier == 2)
+    active_universe = get_full_universe()
+    total = len(active_universe)
+    tier1 = sum(1 for e in active_universe if e.tier == 1)
+    tier2 = sum(1 for e in active_universe if e.tier == 2)
     by_country: dict[str, int] = {}
-    for e in _UNIVERSE:
+    by_region: dict[str, int] = {}
+    for e in active_universe:
         by_country[e.country] = by_country.get(e.country, 0) + 1
+        region = _TICKER_TO_REGION.get(e.ticker.upper(), "Unknown")
+        by_region[region] = by_region.get(region, 0) + 1
+
+    # Include dynamic supplement stats if available
+    dynamic = load_dynamic_supplement()
+    dynamic_count = len(get_dynamic_entries())
+
     return {
         "total": total,
+        "total_with_dynamic": total + dynamic_count,
         "tier1": tier1,
         "tier2": tier2,
+        "dynamic": dynamic_count,
         "by_country": by_country,
+        "by_region": by_region,
         "last_refreshed": UNIVERSE_LAST_REFRESHED,
+        "last_dynamic_refresh": dynamic.get("refreshed_at"),
     }
+
+
+# ---------------------------------------------------------------------------
+# Dynamic Universe Reconstitution (Priority B)
+# ---------------------------------------------------------------------------
+# Supplements the static universe with validated tickers from yfinance.
+# Prunes stale tickers (no data for 3+ consecutive refreshes).
+# Runs on-demand or from the orchestrator.
+
+import json
+import logging
+from datetime import datetime
+from pathlib import Path
+
+_logger = logging.getLogger(__name__)
+_DYNAMIC_CACHE_PATH = Path(__file__).parent.parent / "feature_cache" / "universe_dynamic.json"
+_MIN_AVG_VOLUME = 500_000       # $500K daily volume floor
+_MIN_MARKET_CAP = 100_000_000   # $100M market cap floor
+_MAX_STALE_RUNS = 3             # Remove after N consecutive no-data refreshes
+
+
+# yfinance returns country as a free-text label ("Germany", "Japan"). Map the
+# common ones to ISO-3166-1-alpha-2 so downstream gates (dollar-volume tiers,
+# region filters) can match on a single convention.
+_YF_COUNTRY_TO_ISO: dict[str, str] = {
+    "united states": "US", "usa": "US", "us": "US",
+    "united kingdom": "GB", "uk": "GB", "britain": "GB",
+    "germany": "DE", "france": "FR", "spain": "ES", "italy": "IT",
+    "netherlands": "NL", "switzerland": "CH", "sweden": "SE",
+    "denmark": "DK", "norway": "NO", "finland": "FI", "belgium": "BE",
+    "ireland": "IE", "austria": "AT", "portugal": "PT", "luxembourg": "LU",
+    "japan": "JP", "china": "CN", "hong kong": "HK", "singapore": "SG",
+    "south korea": "KR", "korea": "KR", "taiwan": "TW", "india": "IN",
+    "australia": "AU", "new zealand": "NZ",
+    "canada": "CA", "mexico": "MX", "brazil": "BR",
+    "israel": "IL",
+}
+
+
+def _iso_country(raw: str) -> str:
+    if not raw:
+        return ""
+    s = raw.strip().lower()
+    if s in _YF_COUNTRY_TO_ISO:
+        return _YF_COUNTRY_TO_ISO[s]
+    # Fallback: if already a 2-letter code, pass through uppercased.
+    if len(raw) == 2 and raw.isalpha():
+        return raw.upper()
+    return ""
+
+
+def load_dynamic_supplement() -> dict:
+    """Load the cached dynamic universe supplement."""
+    if _DYNAMIC_CACHE_PATH.exists():
+        try:
+            return json.loads(_DYNAMIC_CACHE_PATH.read_text())
+        except (json.JSONDecodeError, OSError):
+            pass
+    return {"tickers": [], "stale_counts": {}, "refreshed_at": None}
+
+
+def _save_dynamic_supplement(data: dict) -> None:
+    """Persist the dynamic supplement to disk."""
+    from utils.atomic_io import atomic_write_json
+    _DYNAMIC_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(_DYNAMIC_CACHE_PATH, data, indent=2)
+
+
+def reconstitute_universe(
+    extra_tickers: list[str] | None = None,
+    prune_stale: bool = True,
+) -> dict:
+    """Validate and refresh the dynamic universe supplement.
+
+    1. Validates all existing dynamic tickers still return data from yfinance.
+    2. Adds new tickers from `extra_tickers` if they pass liquidity/mcap gates.
+    3. Prunes tickers that have returned no data for 3+ consecutive refreshes.
+    4. Persists the result to feature_cache/universe_dynamic.json.
+
+    Returns summary dict with counts.
+    """
+    import yfinance as yf
+
+    existing = load_dynamic_supplement()
+    current_tickers = {
+        str(t.get("ticker", "")).upper()
+        for t in existing.get("tickers", [])
+        if not is_excluded_ticker(
+            t.get("ticker", ""),
+            country=t.get("country"),
+            region=t.get("country"),
+        )
+    }
+    stale_counts: dict[str, int] = existing.get("stale_counts", {})
+    static_tickers = {e.ticker.upper() for e in get_full_universe()}
+    for ticker in list(stale_counts):
+        if is_excluded_ticker(ticker):
+            stale_counts.pop(ticker, None)
+
+    # Candidates to validate: existing dynamic + new extras
+    candidates = list(current_tickers)
+    if extra_tickers:
+        for t in extra_tickers:
+            t_upper = str(t or "").upper().strip()
+            if not t_upper or is_excluded_ticker(t_upper):
+                continue
+            if t_upper not in static_tickers and t_upper not in current_tickers:
+                candidates.append(t_upper)
+
+    validated: list[dict] = []
+    removed = 0
+
+    for ticker in candidates:
+        ticker = str(ticker or "").upper().strip()
+        if not ticker or is_excluded_ticker(ticker):
+            stale_counts.pop(ticker, None)
+            removed += 1
+            continue
+        try:
+            info = yf.Ticker(ticker).info or {}
+            mcap = info.get("marketCap", 0) or 0
+            avg_vol = info.get("averageVolume", 0) or 0
+            price = info.get("currentPrice") or info.get("regularMarketPrice") or 0
+            country_iso = _iso_country(info.get("country", "")) or "US"
+            if is_excluded_ticker(ticker, country=country_iso, region=info.get("country", "")):
+                stale_counts.pop(ticker, None)
+                removed += 1
+                continue
+
+            # Liquidity gate
+            avg_dollar_vol = avg_vol * price if price else 0
+
+            if mcap >= _MIN_MARKET_CAP and avg_dollar_vol >= _MIN_AVG_VOLUME:
+                stale_counts.pop(ticker, None)
+                validated.append({
+                    "ticker": ticker,
+                    "country": country_iso,
+                    "exchange": info.get("exchange", ""),
+                    "sector": info.get("sector", ""),
+                    "market_cap": mcap,
+                    "avg_dollar_volume": round(avg_dollar_vol),
+                })
+            else:
+                # Below threshold — count as stale
+                stale_counts[ticker] = stale_counts.get(ticker, 0) + 1
+                if prune_stale and stale_counts[ticker] >= _MAX_STALE_RUNS:
+                    removed += 1
+                    stale_counts.pop(ticker, None)
+                    _logger.info("Pruned stale ticker %s (no data for %d runs)", ticker, _MAX_STALE_RUNS)
+                else:
+                    # Keep it but mark stale
+                    validated.append({
+                        "ticker": ticker,
+                        "country": "??",
+                        "exchange": "",
+                        "sector": "",
+                        "market_cap": 0,
+                        "avg_dollar_volume": 0,
+                        "stale": True,
+                    })
+        except Exception:
+            stale_counts[ticker] = stale_counts.get(ticker, 0) + 1
+            if prune_stale and stale_counts.get(ticker, 0) >= _MAX_STALE_RUNS:
+                removed += 1
+                stale_counts.pop(ticker, None)
+
+    result = {
+        "tickers": validated,
+        "stale_counts": stale_counts,
+        "refreshed_at": datetime.now().isoformat(),
+    }
+    _save_dynamic_supplement(result)
+
+    _logger.info(
+        "Universe reconstitution: %d validated, %d pruned, %d total dynamic",
+        len(validated), removed, len(validated),
+    )
+    return {
+        "validated": len(validated),
+        "pruned": removed,
+        "total_dynamic": len(validated),
+        "total_with_static": len(static_tickers) + len(validated),
+    }
+
+
+def get_dynamic_tickers() -> list[str]:
+    """Return validated dynamic ticker symbols (non-stale only)."""
+    data = load_dynamic_supplement()
+    return [
+        t["ticker"] for t in data.get("tickers", [])
+        if not t.get("stale")
+        and not is_excluded_ticker(
+            t.get("ticker", ""),
+            country=t.get("country"),
+            region=t.get("country"),
+        )
+    ]
+
+
+def get_dynamic_entries() -> list[dict]:
+    """Return full validated dynamic entries with metadata (non-stale only).
+
+    Each entry carries ticker, country (ISO-2), exchange, sector, market_cap
+    and avg_dollar_volume. Used by discovery so the dynamic supplement does
+    not lose the metadata that reconstitute_universe() already fetched.
+    """
+    data = load_dynamic_supplement()
+    return [
+        t for t in data.get("tickers", [])
+        if not t.get("stale")
+        and not is_excluded_ticker(
+            t.get("ticker", ""),
+            country=t.get("country"),
+            region=t.get("country"),
+        )
+    ]
+
+
+def get_dynamic_rejected() -> set[str]:
+    """Tickers currently counted as stale (failed last reconstitution gate).
+
+    These should be excluded from any ETF/fallback direct-inject path — the
+    whole point of routing ETF holdings through reconstitute_universe() is
+    to keep names that fail the liquidity/market-cap floors out of discovery.
+    """
+    data = load_dynamic_supplement()
+    rejected: set[str] = set(data.get("stale_counts", {}).keys())
+    # A currently-stored entry with stale=True is also effectively rejected.
+    for t in data.get("tickers", []):
+        if t.get("stale"):
+            sym = t.get("ticker")
+            if sym:
+                rejected.add(sym)
+    return rejected
+
+
+# ---------------------------------------------------------------------------
+# ETF Holdings Decomposition (Petajisto 2011)
+# ---------------------------------------------------------------------------
+
+_ETF_HOLDINGS_CACHE_PATH = Path("feature_cache/etf_holdings.json")
+
+# Sector ETFs (SPDR Select Sector)
+_UNIVERSE_ETFS_SECTOR = [
+    "XLK", "XLF", "XLV", "XLE", "XLI", "XLY", "XLP", "XLU", "XLB", "XLRE",
+]
+# Country / Region ETFs (iShares MSCI)
+_UNIVERSE_ETFS_COUNTRY = [
+    "EWJ", "EWG", "EWU", "EWA", "EWC", "EWH", "EWS",
+]
+# Size / Style ETFs
+_UNIVERSE_ETFS_SIZE = ["IWM", "MDY"]
+
+_ALL_UNIVERSE_ETFS = _UNIVERSE_ETFS_SECTOR + _UNIVERSE_ETFS_COUNTRY + _UNIVERSE_ETFS_SIZE
+
+
+def decompose_etf_holdings(
+    exclude_tickers: set[str] | None = None,
+    force_refresh: bool = False,
+) -> list[str]:
+    """Extract constituent tickers from key sector/country/size ETFs.
+
+    Uses yfinance get_holdings() with a 7-day cache to avoid repeated API calls.
+    Returns deduplicated ticker symbols not already in the static universe.
+
+    Petajisto (2011): index reconstitution creates predictable demand patterns.
+    Chen, Noronha & Singal (2004): index-add stocks earn abnormal returns.
+    """
+    import yfinance as yf
+
+    cache_ttl = getattr(config, "ETF_HOLDINGS_CACHE_TTL", 604800)  # 7 days
+    excluded = {str(t or "").upper().strip() for t in (exclude_tickers or set())}
+    static_tickers = {e.ticker.upper() for e in get_full_universe()}
+
+    # Check cache freshness
+    if not force_refresh and _ETF_HOLDINGS_CACHE_PATH.exists():
+        try:
+            cached = json.loads(_ETF_HOLDINGS_CACHE_PATH.read_text())
+            saved_at = cached.get("saved_at", "")
+            if saved_at:
+                from datetime import datetime
+                saved_dt = datetime.fromisoformat(saved_at)
+                age_secs = (datetime.now() - saved_dt).total_seconds()
+                if age_secs < cache_ttl:
+                    tickers = [
+                        t for t in cached.get("tickers", [])
+                        if t.upper() not in excluded
+                        and not is_excluded_ticker(t)
+                    ]
+                    _logger.info("ETF decomposition: %d cached tickers (age %.1fh)",
+                                 len(tickers), age_secs / 3600)
+                    return tickers
+        except (json.JSONDecodeError, OSError, ValueError):
+            pass
+
+    # Fetch holdings from each ETF
+    all_tickers: set[str] = set()
+    etf_source: dict[str, list[str]] = {}
+
+    for etf_symbol in _ALL_UNIVERSE_ETFS:
+        try:
+            etf = yf.Ticker(etf_symbol)
+            # get_holdings() returns a DataFrame with symbol column
+            holdings_df = None
+            if hasattr(etf, 'get_holdings'):
+                holdings_df = etf.get_holdings()
+            elif hasattr(etf, 'funds_data'):
+                try:
+                    holdings_df = etf.funds_data.top_holdings
+                except Exception:
+                    pass
+
+            if holdings_df is not None and len(holdings_df) > 0:
+                # Try different column names for the ticker symbol
+                sym_col = None
+                for candidate in ("Symbol", "symbol", "Ticker", "ticker"):
+                    if candidate in holdings_df.columns:
+                        sym_col = candidate
+                        break
+                if sym_col is None and holdings_df.index.name in ("Symbol", "symbol"):
+                    symbols = [str(s) for s in holdings_df.index if isinstance(s, str) and len(s) <= 10]
+                else:
+                    symbols = (
+                        [str(s) for s in holdings_df[sym_col] if isinstance(s, str) and len(s) <= 10]
+                        if sym_col else []
+                    )
+
+                for sym in symbols:
+                    s_upper = sym.upper().strip()
+                    if (
+                        s_upper
+                        and s_upper not in static_tickers
+                        and not is_excluded_ticker(s_upper)
+                    ):
+                        all_tickers.add(s_upper)
+                        etf_source.setdefault(s_upper, []).append(etf_symbol)
+
+                _logger.debug("ETF %s: %d holdings extracted", etf_symbol, len(symbols))
+        except Exception as e:
+            _logger.debug("ETF %s: holdings fetch failed: %s", etf_symbol, e)
+            continue
+
+    # Filter out excluded tickers
+    result = sorted(
+        t for t in all_tickers
+        if t not in excluded and not is_excluded_ticker(t)
+    )
+
+    # Cache result
+    try:
+        from utils.atomic_io import atomic_write_json
+        _ETF_HOLDINGS_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_json(_ETF_HOLDINGS_CACHE_PATH, {
+            "tickers": result,
+            "etf_source": etf_source,
+            "n_etfs_queried": len(_ALL_UNIVERSE_ETFS),
+            "saved_at": datetime.now().isoformat(),
+        }, indent=2)
+    except Exception as e:
+        _logger.debug("ETF holdings cache write failed: %s", e)
+
+    _logger.info("ETF decomposition: %d unique tickers from %d ETFs",
+                 len(result), len(_ALL_UNIVERSE_ETFS))
+    return result
+
+
+# ---------------------------------------------------------------------------
+# ADR Cross-Listing Mapping (saves FX round-trip costs)
+# ---------------------------------------------------------------------------
+
+ADR_MAPPING: dict[str, str] = {
+    # UK → US ADR
+    "SHEL.L": "SHEL", "AZN.L": "AZN", "BP.L": "BP", "GSK.L": "GSK",
+    "RIO.L": "RIO", "HSBA.L": "HSBC", "ULVR.L": "UL", "DEO.L": "DEO",
+    "NGG.L": "NGG", "VOD.L": "VOD", "BTI.L": "BTI", "LIN.L": "LIN",
+    "RELI.L": "RELX", "LSEG.L": "LNSTY", "BHP.L": "BHP",
+    # Germany → US ADR
+    "SAP.DE": "SAP", "SIE.DE": "SIEGY", "DTE.DE": "DTEGY",
+    "ALV.DE": "ALIZY", "BAS.DE": "BASFY", "MBG.DE": "MBGAF",
+    "BMW.DE": "BMWYY", "MUV2.DE": "MURGY", "ADS.DE": "ADDYY",
+    # France → US ADR
+    "SAN.PA": "SNY", "OR.PA": "LRLCY", "AI.PA": "AIQUY",
+    "MC.PA": "LVMUY", "SU.PA": "SCGLY", "BNP.PA": "BNPQY",
+    "DG.PA": "VEOEY", "KER.PA": "PPRUY", "EL.PA": "ESLOY",
+    # Spain → US ADR
+    "SAN.MC": "SAN", "TEF.MC": "TEF", "BBVA.MC": "BBVA",
+    "IBE.MC": "IBDRY",
+    # Nordics → US ADR
+    "NOVO-B.CO": "NVO", "AZN.ST": "AZN", "VOLV-B.ST": "VLVLY",
+    "ERIC-B.ST": "ERIC", "NESTE.HE": "NTOIY",
+    # Japan → US ADR
+    "7203.T": "TM", "6758.T": "SONY", "9984.T": "SFTBY",
+    "8306.T": "MUFG", "6861.T": "KYOCY", "7267.T": "HMC",
+    # Australia → US ADR
+    "BHP.AX": "BHP", "CSL.AX": "CSLLY", "WBC.AX": "WBCFY",
+    # Canada → US ADR
+    "RY.TO": "RY", "TD.TO": "TD", "ENB.TO": "ENB",
+    "CNR.TO": "CNI", "BMO.TO": "BMO", "BNS.TO": "BNS",
+    # Hong Kong → US ADR
+    "0700.HK": "TCEHY", "9988.HK": "BABA", "3690.HK": "MPNGY",
+}
+
+# Reverse mapping: ADR → local ticker
+ADR_REVERSE_MAPPING: dict[str, str] = {v: k for k, v in ADR_MAPPING.items()}

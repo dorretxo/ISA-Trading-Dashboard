@@ -30,7 +30,6 @@ Usage:
 
 import json
 import logging
-import os
 import time
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
@@ -38,6 +37,8 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+
+from utils.atomic_io import atomic_write_json
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +60,8 @@ class TickerFeatures:
     # Volatility
     vol_20d: float = 0.0      # 20-day realised vol (annualised)
     vol_60d: float = 0.0      # 60-day realised vol (annualised)
+    downside_vol_60d: float = 0.0  # 60-day downside semi-vol (annualised)
+    max_dd_252d: float = 0.0       # trailing 252d max drawdown as positive fraction
 
     # Trend / MA
     above_sma50: bool = False
@@ -164,13 +167,7 @@ class FeatureStore:
             "features": self._data,
         }
 
-        # Atomic write via temp file
-        tmp = path.with_suffix(".tmp")
-        with open(tmp, "w") as f:
-            json.dump(payload, f, separators=(",", ":"))
-            f.flush()
-            os.fsync(f.fileno())
-        tmp.replace(path)
+        atomic_write_json(path, payload, separators=(",", ":"))
 
         self._dirty = False
         logger.info("Feature store saved: %d tickers for %s", len(self._data), date_str)
@@ -388,6 +385,12 @@ def _extract_ticker_features(
         # Volatility (annualised)
         vol_20d = float(np.std(daily_returns[-20:]) * np.sqrt(252)) if len(daily_returns) >= 20 else 0
         vol_60d = float(np.std(daily_returns[-60:]) * np.sqrt(252)) if len(daily_returns) >= 60 else vol_20d
+        downside_sample = daily_returns[-60:] if len(daily_returns) >= 60 else daily_returns
+        downside = downside_sample[downside_sample < 0]
+        downside_vol_60d = (
+            float(np.sqrt(np.mean(np.square(downside))) * np.sqrt(252))
+            if len(downside) >= 2 else 0.0
+        )
 
         # Moving averages
         sma_50 = np.mean(values[-min(50, n):])
@@ -419,6 +422,10 @@ def _extract_ticker_features(
         low_252 = np.min(values[-min(252, n):])
         pct_from_high = values[-1] / high_252 if high_252 > 0 else 0
         pct_from_low = values[-1] / low_252 if low_252 > 0 else 0
+        dd_values = values[-min(252, n):]
+        running_peak = np.maximum.accumulate(dd_values)
+        drawdowns = dd_values / np.maximum(running_peak, 1e-12) - 1.0
+        max_dd_252d = float(abs(np.min(drawdowns))) if len(drawdowns) else 0.0
 
         # Beta vs SPY
         beta = 1.0
@@ -441,6 +448,8 @@ def _extract_ticker_features(
             ret_10d=float(ret_10d),
             vol_20d=vol_20d,
             vol_60d=vol_60d,
+            downside_vol_60d=downside_vol_60d,
+            max_dd_252d=max_dd_252d,
             above_sma50=above_sma50,
             above_sma200=above_sma200,
             sma50_slope=float(sma50_slope),

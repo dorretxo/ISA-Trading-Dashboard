@@ -66,6 +66,8 @@ CHANDELIER_TIGHTEN_NEAR_TARGET = 2.0  # Tighter multiplier when near take-profit
 CUSUM_THRESHOLD = 4.0             # Detection threshold (h parameter, in std devs)
 CUSUM_DRIFT = 0.5                 # Allowable drift before alarm (k parameter)
 CUSUM_LOOKBACK = 60               # Days for estimating mean/std of returns
+CUSUM_REF_MIN = 120               # Minimum external reference window (trading days)
+CUSUM_TEST_TAIL = 45              # Most-recent window scored for change-points
 
 # Score decay
 DECAY_LOOKBACK_DAYS = 30
@@ -209,77 +211,103 @@ def _cusum_changepoint(
     returns: np.ndarray,
     threshold: float = CUSUM_THRESHOLD,
     drift: float = CUSUM_DRIFT,
+    *,
+    ref_min: int = CUSUM_REF_MIN,
+    test_tail: int = CUSUM_TEST_TAIL,
 ) -> dict:
-    """Detect structural change in return distribution using CUSUM.
+    """Detect structural change in the *recent* return distribution using CUSUM.
 
-    The CUSUM (Cumulative Sum) algorithm detects when a process has shifted
-    from its expected mean. We track both upward and downward shifts.
+    Page's (1954) sequential test assumes the reference moments (μ, σ) are
+    estimated from a window disjoint from the test window; otherwise the
+    in-sample reference inflates Type-I error (see Basseville & Nikiforov 1993,
+    §2.3).  Callers should pass a long history (≥ ``ref_min + test_tail``
+    trading days); the leading ``len(returns) - test_tail`` observations form
+    the out-of-sample reference and only the trailing ``test_tail`` window is
+    scanned for a change-point.
 
-    For exit signals, we care about NEGATIVE shifts — the stock's return
-    distribution has moved downward relative to its recent norm.
+    For exit signals we care about NEGATIVE shifts — the stock's return
+    distribution has moved downward relative to its established baseline.
 
     Parameters:
-        returns: Array of daily returns
-        threshold: h parameter — number of std devs for alarm (higher = fewer false alarms)
-        drift: k parameter — allowable drift before accumulation starts
+        returns: Array of daily returns (chronological; most recent last).
+        threshold: h parameter — number of std devs for alarm.
+        drift: k parameter — allowable drift before accumulation starts.
+        ref_min: Minimum reference-window length (trading days).
+        test_tail: Length of the recent window scanned for a change-point.
 
     Returns:
-        {
-            "alarm": bool,           # True if change-point detected
-            "direction": str,        # "negative" or "positive"
-            "cusum_value": float,    # Current CUSUM statistic
-            "threshold": float,      # Detection threshold used
-            "days_since_shift": int, # How many days ago the shift was detected
-            "magnitude": float,      # Normalized shift magnitude (0-1)
-        }
+        dict with keys: alarm, direction, cusum_value, threshold,
+        days_since_shift, magnitude, ref_len, test_len.
     """
-    if len(returns) < 30:
-        return {"alarm": False, "direction": "none", "cusum_value": 0,
-                "threshold": threshold, "days_since_shift": 0, "magnitude": 0}
+    n = len(returns)
+    base = {
+        "alarm": False, "direction": "none", "cusum_value": 0.0,
+        "threshold": threshold, "days_since_shift": 0, "magnitude": 0.0,
+        "ref_len": 0, "test_len": 0,
+    }
+    if n < ref_min + 20:
+        return base
 
-    # Reference period: first 2/3 of data establishes "normal"
-    ref_len = max(20, len(returns) * 2 // 3)
+    # Strictly disjoint reference (history) and test (recent tail).
+    test_len = min(test_tail, max(20, n - ref_min))
+    ref_len = n - test_len
+    if ref_len < ref_min or test_len < 20:
+        return base
+
     ref_returns = returns[:ref_len]
-    mu = float(np.mean(ref_returns))
-    sigma = float(np.std(ref_returns))
+    # Robust reference moments: median/MAD is insensitive to the handful of
+    # outlier days that plague daily equity returns (Huber 1964).
+    mu = float(np.median(ref_returns))
+    mad = float(np.median(np.abs(ref_returns - mu)))
+    sigma = 1.4826 * mad if mad > 0 else float(np.std(ref_returns))
     if sigma < 1e-8:
         sigma = 0.01
 
-    # Normalized returns
-    z = (returns - mu) / sigma
+    z_tail = (returns[ref_len:] - mu) / sigma
 
-    # One-sided CUSUM for negative shifts
+    # Two-sided CUSUM over the test window only.
     s_neg = 0.0
     s_pos = 0.0
-    neg_alarm_day = None
-    pos_alarm_day = None
+    neg_alarm_day: int | None = None
+    pos_alarm_day: int | None = None
+    peak_neg = 0.0
+    peak_pos = 0.0
 
-    for i in range(ref_len, len(z)):
-        # Negative shift detection
-        s_neg = max(0, s_neg - z[i] - drift)
+    for i, z in enumerate(z_tail):
+        s_neg = max(0.0, s_neg - float(z) - drift)
+        s_pos = max(0.0, s_pos + float(z) - drift)
+        peak_neg = max(peak_neg, s_neg)
+        peak_pos = max(peak_pos, s_pos)
         if s_neg > threshold and neg_alarm_day is None:
             neg_alarm_day = i
-
-        # Positive shift detection (for completeness)
-        s_pos = max(0, s_pos + z[i] - drift)
         if s_pos > threshold and pos_alarm_day is None:
             pos_alarm_day = i
 
     alarm = neg_alarm_day is not None
-    direction = "negative" if alarm else ("positive" if pos_alarm_day is not None else "none")
-    cusum_val = s_neg if alarm else s_pos
+    if alarm:
+        direction = "negative"
+        cusum_val = peak_neg
+        days_since = test_len - neg_alarm_day
+    elif pos_alarm_day is not None:
+        direction = "positive"
+        cusum_val = peak_pos
+        days_since = test_len - pos_alarm_day
+    else:
+        direction = "none"
+        cusum_val = max(peak_neg, peak_pos)
+        days_since = 0
 
-    days_since = (len(returns) - neg_alarm_day) if neg_alarm_day else 0
-    # Magnitude: how far CUSUM exceeded threshold, normalized to 0-1
-    magnitude = min(1.0, (cusum_val - threshold) / threshold) if alarm else 0
+    magnitude = min(1.0, (cusum_val - threshold) / threshold) if alarm else 0.0
 
     return {
         "alarm": alarm,
         "direction": direction,
         "cusum_value": round(float(cusum_val), 3),
         "threshold": threshold,
-        "days_since_shift": days_since,
+        "days_since_shift": int(days_since),
         "magnitude": round(magnitude, 3),
+        "ref_len": int(ref_len),
+        "test_len": int(test_len),
     }
 
 
@@ -607,11 +635,15 @@ def assess_exits(results: list[dict], holdings: list[dict]) -> list[ExitSignal]:
 
         # ── 1. Chandelier Exit (LeBeau) ──────────────────────────────
         try:
-            data = yf.download(ticker, period="90d", progress=False, auto_adjust=True)
+            data = yf.download(ticker, period="1y", progress=False, auto_adjust=True)
             if data is not None and len(data) >= 30:
-                highs = data["High"].values.flatten().astype(float)
-                lows = data["Low"].values.flatten().astype(float)
-                closes = data["Close"].values.flatten().astype(float)
+                highs_full = data["High"].values.flatten().astype(float)
+                lows_full = data["Low"].values.flatten().astype(float)
+                closes_full = data["Close"].values.flatten().astype(float)
+                # Chandelier only needs the recent 90 bars; CUSUM uses the full history.
+                highs = highs_full[-90:]
+                lows = lows_full[-90:]
+                closes = closes_full[-90:]
 
                 # Standard Chandelier with regime-adaptive multiplier
                 _regime_mult = _regime_adaptive_atr_mult()
@@ -636,7 +668,9 @@ def assess_exits(results: list[dict], holdings: list[dict]) -> list[ExitSignal]:
                         stop_urgency = min(1.0, stop_urgency * (1.0 + pos_weight * 2))
 
                 # ── 2. CUSUM Change-Point Detection (Page, 1954) ──────
-                daily_returns = np.diff(closes) / closes[:-1]
+                # Use the *full* 1y history so the reference window is
+                # disjoint from the trailing test window.
+                daily_returns = np.diff(closes_full) / closes_full[:-1]
                 cusum = _cusum_changepoint(daily_returns)
                 signals_detail["cusum"] = cusum
 
@@ -744,10 +778,18 @@ def assess_exits(results: list[dict], holdings: list[dict]) -> list[ExitSignal]:
             exit_score=exit_score,
         ))
 
-    # Sort by composite exit score (highest urgency first)
-    exit_signals.sort(key=lambda s: s.exit_score, reverse=True)
+    # Deduplicate per ticker: a holding can emit both a score-action signal
+    # (e.g., STRONG SELL) and a composite signal (e.g., stop_proximity); we
+    # keep the highest-urgency one to avoid double-listing the same name.
+    best_by_ticker: dict[str, ExitSignal] = {}
+    for sig in exit_signals:
+        prev = best_by_ticker.get(sig.ticker)
+        if prev is None or sig.exit_score > prev.exit_score:
+            best_by_ticker[sig.ticker] = sig
 
-    return exit_signals
+    deduped = list(best_by_ticker.values())
+    deduped.sort(key=lambda s: s.exit_score, reverse=True)
+    return deduped
 
 
 # ---------------------------------------------------------------------------

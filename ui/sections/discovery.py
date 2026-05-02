@@ -137,12 +137,12 @@ def render_discovery_section(dash, holdings, risk_data) -> None:
     with disc_col2:
         cached_ts = st.session_state.get("discovery_cached_from")
         if cached_ts and "discovery_results" in st.session_state:
-            st.info(f"Showing cached results · {format_freshness(cached_ts)} · Click Re-run to refresh")
+            st.info(f"Showing cached results - {format_freshness(cached_ts)} - Click Re-run to refresh")
         else:
             st.info(
-                f"Screens {len(config.DISCOVERY_EXCHANGES)} US exchanges + global universe · "
-                f"Market cap = £{config.DISCOVERY_MIN_MCAP / 1e6:.0f}M (no upper cap) · "
-                f"Top {config.DISCOVERY_TOP_N_FULL_SCORE} fully scored · "
+                f"Screens {len(config.DISCOVERY_EXCHANGES)} US exchanges + global universe - "
+                f"Market cap = GBP {config.DISCOVERY_MIN_MCAP / 1e6:.0f}M (no upper cap) - "
+                f"Top {config.DISCOVERY_TOP_N_FULL_SCORE} fully scored - "
                 f"~60-90 min runtime"
             )
 
@@ -180,7 +180,7 @@ def render_discovery_section(dash, holdings, risk_data) -> None:
             f"{disc.after_quick_filter} filtered ? "
             f"{disc.after_corr_filter} uncorrelated ? "
             f"{disc.after_quick_rank} ranked ? "
-            f"{disc.fully_scored} scored · "
+            f"{disc.fully_scored} scored - "
             f"?? {disc.run_time_seconds:.0f}s"
         )
 
@@ -216,21 +216,21 @@ def render_discovery_section(dash, holdings, risk_data) -> None:
                 "best",
                 "Best New Opportunity",
                 best_idea,
-                f"Final rank {safe_float(getattr(best_idea, 'final_rank', 0)):.3f} · {getattr(best_idea, 'action', 'NEUTRAL')}",
+                f"Final rank {safe_float(getattr(best_idea, 'final_rank', 0)):.3f} - {getattr(best_idea, 'action', 'NEUTRAL')}",
             ),
             (
                 cc2,
                 "fit",
                 "Best Diversifier",
                 best_fit,
-                f"Portfolio fit {safe_float(getattr(best_fit, 'portfolio_fit_score', 0)):.2f} · Corr {safe_float(getattr(best_fit, 'max_correlation', 0)):.2f}",
+                f"Portfolio fit {safe_float(getattr(best_fit, 'portfolio_fit_score', 0)):.2f} - Corr {safe_float(getattr(best_fit, 'max_correlation', 0)):.2f}",
             ),
             (
                 cc3,
                 "momentum",
                 "Momentum Leader",
                 best_momentum,
-                f"Momentum {safe_float(getattr(best_momentum, 'momentum_score', 0)):.2f} · 90d {format_pct(safe_float(getattr(best_momentum, 'return_90d', 0)) * 100)}",
+                f"Momentum {safe_float(getattr(best_momentum, 'momentum_score', 0)):.2f} - 90d {format_pct(safe_float(getattr(best_momentum, 'return_90d', 0)) * 100)}",
             ),
             (
                 cc4,
@@ -289,7 +289,7 @@ def render_discovery_section(dash, holdings, risk_data) -> None:
                         action_tone = "neutral"
                     mcap = safe_float(cand.market_cap)
                     geo = country_flags.get(cand.country, "Global")
-                    subtitle = f"{geo} · {cand.exchange} · {cand.sector}" + (f" · {format_currency(mcap / 1e9, 'GBP', decimals=1)}B mcap" if mcap > 0 else "")
+                    subtitle = f"{geo} - {cand.exchange} - {cand.sector}" + (f" - {format_currency(mcap / 1e9, 'GBP', decimals=1)}B mcap" if mcap > 0 else "")
                     badge_html = (
                         '<div class="badge-row">'
                         f'<span class="signal-badge {action_tone}">{_html.escape(action)}</span>'
@@ -331,8 +331,8 @@ def render_discovery_section(dash, holdings, risk_data) -> None:
                         st.markdown(f"**Thesis:** {candidate_thesis(cand)}")
                         st.caption(f"**System rationale:** {cand.why}")
                         st.caption(
-                            f"Momentum: {format_pct(safe_float(getattr(cand, 'return_90d', 0)) * 100)} over 90d · "
-                            f"{format_pct(safe_float(getattr(cand, 'return_30d', 0)) * 100)} over 30d · "
+                            f"Momentum: {format_pct(safe_float(getattr(cand, 'return_90d', 0)) * 100)} over 90d - "
+                            f"{format_pct(safe_float(getattr(cand, 'return_30d', 0)) * 100)} over 30d - "
                             f"volume {safe_float(getattr(cand, 'volume_ratio', 1.0)):.1f}x"
                         )
                         if cand.fx_penalty_applied:
@@ -359,14 +359,14 @@ def render_discovery_section(dash, holdings, risk_data) -> None:
                         "Sector": c.sector,
                         "Score": c.aggregate_score,
                         "Confidence": discovery_confidence(c)[0],
-                        "FX Penalty": f"-{c.fx_penalty_pct:.1f}%" if c.fx_penalty_applied else "—",
+                        "FX Penalty": f"-{c.fx_penalty_pct:.1f}%" if c.fx_penalty_applied else "-",
                         "Fit": c.portfolio_fit_score,
                         "Max Corr": c.max_correlation,
                         "Action": c.action,
                         "Currency": c.currency,
-                        "Cap": getattr(c, "cap_tier", "—"),
-                        "Parabolic": f"-{c.parabolic_penalty:.2f}" if getattr(c, "is_parabolic", False) else "—",
-                        "Earnings": f"{c.earnings_days}d" if getattr(c, "earnings_days", None) else "—",
+                        "Cap": getattr(c, "cap_tier", "-"),
+                        "Parabolic": f"-{c.parabolic_penalty:.2f}" if getattr(c, "is_parabolic", False) else "-",
+                        "Earnings": f"{c.earnings_days}d" if getattr(c, "earnings_days", None) else "-",
                     }
                 )
             if disc_rows:
@@ -412,7 +412,7 @@ def render_discovery_section(dash, holdings, risk_data) -> None:
                     st.dataframe(pd.DataFrame(ac_rows), hide_index=True, use_container_width=True)
 
                 if rstats:
-                    re_rows = [{"Regime": r["regime"], "Avg 90d Return": f"{r['avg_return_90d']:+.1f}%", "Best Pillar": (r["best_pillar"] or "—").title(), "Samples": r["sample_size"]} for r in rstats]
+                    re_rows = [{"Regime": r["regime"], "Avg 90d Return": f"{r['avg_return_90d']:+.1f}%", "Best Pillar": (r["best_pillar"] or "-").title(), "Samples": r["sample_size"]} for r in rstats]
                     st.markdown("**Regime Effectiveness (which regime works best?)**")
                     st.dataframe(pd.DataFrame(re_rows), hide_index=True, use_container_width=True)
 
@@ -423,8 +423,8 @@ def render_discovery_section(dash, holdings, risk_data) -> None:
                         s_hit = st_stats.get("stops_hit") or 0
                         t_hit = st_stats.get("targets_hit") or 0
                         st.markdown("**Stop-Loss / Take-Profit Hits**")
-                        st.caption(f"Stops hit: {s_hit}/{total_w} ({s_hit/total_w:.0%})" + (f" — avg day {st_stats['avg_stop_day']:.0f}" if st_stats.get("avg_stop_day") else ""))
-                        st.caption(f"Targets hit: {t_hit}/{total_w} ({t_hit/total_w:.0%})" + (f" — avg day {st_stats['avg_target_day']:.0f}" if st_stats.get("avg_target_day") else ""))
+                        st.caption(f"Stops hit: {s_hit}/{total_w} ({s_hit/total_w:.0%})" + (f" - avg day {st_stats['avg_stop_day']:.0f}" if st_stats.get("avg_stop_day") else ""))
+                        st.caption(f"Targets hit: {t_hit}/{total_w} ({t_hit/total_w:.0%})" + (f" - avg day {st_stats['avg_target_day']:.0f}" if st_stats.get("avg_target_day") else ""))
                 with fc_col:
                     if st_stats and st_stats.get("avg_forecast_err_5d") is not None:
                         st.markdown("**Forecast Accuracy**")
@@ -433,8 +433,8 @@ def render_discovery_section(dash, holdings, risk_data) -> None:
                             st.caption(f"63-day avg error: {st_stats['avg_forecast_err_63d']:.1f}%")
 
                 if perf:
-                    perf_rows = [{"Date": p["run_date"][:10], "Ticker": p["ticker"], "Source": p.get("source", "—"), "Action": p.get("action", "—"), "Score": f"{p['aggregate_score']:.3f}", "30d": f"{p['return_30d']:+.1f}%" if p.get("return_30d") is not None else "—", "60d": f"{p['return_60d']:+.1f}%" if p.get("return_60d") is not None else "—", "90d": f"{p['return_90d']:+.1f}%" if p.get("return_90d") is not None else "—", "Beat SPY": "Yes" if p.get("beat_market") else "No", "Action OK": "Yes" if p.get("action_correct") else "No"} for p in perf]
-                    st.markdown("**Signal Performance — Multi-Horizon Returns**")
+                    perf_rows = [{"Date": p["run_date"][:10], "Ticker": p["ticker"], "Source": p.get("source", "-"), "Action": p.get("action", "-"), "Score": f"{p['aggregate_score']:.3f}", "30d": f"{p['return_30d']:+.1f}%" if p.get("return_30d") is not None else "-", "60d": f"{p['return_60d']:+.1f}%" if p.get("return_60d") is not None else "-", "90d": f"{p['return_90d']:+.1f}%" if p.get("return_90d") is not None else "-", "Beat SPY": "Yes" if p.get("beat_market") else "No", "Action OK": "Yes" if p.get("action_correct") else "No"} for p in perf]
+                    st.markdown("**Signal Performance - Multi-Horizon Returns**")
                     st.dataframe(pd.DataFrame(perf_rows), hide_index=True, use_container_width=True)
                     returns = [p["return_90d"] for p in perf if p.get("return_90d") is not None]
                     if returns:
@@ -458,23 +458,23 @@ def render_discovery_section(dash, holdings, risk_data) -> None:
             with st.expander(f"?? **Performance Scorecard** ({sc.evaluated_signals} signals evaluated)"):
                 ev1, ev2, ev3, ev4 = st.columns(4)
                 ev1.metric("Sharpe Ratio", f"{sc.sharpe_ratio:.2f}")
-                ev2.metric("Sortino Ratio", f"{sc.sortino_ratio:.2f}" if sc.sortino_ratio else "—")
-                ev3.metric("Max Drawdown", f"{sc.max_drawdown:+.1f}%" if sc.max_drawdown else "—")
-                ev4.metric("Calmar Ratio", f"{sc.calmar_ratio:.2f}" if sc.calmar_ratio else "—")
+                ev2.metric("Sortino Ratio", f"{sc.sortino_ratio:.2f}" if sc.sortino_ratio else "-")
+                ev3.metric("Max Drawdown", f"{sc.max_drawdown:+.1f}%" if sc.max_drawdown else "-")
+                ev4.metric("Calmar Ratio", f"{sc.calmar_ratio:.2f}" if sc.calmar_ratio else "-")
 
                 ev5, ev6, ev7, ev8 = st.columns(4)
-                ev5.metric("Hit Rate (90d)", f"{sc.overall_hit_rate:.0%}" if sc.overall_hit_rate else "—")
-                ev6.metric("Action Accuracy", f"{sc.action_accuracy:.0%}" if sc.action_accuracy else "—")
-                ev7.metric("Beat SPY Rate", f"{sc.beat_benchmark_rate:.0%}" if sc.beat_benchmark_rate else "—")
-                ev8.metric("IC Stability", f"{sc.ic_stability:.4f}" if sc.ic_stability else "—")
+                ev5.metric("Hit Rate (90d)", f"{sc.overall_hit_rate:.0%}" if sc.overall_hit_rate else "-")
+                ev6.metric("Action Accuracy", f"{sc.action_accuracy:.0%}" if sc.action_accuracy else "-")
+                ev7.metric("Beat SPY Rate", f"{sc.beat_benchmark_rate:.0%}" if sc.beat_benchmark_rate else "-")
+                ev8.metric("IC Stability", f"{sc.ic_stability:.4f}" if sc.ic_stability else "-")
 
                 if sc.horizons:
-                    h_rows = pd.DataFrame([{"Horizon": h.horizon, "Avg Return": f"{h.avg_return:+.1f}%", "Median": f"{h.median_return:+.1f}%", "Std Dev": f"{h.std_return:.1f}%", "Hit Rate": f"{h.hit_rate:.0%}", "Alpha vs SPY": f"{h.alpha:+.1f}%" if h.horizon == "90d" else "—", "Best": f"{h.best:+.1f}%", "Worst": f"{h.worst:+.1f}%", "N": h.sample_size} for h in sc.horizons])
+                    h_rows = pd.DataFrame([{"Horizon": h.horizon, "Avg Return": f"{h.avg_return:+.1f}%", "Median": f"{h.median_return:+.1f}%", "Std Dev": f"{h.std_return:.1f}%", "Hit Rate": f"{h.hit_rate:.0%}", "Alpha vs SPY": f"{h.alpha:+.1f}%" if h.horizon == "90d" else "-", "Best": f"{h.best:+.1f}%", "Worst": f"{h.worst:+.1f}%", "N": h.sample_size} for h in sc.horizons])
                     st.markdown("**Returns by Horizon**")
                     st.dataframe(h_rows, hide_index=True, use_container_width=True)
 
                 if sc.regimes:
-                    r_rows = pd.DataFrame([{"Regime": r.regime, "Avg 90d Return": f"{r.avg_return_90d:+.1f}%", "Hit Rate": f"{r.hit_rate:.0%}", "Best Pillar": (r.best_pillar or "—").title(), "N": r.sample_size} for r in sc.regimes])
+                    r_rows = pd.DataFrame([{"Regime": r.regime, "Avg 90d Return": f"{r.avg_return_90d:+.1f}%", "Hit Rate": f"{r.hit_rate:.0%}", "Best Pillar": (r.best_pillar or "-").title(), "N": r.sample_size} for r in sc.regimes])
                     st.markdown("**Performance by Market Regime**")
                     st.dataframe(r_rows, hide_index=True, use_container_width=True)
 

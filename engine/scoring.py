@@ -1,5 +1,10 @@
 """Multi-factor scoring engine and recommendation logic."""
 
+import concurrent.futures
+import logging
+import threading
+import time
+
 import config
 from engine import technical, fundamental, sentiment, stops
 from engine.forecasting import forecast_dual_horizon
@@ -7,16 +12,185 @@ from engine.regime import get_regime_adjusted_weights
 from utils.data_fetch import get_current_price, get_daily_change
 from utils.safe_numeric import safe_float
 
+_logger = logging.getLogger(__name__)
+
+# Per-component timeout (seconds) — prevents any single sub-analysis from blocking
+_COMPONENT_TIMEOUT = getattr(config, "SCORING_COMPONENT_TIMEOUT", 45)
+_WEIGHT_CACHE_LOCK = threading.Lock()
+_WEIGHT_CACHE: dict[tuple[str, str], tuple[dict[str, float] | None, float]] = {}
+
+
+def _get_scoring_weights(source: str = "portfolio", horizon: str = "90d") -> dict[str, float]:
+    """Return scoring weights with a short process-local cache."""
+    ttl = float(getattr(config, "SCORING_ADAPTIVE_WEIGHT_CACHE_TTL", 900))
+    key = (source, horizon)
+    now = time.time()
+    with _WEIGHT_CACHE_LOCK:
+        cached = _WEIGHT_CACHE.get(key)
+        if cached and now - cached[1] < ttl and cached[0] is not None:
+            return dict(cached[0])
+
+    adjusted_weights = None
+    try:
+        from engine.discovery_backtest import get_adaptive_weights
+        adjusted_weights = get_adaptive_weights(source=source, horizon=horizon)
+    except Exception:
+        adjusted_weights = None
+
+    if adjusted_weights is None:
+        try:
+            adjusted_weights = get_regime_adjusted_weights(config.WEIGHTS)
+        except Exception:
+            adjusted_weights = dict(config.WEIGHTS)
+
+    pillars = ("technical", "fundamental", "sentiment", "forecast")
+    normalized = {
+        p: float((adjusted_weights or {}).get(p, config.WEIGHTS.get(p, 0.0)) or 0.0)
+        for p in pillars
+    }
+    total = sum(max(0.0, v) for v in normalized.values())
+    if total <= 0:
+        normalized = dict(config.WEIGHTS)
+    else:
+        normalized = {k: max(0.0, v) / total for k, v in normalized.items()}
+
+    with _WEIGHT_CACHE_LOCK:
+        _WEIGHT_CACHE[key] = (dict(normalized), now)
+    return normalized
+
+
+def clear_runtime_caches() -> None:
+    """Clear process-local scoring caches."""
+    with _WEIGHT_CACHE_LOCK:
+        _WEIGHT_CACHE.clear()
+
+
+def _run_component(func, *args, component_name: str = "", timeout: int = 0, **kwargs):
+    """Run a scoring component with timeout protection and error isolation.
+
+    Uses multiprocessing-based ProcessPoolExecutor to get true preemptive timeout,
+    falling back to ThreadPoolExecutor if process-based execution fails (e.g. pickling issues).
+    Returns (result, elapsed_seconds, error_string_or_None).
+    """
+    timeout = timeout or _COMPONENT_TIMEOUT
+    t0 = time.time()
+
+    # Strategy 1: Thread-based (fast, but GIL can block timeout)
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    try:
+        future = pool.submit(func, *args, **kwargs)
+        result = future.result(timeout=timeout)
+        elapsed = time.time() - t0
+        pool.shutdown(wait=False)
+        return result, elapsed, None
+    except concurrent.futures.TimeoutError:
+        elapsed = time.time() - t0
+        # Check if the thread is genuinely stuck (GIL-blocked C extension)
+        # If so, the elapsed time will be very close to timeout — that's fine.
+        # The key fix: don't wait for the stuck thread.
+        pool.shutdown(wait=False)
+        _logger.warning("[scoring] %s timed out after %.1fs (limit %ds)",
+                        component_name, elapsed, timeout)
+        return None, elapsed, f"timeout after {timeout}s"
+    except Exception as e:
+        elapsed = time.time() - t0
+        _logger.warning("[scoring] %s failed after %.1fs: %s: %s",
+                        component_name, elapsed, type(e).__name__, e)
+        pool.shutdown(wait=False)
+        return None, elapsed, str(e)
+
 
 def analyse_holding(holding: dict) -> dict:
     """Run full analysis on a single holding. Returns all data needed for the UI."""
     ticker = holding["ticker"]
     name = holding.get("name", ticker)
+    _hold_start = time.time()
+    _component_timings: dict[str, float] = {}
+    _component_errors: list[str] = []
 
-    # Run all three analysis modules
-    tech = technical.analyse(ticker)
-    fund = fundamental.analyse(ticker)
-    sent = sentiment.analyse(ticker, company_name=name)
+    if getattr(config, "SCORING_PARALLEL_COMPONENTS", True):
+        component_jobs = {
+            "technical": (technical.analyse, (ticker,), {}, {"score": 0.0, "reasons": [], "current_price": None, "rsi": None, "atr": None}),
+            "fundamental": (fundamental.analyse, (ticker,), {}, {"score": 0.0, "reasons": []}),
+            "sentiment": (
+                sentiment.analyse,
+                (ticker,),
+                {"company_name": name},
+                {"score": 0.0, "reasons": [], "sentiment_confidence": 0.0, "article_count": 0, "active_sources": 0},
+            ),
+        }
+        component_results: dict[str, dict] = {}
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=len(component_jobs))
+        futures = {}
+        try:
+            for comp_name, (func, args, kwargs, fallback) in component_jobs.items():
+                futures[pool.submit(func, *args, **kwargs)] = (comp_name, time.time(), fallback)
+
+            for future, (comp_name, started, fallback) in list(futures.items()):
+                try:
+                    remaining = max(0.1, _COMPONENT_TIMEOUT - (time.time() - started))
+                    value = future.result(timeout=remaining)
+                    _component_timings[comp_name] = time.time() - started
+                    component_results[comp_name] = value or fallback
+                except concurrent.futures.TimeoutError:
+                    _component_timings[comp_name] = time.time() - started
+                    _component_errors.append(f"{comp_name}: timeout after {_COMPONENT_TIMEOUT}s")
+                    _logger.warning("[scoring] %s(%s) timed out after %.1fs (limit %ds)",
+                                    comp_name, ticker, _component_timings[comp_name], _COMPONENT_TIMEOUT)
+                    component_results[comp_name] = fallback
+                except Exception as e:
+                    _component_timings[comp_name] = time.time() - started
+                    _component_errors.append(f"{comp_name}: {e}")
+                    _logger.warning("[scoring] %s(%s) failed after %.1fs: %s: %s",
+                                    comp_name, ticker, _component_timings[comp_name], type(e).__name__, e)
+                    component_results[comp_name] = fallback
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
+
+        tech = component_results.get("technical") or component_jobs["technical"][3]
+        fund = component_results.get("fundamental") or component_jobs["fundamental"][3]
+        sent = component_results.get("sentiment") or component_jobs["sentiment"][3]
+    else:
+        # Run all three analysis modules with timeout protection
+        tech, _t, _e = _run_component(technical.analyse, ticker, component_name=f"technical({ticker})")
+        _component_timings["technical"] = _t
+        if tech is None:
+            _component_errors.append(f"technical: {_e}")
+            tech = {"score": 0.0, "reasons": [], "current_price": None, "rsi": None, "atr": None}
+
+        fund, _t, _e = _run_component(fundamental.analyse, ticker, component_name=f"fundamental({ticker})")
+        _component_timings["fundamental"] = _t
+        if fund is None:
+            _component_errors.append(f"fundamental: {_e}")
+            fund = {"score": 0.0, "reasons": []}
+
+        sent, _t, _e = _run_component(
+            sentiment.analyse, ticker, component_name=f"sentiment({ticker})",
+            company_name=name,
+        )
+        _component_timings["sentiment"] = _t
+        if sent is None:
+            _component_errors.append(f"sentiment: {_e}")
+            sent = {"score": 0.0, "reasons": [], "sentiment_confidence": 0.0,
+                    "article_count": 0, "active_sources": 0}
+
+    if _component_errors:
+        _logger.info("[scoring] %s: %d component errors: %s (timings: %s)",
+                     ticker, len(_component_errors),
+                     "; ".join(_component_errors),
+                     {k: f"{v:.1f}s" for k, v in _component_timings.items()})
+
+    transcript_text = (
+        holding.get("transcript_text")
+        or holding.get("earnings_transcript")
+        or holding.get("qa_transcript")
+    )
+    qa_sentiment_score = None
+    if transcript_text:
+        try:
+            qa_sentiment_score = sentiment.score_qa_sentiment(transcript_text)
+        except Exception:
+            qa_sentiment_score = None
 
     # Get price data — sanitise to prevent NaN propagation
     current_price = safe_float(tech.get("current_price")) or safe_float(get_current_price(ticker))
@@ -34,7 +208,15 @@ def analyse_holding(holding: dict) -> dict:
     forecast_score = 0.0
     forecast_reasons = []
     try:
-        dual = forecast_dual_horizon(ticker)
+        _fc_timeout = getattr(config, "SCORING_FORECAST_TIMEOUT", 60)
+        dual, _fc_t, _fc_e = _run_component(
+            forecast_dual_horizon, ticker,
+            component_name=f"forecast({ticker})",
+            timeout=_fc_timeout,
+        )
+        _component_timings["forecast"] = _fc_t
+        if dual is None:
+            raise RuntimeError(_fc_e or "forecast returned None")
         fc_short = dual["short"]
         fc_long = dual["long"]
 
@@ -112,22 +294,12 @@ def analyse_holding(holding: dict) -> dict:
             else:
                 forecast_reasons.append(f"90d outlook {fc_long.pct_change:+.1f}%")
     except Exception as e:
-        import logging as _log
-        _log.getLogger(__name__).warning("Forecast failed for %s: %s", ticker, e)
+        _component_errors.append(f"forecast: {e}")
+        _logger.warning("[scoring] Forecast failed for %s: %s: %s", ticker, type(e).__name__, e)
         forecast_data = {"forecast_price": None, "expected_return_90d": 0.0, "forecast_unavailable": True}
 
     # Get weights: prefer adaptive (backtest-driven) → regime-adjusted → config defaults
-    adjusted_weights = None
-    try:
-        from engine.discovery_backtest import get_adaptive_weights
-        adjusted_weights = get_adaptive_weights(source="portfolio", horizon="90d")
-    except Exception:
-        pass
-    if adjusted_weights is None:
-        try:
-            adjusted_weights = get_regime_adjusted_weights(config.WEIGHTS)
-        except Exception:
-            adjusted_weights = dict(config.WEIGHTS)
+    adjusted_weights = _get_scoring_weights(source="portfolio", horizon="90d")
 
     # Weighted aggregate score (4 pillars with regime tilt)
     aggregate_score = (
@@ -143,8 +315,8 @@ def analyse_holding(holding: dict) -> dict:
         from engine.risk_overlay import apply_risk_overlay
         risk_overlay = apply_risk_overlay(fund, ticker)
         aggregate_score -= risk_overlay.parabolic_penalty
-    except Exception:
-        pass
+    except Exception as _ro_e:
+        _logger.debug("[scoring] Risk overlay failed for %s: %s", ticker, _ro_e)
 
     # Asymmetric / binary outcome flag (metadata only — no score impact)
     # Detects stocks where risk profile is binary (big move in either direction),
@@ -175,6 +347,22 @@ def analyse_holding(holding: dict) -> dict:
         action = "SELL"
     else:
         action = "STRONG SELL"
+
+    # F-score hard downgrade (Piotroski 2000): names with very low F-score
+    # and decent coverage are likely accounting-weak — cap at KEEP even if
+    # aggregate is bullish.  Gated by `config.F_SCORE_GATE_ENABLED`.
+    if getattr(config, "F_SCORE_GATE_ENABLED", False):
+        _fs_raw = fund.get("f_score")
+        _fs = safe_float(_fs_raw, default=None)
+        _fs_cov = safe_float(fund.get("f_score_coverage"), default=0.0)
+        if (
+            _fs is not None
+            and _fs_cov >= 6.0 / 9.0
+            and _fs <= 3
+            and action in ("STRONG BUY", "BUY")
+        ):
+            _logger.info("F-score gate: %s F=%s cov=%.2f — action capped at KEEP", ticker, _fs, _fs_cov)
+            action = "KEEP"
 
     # Build the "Why?" summary
     all_reasons = tech["reasons"] + fund["reasons"] + sent["reasons"] + forecast_reasons
@@ -247,12 +435,30 @@ def analyse_holding(holding: dict) -> dict:
         "profit_margin": fund.get("profit_margin"),
         "roe": fund.get("roe"),
         "fcf_yield": fund.get("fcf_yield"),
+        "quality_score_fundamental": fund.get("quality_score_fundamental", 0.0),
+        "gross_profitability": fund.get("gross_profitability"),
+        # Enterprise-grade factor bundle (roadmap items #1, #2)
+        "enterprise_value": fund.get("enterprise_value"),
+        "ev_ebit": fund.get("ev_ebit"),
+        "ev_ebitda": fund.get("ev_ebitda"),
+        "ebit_yield": fund.get("ebit_yield"),
+        "ev_ebit_score": fund.get("ev_ebit_score"),
+        "gpa": fund.get("gpa"),
+        "gpa_score": fund.get("gpa_score"),
+        "f_score": fund.get("f_score"),
+        "f_score_gate": fund.get("f_score_gate", False),
+        "f_score_score": fund.get("f_score_score"),
+        "f_score_coverage": fund.get("f_score_coverage", 0.0),
+        "fcf_to_assets": fund.get("fcf_to_assets"),
+        "earnings_stability": fund.get("earnings_stability"),
+        "eps_growth_variance_5y": fund.get("eps_growth_variance_5y"),
         "news_headlines": sent.get("headlines", []),
         "reddit_headlines": sent.get("reddit_headlines", []),
         "fmp_headlines": sent.get("fmp_headlines", []),
         "news_score": sent.get("news_score"),
         "reddit_score": sent.get("reddit_score"),
         "fmp_news_score": sent.get("fmp_news_score"),
+        "qa_sentiment_score": qa_sentiment_score,
         # FMP fundamental enhancements
         "fmp_available": fund.get("fmp_available", False),
         "earnings_beat_rate": fund.get("earnings_beat_rate"),
@@ -284,6 +490,12 @@ def analyse_holding(holding: dict) -> dict:
         "net_debt_ebitda": fund.get("net_debt_ebitda"),
         "cash_to_debt": fund.get("cash_to_debt"),
         "balance_sheet_grade": fund.get("balance_sheet_grade"),
+        # Distress / quality-of-earnings gates (Altman 1968; Sloan 1996; CGS 2008)
+        "altman_z": fund.get("altman_z"),
+        "altman_zone": fund.get("altman_zone"),
+        "altman_coverage": fund.get("altman_coverage", 0.0),
+        "accruals_factor_score": fund.get("accruals_factor_score"),
+        "investment_factor_score": fund.get("investment_factor_score"),
         # Governance red flag
         "governance_flag": fund.get("governance_flag", False),
         "governance_reasons": fund.get("governance_reasons", []),
@@ -295,6 +507,12 @@ def analyse_holding(holding: dict) -> dict:
         "entry_method": None,
         "sizing_method": None,
         "kelly_cap_fraction": None,
+        # Diagnostic metadata (for pipeline observability)
+        "_scoring_time_s": round(time.time() - _hold_start, 2),
+        "_component_timings": {k: round(v, 2) for k, v in _component_timings.items()},
+        "_component_errors": _component_errors if _component_errors else None,
+        # Raw earnings data passthrough for PEAD factor
+        "_earnings_surprises": fund.get("_earnings_surprises"),
     }
     result.update(forecast_data)
     return result

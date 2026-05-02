@@ -16,9 +16,12 @@ Usage:
 import argparse
 import json
 import logging
+import os
+import socket
 import sys
 import threading
 import time
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -63,6 +66,152 @@ def _setup_logging(dry_run: bool = False) -> None:
 logger = logging.getLogger("orchestrator")
 
 
+def _paper_trading_enabled_for_run(dry_run: bool) -> bool:
+    """Return True when this run may write to the paper-trading ledger."""
+    if not getattr(config, "PAPER_TRADING_ENABLED", False):
+        return False
+    return (not dry_run) or bool(getattr(config, "PAPER_TRADING_LOG_DRY_RUN", False))
+
+
+# ---------------------------------------------------------------------------
+# Single-instance lock
+# ---------------------------------------------------------------------------
+
+@dataclass
+class OrchestratorRunLock:
+    """Exclusive lock file for a single orchestrator process."""
+    path: Path
+    token: str
+    metadata: dict
+    reclaimed: dict | None = None
+    released: bool = False
+
+    def release(self) -> None:
+        """Release the lock if we still own it."""
+        if self.released:
+            return
+        try:
+            current = _read_lock_metadata(self.path)
+            if current and current.get("token") not in (None, self.token):
+                logger.warning(
+                    "Lock ownership changed while running; leaving %s in place.",
+                    self.path,
+                )
+                return
+            self.path.unlink(missing_ok=True)
+        except OSError as e:
+            logger.warning("Failed to release orchestrator lock %s: %s", self.path, e)
+        finally:
+            self.released = True
+
+
+class OrchestratorAlreadyRunning(RuntimeError):
+    """Raised when another orchestrator invocation is already active."""
+
+    def __init__(self, metadata: dict | None = None):
+        super().__init__("another orchestrator run is already active")
+        self.metadata = metadata or {}
+
+
+def _read_lock_metadata(path: Path) -> dict | None:
+    """Best-effort JSON loader for the lock file."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else None
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _lock_age_seconds(path: Path, metadata: dict | None) -> float:
+    """Estimate how old the lock is, preferring its started_at timestamp."""
+    if metadata:
+        started_at = metadata.get("started_at")
+        if started_at:
+            try:
+                started = datetime.fromisoformat(str(started_at))
+                return max((datetime.now() - started).total_seconds(), 0.0)
+            except ValueError:
+                pass
+    try:
+        return max(time.time() - path.stat().st_mtime, 0.0)
+    except OSError:
+        return 0.0
+
+
+def _is_lock_stale(path: Path, metadata: dict | None, stale_seconds: int) -> bool:
+    """Return True when the existing lock is old enough to reclaim safely."""
+    return _lock_age_seconds(path, metadata) >= max(int(stale_seconds), 1)
+
+
+def _acquire_orchestrator_lock(
+    *,
+    dry_run: bool,
+    force_discovery: bool,
+    portfolio_only: bool,
+    path: Path | None = None,
+    stale_seconds: int | None = None,
+) -> OrchestratorRunLock:
+    """Acquire the single-instance orchestrator lock or raise if busy."""
+    lock_path = path or (ROOT / getattr(config, "ORCHESTRATOR_LOCK_FILE", "feature_cache/orchestrator.lock"))
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if stale_seconds is None:
+        max_runtime = int(getattr(config, "ORCHESTRATOR_MAX_RUNTIME", 3600))
+        stale_seconds = int(
+            getattr(config, "ORCHESTRATOR_LOCK_STALE_SECONDS", max_runtime + 1800)
+        )
+
+    token = f"{os.getpid()}-{time.time_ns()}"
+    metadata = {
+        "pid": os.getpid(),
+        "token": token,
+        "started_at": datetime.now().isoformat(timespec="seconds"),
+        "hostname": socket.gethostname(),
+        "cwd": str(ROOT),
+        "argv": list(sys.argv),
+        "dry_run": bool(dry_run),
+        "force_discovery": bool(force_discovery),
+        "portfolio_only": bool(portfolio_only),
+    }
+    reclaimed: dict | None = None
+
+    while True:
+        try:
+            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(metadata, f, default=str)
+                f.flush()
+                os.fsync(f.fileno())
+            return OrchestratorRunLock(
+                path=lock_path,
+                token=token,
+                metadata=metadata,
+                reclaimed=reclaimed,
+            )
+        except FileExistsError:
+            existing = _read_lock_metadata(lock_path)
+            if not _is_lock_stale(lock_path, existing, stale_seconds):
+                raise OrchestratorAlreadyRunning(existing)
+
+            logger.warning(
+                "Stale orchestrator lock detected at %s (age %.0fs >= %ss); reclaiming.",
+                lock_path,
+                _lock_age_seconds(lock_path, existing),
+                stale_seconds,
+            )
+            try:
+                lock_path.unlink()
+                reclaimed = existing
+            except FileNotFoundError:
+                continue
+            except OSError as e:
+                raise OrchestratorAlreadyRunning({
+                    "path": str(lock_path),
+                    "error": f"stale_lock_reclaim_failed: {e}",
+                }) from e
+
+
 # ---------------------------------------------------------------------------
 # Decision log — append-only JSONL file
 # ---------------------------------------------------------------------------
@@ -90,10 +239,12 @@ def _run_with_timeout(func, args=(), timeout_seconds: int = 300):
     """Run func(*args) with a timeout.  Raises TimeoutError on expiry.
 
     Uses threading.Thread.join(timeout) because Windows lacks signal.SIGALRM.
-    Note: the thread is not forcefully killed — it will finish naturally.
+    Logs a heartbeat every 60s while waiting so operators can see the process
+    is alive even when the inner function is silent.
     """
     result_box = [None]
     error_box = [None]
+    _start = time.time()
 
     def _target():
         try:
@@ -103,9 +254,29 @@ def _run_with_timeout(func, args=(), timeout_seconds: int = 300):
 
     thread = threading.Thread(target=_target, daemon=True)
     thread.start()
-    thread.join(timeout=timeout_seconds)
+
+    # Poll with heartbeat instead of blocking join — gives visibility
+    _HEARTBEAT_INTERVAL = 60  # seconds
+    remaining = timeout_seconds
+    while remaining > 0 and thread.is_alive():
+        wait = min(_HEARTBEAT_INTERVAL, remaining)
+        thread.join(timeout=wait)
+        remaining -= wait
+        if thread.is_alive() and remaining > 0:
+            elapsed = time.time() - _start
+            logger.info("[heartbeat] %s running for %.0fs (timeout in %.0fs)",
+                        func.__name__, elapsed, remaining)
 
     if thread.is_alive():
+        elapsed = time.time() - _start
+        logger.error("[timeout] %s exceeded %ds timeout (ran %.0fs). "
+                     "Thread is orphaned — it will finish naturally but results are discarded.",
+                     func.__name__, timeout_seconds, elapsed)
+        _log_decision("timeout", {
+            "function": func.__name__,
+            "timeout_s": timeout_seconds,
+            "elapsed_s": round(elapsed, 1),
+        })
         raise TimeoutError(f"{func.__name__} exceeded {timeout_seconds}s timeout")
     if error_box[0]:
         raise error_box[0]
@@ -140,6 +311,99 @@ def _run_discovery_pipeline(holdings: list[dict], risk_data: dict):
     """Run the global discovery engine. Returns DiscoveryResult."""
     from engine.discovery import run_discovery
     return run_discovery(holdings, risk_data)
+
+
+def _reconstitute_dynamic_universe() -> dict | None:
+    """Refresh the dynamic universe supplement before discovery.
+
+    Pulls fresh ETF-holdings candidates through the validation gates so that
+    new entrants are admitted only if they pass liquidity/mcap floors. Stale
+    tickers are pruned after N consecutive misses. Failures are non-fatal —
+    discovery will fall back to the existing supplement and direct ETF inject.
+    """
+    try:
+        from utils.global_universe import (
+            decompose_etf_holdings,
+            reconstitute_universe,
+        )
+    except Exception as e:
+        logger.debug("Universe reconstitution modules unavailable: %s", e)
+    return None
+
+
+def _dynamic_universe_cache_fresh() -> bool:
+    """Return True when dynamic universe validation was refreshed recently."""
+    try:
+        ttl_hours = float(getattr(config, "DISCOVERY_RECONSTITUTE_TTL_HOURS", 24))
+        if ttl_hours <= 0:
+            return False
+        path = ROOT / "feature_cache" / "universe_dynamic.json"
+        if not path.exists():
+            return False
+        import json
+        from datetime import datetime
+
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        refreshed_at = payload.get("refreshed_at")
+        if not refreshed_at:
+            return False
+        refreshed = datetime.fromisoformat(refreshed_at)
+        age_hours = (datetime.now() - refreshed).total_seconds() / 3600.0
+        if age_hours < ttl_hours:
+            logger.info(
+                "Dynamic universe reconstitution skipped: cache fresh %.1fh < %.1fh",
+                age_hours,
+                ttl_hours,
+            )
+            return True
+    except Exception as exc:
+        logger.debug("Dynamic universe freshness check failed: %s", exc)
+    return False
+
+    extras: list[str] = []
+    if getattr(config, "DISCOVERY_USE_ETF_DECOMPOSITION", True):
+        try:
+            extras = decompose_etf_holdings() or []
+        except Exception as e:
+            logger.warning("ETF decomposition failed pre-reconstitution: %s", e)
+            extras = []
+
+    # Benchmark-driven entrants (S&P 500, FTSE 100/250, CAC, DAX, IBEX, ...).
+    # Cached 30d; per-benchmark isolation means one failed scrape does not
+    # block the others. Graduating through reconstitute_universe() means
+    # each constituent still has to clear the liquidity/mcap floors.
+    if getattr(config, "DISCOVERY_USE_BENCHMARK_REBUILD", True):
+        try:
+            from utils.benchmark_constituents import get_benchmark_tickers
+            ttl_days = int(getattr(config, "DISCOVERY_BENCHMARK_TTL_DAYS", 30))
+            bench = get_benchmark_tickers(ttl_days=ttl_days) or []
+            before = len(extras)
+            seen = set(extras)
+            for t in bench:
+                if t not in seen:
+                    extras.append(t)
+                    seen.add(t)
+            logger.info(
+                "Benchmark constituents: %d unique tickers, %d net-new",
+                len(bench),
+                len(extras) - before,
+            )
+        except Exception as e:
+            logger.warning("Benchmark constituents fetch failed: %s", e)
+
+    try:
+        summary = reconstitute_universe(extra_tickers=extras)
+        logger.info(
+            "Dynamic universe reconstituted: %d validated, %d pruned "
+            "(ETF extras fed in: %d)",
+            summary.get("validated", 0),
+            summary.get("pruned", 0),
+            len(extras),
+        )
+        return summary
+    except Exception as e:
+        logger.warning("reconstitute_universe() failed: %s", e)
+        return None
 
 
 def save_discovery_results(disc_result, state: dict) -> int:
@@ -221,6 +485,7 @@ def save_discovery_results(disc_result, state: dict) -> int:
             "kelly_cap_fraction": getattr(c, "kelly_cap_fraction", None),
             "support_levels": getattr(c, "support_levels", {}),
             "regime_info": getattr(c, "regime_info", {}),
+            "regime": getattr(c, "regime", None),
             # Dividend safety
             "dividend_yield": getattr(c, "dividend_yield", None),
             "payout_ratio": getattr(c, "payout_ratio", None),
@@ -238,6 +503,40 @@ def save_discovery_results(disc_result, state: dict) -> int:
             # Asymmetric / binary outcome flag
             "asymmetric_risk_flag": getattr(c, "asymmetric_risk_flag", False),
             "asymmetric_risk_reason": getattr(c, "asymmetric_risk_reason", None),
+            # Enterprise factor bundle (roadmap items #1, #2)
+            "enterprise_value": getattr(c, "enterprise_value", None),
+            "ev_ebit": getattr(c, "ev_ebit", None),
+            "ev_ebitda": getattr(c, "ev_ebitda", None),
+            "ebit_yield": getattr(c, "ebit_yield", None),
+            "ev_ebit_score": getattr(c, "ev_ebit_score", None),
+            "gpa": getattr(c, "gpa", None),
+            "gpa_score": getattr(c, "gpa_score", None),
+            "f_score": getattr(c, "f_score", None),
+            "f_score_gate": getattr(c, "f_score_gate", False),
+            "f_score_score": getattr(c, "f_score_score", None),
+            "f_score_coverage": getattr(c, "f_score_coverage", 0.0),
+            # Day-1 quality / self-learning diagnostics
+            "institutional_prior_score": getattr(c, "institutional_prior_score", None),
+            "institutional_prior_percentile": getattr(c, "institutional_prior_percentile", None),
+            "institutional_prior_confidence": getattr(c, "institutional_prior_confidence", None),
+            "institutional_prior_rank": getattr(c, "institutional_prior_rank", None),
+            "strong_buy_eligible": getattr(c, "strong_buy_eligible", None),
+            "ready_contract_status": getattr(c, "ready_contract_status", None),
+            "ready_contract_reasons": getattr(c, "ready_contract_reasons", None),
+            "meta_label_proba": getattr(c, "meta_success_prob", None),
+            "ml_alpha_raw": getattr(c, "ml_alpha_raw", None),
+            "ml_shadow_score": getattr(c, "ml_shadow_score", None),
+            "sleeve_composite": getattr(c, "sleeve_composite", None),
+            "sleeve_momentum": getattr(c, "sleeve_momentum", None),
+            "sleeve_quality": getattr(c, "sleeve_quality", None),
+            "sleeve_value": getattr(c, "sleeve_value", None),
+            "sleeve_low_risk": getattr(c, "sleeve_low_risk", None),
+            "sleeve_pead": getattr(c, "sleeve_pead", None),
+            "sleeve_ready": getattr(c, "sleeve_ready", None),
+            # Split rank components (roadmap item #5)
+            "selection_rank": getattr(c, "selection_rank", None),
+            "timing_rank": getattr(c, "timing_rank", None),
+            "portfolio_fit_rank": getattr(c, "portfolio_fit_rank", None),
             "final_rank": c.final_rank,
         }
         for c in disc_result.candidates
@@ -429,7 +728,7 @@ def run_orchestrator(
     })
 
     # --- Paper trading: resolve yesterday's pending signals (T+1 fills) ---
-    if getattr(config, "PAPER_TRADING_ENABLED", False):
+    if _paper_trading_enabled_for_run(dry_run):
         try:
             _init_paper_db()
             n_resolved = resolve_pending_signals()
@@ -437,6 +736,8 @@ def run_orchestrator(
                 logger.info("Paper trading: resolved %d pending signals.", n_resolved)
         except Exception as e:
             logger.warning("Paper trading fill resolution failed: %s", e)
+    elif dry_run and getattr(config, "PAPER_TRADING_ENABLED", False):
+        logger.info("[DRY RUN] Paper trading ledger writes skipped.")
 
     # --- Discovery backtest: evaluate picks that are 90+ days old ---
     try:
@@ -449,6 +750,47 @@ def run_orchestrator(
     # --- Load state and portfolio ---
     state = load_state()
     prune_expired_cooldowns(state)
+
+    if getattr(config, "ML_DRIFT_MONITOR_ENABLED", True):
+        try:
+            from utils.drift_monitor import get_drift_status
+
+            drift = get_drift_status(write=True)
+            drift_payload = dict(drift.__dict__)
+            previous = state.get("drift_status") or {}
+            consecutive = int(previous.get("consecutive_alerts", 0) or 0)
+            if drift.drift_detected:
+                consecutive += 1
+            else:
+                consecutive = 0
+            drift_payload["consecutive_alerts"] = consecutive
+            state["drift_status"] = drift_payload
+            summary["drift_status"] = drift_payload
+            if drift.drift_detected:
+                _log_decision("drift_alert", drift_payload)
+                logger.warning("Drift monitor alert: %s", drift_payload)
+            if consecutive >= 2:
+                runtime_overrides = state.setdefault("runtime_overrides", {})
+                runtime_overrides["ML_RANKER_MODE"] = "shadow"
+                runtime_overrides["ML_RANKER_SHADOW_ONLY"] = True
+                runtime_overrides["percentile_action_tightening"] = 0.5
+                _log_decision("drift_debounce_confirmed", drift_payload)
+                logger.warning("Drift confirmed on consecutive runs; ML override set to shadow.")
+
+            # Threshold-learner hook: persist drift-active flag so the next
+            # discovery run picks the conservative profile (Russo & Van Roy
+            # 2014 — Thompson sampling with safety-first override).
+            if getattr(config, "THRESHOLD_LEARNER_ENABLED", True):
+                try:
+                    from engine.threshold_learner import load_state as _load_tl_state
+                    from engine.threshold_learner import save_state as _save_tl_state
+                    tl_state = _load_tl_state()
+                    tl_state.drift_active = bool(consecutive >= 2)
+                    _save_tl_state(tl_state)
+                except Exception as exc:
+                    logger.debug("Threshold-learner drift sync failed: %s", exc)
+        except Exception as e:
+            logger.warning("Drift monitor failed: %s", e)
 
     try:
         holdings = load_portfolio()
@@ -614,7 +956,7 @@ def run_orchestrator(
         })
 
     # --- Paper trading: log SELL signals ---
-    if getattr(config, "PAPER_TRADING_ENABLED", False):
+    if _paper_trading_enabled_for_run(dry_run):
         for a in alerts:
             try:
                 _log_paper_signal(
@@ -635,6 +977,14 @@ def run_orchestrator(
     if not portfolio_only:
         run_disc = should_run_discovery(state) or force_discovery
         if run_disc:
+            # Refresh the dynamic universe supplement before assembly so
+            # ETF-graduated tickers pass liquidity/mcap validation (rather
+            # than being injected directly with thin metadata).
+            if getattr(config, "DISCOVERY_RECONSTITUTE_UNIVERSE_ENABLED", True):
+                if not _dynamic_universe_cache_fresh():
+                    _reconstitute_dynamic_universe()
+            else:
+                logger.info("Dynamic universe reconstitution skipped by config")
             logger.info("Running Global Discovery Engine v4 (multi-lens, 240 deep-scored, may take 30-60 min)...")
             timeout = getattr(config, "DISCOVERY_TIMEOUT", 900)
             try:
@@ -669,22 +1019,34 @@ def run_orchestrator(
                 logger.warning("Discovery timed out after %ds. Using cached results.", timeout)
                 _log_decision("discovery_timeout", {"timeout_s": timeout})
             except Exception as e:
-                logger.warning("Discovery failed: %s. Using cached results.", e)
-                _log_decision("discovery_error", {"error": str(e)})
+                import traceback
+                tb = traceback.format_exc()
+                logger.error("Discovery failed: %s\n%s", e, tb)
+                _log_decision("discovery_error", {
+                    "error_type": type(e).__name__,
+                    "error": str(e),
+                    "traceback": tb[-2000:],
+                })
         else:
             logger.info("Discovery not scheduled (last run: %s). Using cached results.",
                         state.get("last_discovery_run", "never"))
 
+    _skip_post_discovery = False
     try:
         _check_timeout("post_discovery")
     except TimeoutError:
-        logger.warning("Timeout after discovery — saving state with results so far.")
+        logger.warning("Timeout after discovery — saving state with results so far. "
+                       "Skipping swap evaluation; will proceed to email/summary.")
         save_state(state)
-        raise
+        _skip_post_discovery = True
 
     # --- Step 5: Evaluate swap opportunities ---
-    cached = get_cached_discovery(state) if not portfolio_only else []
-    swap_recs = _evaluate_swaps(results, cached, state)
+    if _skip_post_discovery:
+        swap_recs = []
+        logger.info("Skipping swap evaluation due to timeout.")
+    else:
+        cached = get_cached_discovery(state) if not portfolio_only else []
+        swap_recs = _evaluate_swaps(results, cached, state)
     summary["swap_recs"] = [
         {"candidate": s["candidate"]["ticker"], "delta": s["score_delta"]}
         for s in swap_recs
@@ -700,7 +1062,7 @@ def run_orchestrator(
                         s["score_delta"])
 
         # --- Paper trading: log both legs of each swap ---
-        if getattr(config, "PAPER_TRADING_ENABLED", False):
+        if _paper_trading_enabled_for_run(dry_run):
             for s in swap_recs:
                 cand = s["candidate"]
                 # SELL leg — the weak holding being swapped out
@@ -752,6 +1114,14 @@ def run_orchestrator(
             optimizer_alloc=portfolio_alloc,
             discovery_candidates=get_cached_discovery(state),
             exit_signals=summary.get("exit_signals"),
+            discovery_meta=state.get("cached_discovery_meta"),
+            artifact_timestamps={
+                "portfolio": (state.get("cached_portfolio") or {}).get("timestamp") or state.get("last_portfolio_run"),
+                "discovery": state.get("last_discovery_run"),
+                "optimizer": (state.get("cached_optimizer") or {}).get("timestamp"),
+                "exit": ((state.get("cached_exit_signals") or {}).get("timestamp")),
+            },
+            discovery_ran=discovery_ran,
         )
 
         success = send_email(subject, html, dry_run=dry_run)
@@ -849,6 +1219,24 @@ def run_orchestrator(
         # portfolio cache are persisted even if artifact caching partially fails
         save_state(state)
 
+    # Self-monitoring: analyze recent telemetry and emit recommendations.
+    # Reads the decision log just written above; never mutates config.
+    if getattr(config, "AUTO_TUNE_ENABLED", True):
+        try:
+            from engine import auto_tune
+            report = auto_tune.run(
+                window_days=int(getattr(config, "AUTO_TUNE_WINDOW_DAYS", 30)),
+            )
+            summary_line = auto_tune.summarize(report)
+            logger.info(summary_line)
+            _log_decision("auto_tune_done", {
+                "n_recommendations": len(report.recommendations),
+                "params": [r.param for r in report.recommendations],
+                "summary": summary_line,
+            })
+        except Exception as e:
+            logger.warning("auto_tune run failed: %s", e)
+
     elapsed = round(time.time() - start, 1)
     _log_decision("run_complete", {"elapsed_s": elapsed, "summary": summary})
     logger.info("Orchestrator finished in %.1fs", elapsed)
@@ -889,11 +1277,56 @@ def main():
     if args.dry_run:
         logger.info("=== DRY RUN MODE — no emails will be sent ===")
 
-    summary = run_orchestrator(
-        dry_run=args.dry_run,
-        force_discovery=args.force_discovery,
-        portfolio_only=args.portfolio_only,
-    )
+    lock = None
+    try:
+        lock = _acquire_orchestrator_lock(
+            dry_run=args.dry_run,
+            force_discovery=args.force_discovery,
+            portfolio_only=args.portfolio_only,
+        )
+        if lock.reclaimed:
+            _log_decision("lock_reclaimed", {
+                "path": str(lock.path),
+                "previous": lock.reclaimed,
+            })
+        logger.info("Acquired orchestrator lock: %s", lock.path)
+
+        summary = run_orchestrator(
+            dry_run=args.dry_run,
+            force_discovery=args.force_discovery,
+            portfolio_only=args.portfolio_only,
+        )
+    except OrchestratorAlreadyRunning as e:
+        md = e.metadata or {}
+        logger.warning(
+            "Another orchestrator run is already active (pid=%s, started=%s, host=%s). Exiting without running.",
+            md.get("pid", "unknown"),
+            md.get("started_at", "unknown"),
+            md.get("hostname", "unknown"),
+        )
+        _log_decision("run_skipped_lock", {
+            "active_run": md,
+            "argv": list(sys.argv),
+        })
+        sys.exit(0)
+    except KeyboardInterrupt:
+        logger.warning("Orchestrator interrupted by user (SIGINT/Ctrl+C)")
+        _log_decision("interrupted", {"reason": "KeyboardInterrupt"})
+        sys.exit(130)
+    except Exception as e:
+        # Catch-all: no pipeline run should ever crash silently
+        import traceback
+        tb = traceback.format_exc()
+        logger.critical("FATAL: Orchestrator crashed with unhandled exception:\n%s", tb)
+        _log_decision("fatal_crash", {
+            "error_type": type(e).__name__,
+            "error": str(e),
+            "traceback": tb[-2000:],  # Last 2000 chars of traceback
+        })
+        sys.exit(2)
+    finally:
+        if lock is not None:
+            lock.release()
 
     # Exit code: 0 = success, 1 = error
     sys.exit(0 if summary.get("error") is None else 1)

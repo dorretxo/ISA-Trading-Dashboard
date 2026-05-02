@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 PROJECTION_HORIZON = 63          # Trading days (~90 calendar days)
-N_SIMULATIONS = 5000             # Monte Carlo paths
+N_SIMULATIONS = 20000            # Monte Carlo paths (antithetic pairing halves effective cost)
 CONFIDENCE_LEVELS = (0.10, 0.25, 0.50, 0.75, 0.90)  # Percentile bands
 
 # Drift blending: how much to trust MoE vs pure historical
@@ -174,8 +174,16 @@ def _simulate_portfolio(
     corr_matrix: np.ndarray,
     horizon: int = PROJECTION_HORIZON,
     n_sims: int = N_SIMULATIONS,
+    seed: int | None = None,
+    antithetic: bool = True,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Run correlated Geometric Brownian Motion Monte Carlo.
+
+    Variance reduction: antithetic sampling pairs each draw Z with -Z,
+    halving the Monte-Carlo standard error for the same compute cost
+    (Glasserman 2003 §4.2).  ``seed=None`` (default) gives fresh
+    stochastic draws on every call — pass a fixed integer when
+    reproducibility is required (e.g., for UI snapshots).
 
     Returns:
         ticker_terminal: (n_sims, n_tickers) — terminal prices per sim
@@ -189,9 +197,17 @@ def _simulate_portfolio(
     daily_drifts = np.array([(d - 0.5 * v**2) * dt for d, v in zip(drifts, vols)])
     daily_vols = np.array([v * math.sqrt(dt) for v in vols])
 
-    # Generate correlated random shocks
-    rng = np.random.default_rng(seed=42)
-    Z = rng.standard_normal((n_sims, horizon, n))
+    # Generate correlated random shocks (antithetic pairs: Z and -Z)
+    rng = np.random.default_rng(seed=seed)
+    if antithetic and n_sims >= 2:
+        half = n_sims // 2
+        Z_half = rng.standard_normal((half, horizon, n))
+        Z = np.concatenate([Z_half, -Z_half], axis=0)
+        if Z.shape[0] < n_sims:
+            extra = rng.standard_normal((n_sims - Z.shape[0], horizon, n))
+            Z = np.concatenate([Z, extra], axis=0)
+    else:
+        Z = rng.standard_normal((n_sims, horizon, n))
     correlated_Z = Z @ L.T  # Apply Cholesky to correlate
 
     # Simulate GBM paths

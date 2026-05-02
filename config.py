@@ -45,6 +45,19 @@ SCORE_BUY_THRESHOLD = 0.20         # Above this = BUY (top quartile)
 SCORE_KEEP_THRESHOLD = -0.25       # Above this = KEEP
 SCORE_SELL_THRESHOLD = -0.50       # Above this = SELL, below = STRONG SELL
 
+# Discovery action labels. Percentile mode turns the day's best risk-screened
+# names into BUY/STRONG BUY candidates while absolute floors prevent weak days
+# from being promoted.
+USE_PERCENTILE_ACTIONS = True
+PERCENTILE_STRONG_BUY_PCT = 0.05
+PERCENTILE_BUY_PCT = 0.15
+PERCENTILE_NEUTRAL_PCT = 0.50
+PERCENTILE_BEAR_STRONG_BUY_PCT = 0.03
+PERCENTILE_BEAR_BUY_PCT = 0.10
+PERCENTILE_STRONG_BUY_MIN_AGG = 0.0
+PERCENTILE_BUY_MIN_AGG = -0.05
+PERCENTILE_STRONG_BUY_MIN_PRIOR_PCT = 0.85
+
 # Data settings
 PRICE_HISTORY_DAYS = 730  # 2 years of history for technicals + backtest training
 NEWS_HEADLINE_COUNT = 5
@@ -78,6 +91,206 @@ REGIME_TILT_PCT = 0.05               # ±5% weight tilt per regime
 # Position sizing — inverse-volatility weighting
 MAX_POSITION_WEIGHT = 0.25           # 25% max per position
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# Portfolio optimiser — multi-method ensemble
+# Markowitz 1952; Jorion 1986 (James-Stein); Jagannathan & Ma 2003 (MinVar);
+# Maillard-Roncalli-Teïletche 2010 (Risk Parity); Black & Litterman 1992;
+# He & Litterman 1999; López de Prado 2016 (HRP); Gerber et al. 2022;
+# Longin & Solnik 2001 (bear-regime correlation inflation).
+# ═══════════════════════════════════════════════════════════════════════════════
+OPTIMIZER_MU_V2 = True                            # Use calibrated μ with James-Stein shrinkage
+OPTIMIZER_MU_WEIGHTS = (0.70, 0.30)               # (w_moe, w_score) blend for μ
+OPTIMIZER_MU_SHRINKAGE_MAX = 0.40                 # Cap on James-Stein α
+OPTIMIZER_COV_METHOD = "blend"                    # "lw_ewma" | "gerber" | "blend"
+OPTIMIZER_BEAR_CORR_INFLATE = 0.20                # Off-diagonal corr inflate in BEAR regime
+OPTIMIZER_ENSEMBLE_METHODS = [
+    "mean_variance", "min_variance", "risk_parity", "black_litterman", "hrp",
+]
+OPTIMIZER_ENSEMBLE_TEMPERATURE = 0.5              # Softmax τ for history-weighted combiner
+OPTIMIZER_METHOD_WEIGHT_MIN = 0.05                # Floor per method in the ensemble
+OPTIMIZER_METHOD_WEIGHT_MAX = 0.50                # Cap per method in the ensemble
+OPTIMIZER_BL_TAU = 0.05                           # Black-Litterman prior scaling
+
+# --- Enterprise factor bundle (roadmap items #1-#10) -----------------------
+ENTERPRISE_FACTORS_ENABLED = True                  # Master toggle
+EV_EBIT_YIELD_ANCHOR = 0.10                        # 10% EBIT/EV is median
+F_SCORE_GATE_ENABLED = True                       # Hard gate on F-score ≥ 6
+F_SCORE_GATE_MIN = 6                               # Piotroski 2000 original cut
+FACTOR_SECTOR_NEUTRAL = True                       # Apply sector-neutral z-scoring
+FACTOR_WINSOR_SIGMA = 3.0                          # ±3σ winsorisation
+FACTOR_JS_SHRINKAGE_MAX = 0.40                     # James-Stein max shrinkage
+REGIME_FACTOR_TILT_ENABLED = True                  # Apply BULL/NEUTRAL/BEAR tilts
+ORTHOGONALISE_SENTIMENT = True                     # Residualise sentiment vs factors
+PIT_FUNDAMENTAL_LAG_DAYS = 45                      # SEC 10-Q reporting lag
+RESIDUAL_MOMENTUM_TARGET_VOL = 0.12                # Barroso-Santa-Clara target
+
+# Discovery gates v2.  Broad gate decisions are shadowed until the diagnostics
+# table has enough matured signals to calibrate thresholds.  The narrow trap
+# safeguard is active because it only blocks commodity-cycle chase setups.
+DISCOVERY_GATES_V2_ENABLED = False
+DISCOVERY_GATES_V2_SHADOW = True
+DISCOVERY_GATES_V2_F_SCORE_MIN = 5
+DISCOVERY_GATES_V2_F_SCORE_MIN_COVERAGE = 6 / 9
+DISCOVERY_GATES_V2_GPA_MIN = 0.15
+DISCOVERY_GATES_V2_MAX_STRETCH = 0.50
+DISCOVERY_GATES_V2_REJECT_RANK_MULTIPLIER = 0.20
+DISCOVERY_TRAP_SAFEGUARD_ENABLED = True
+DISCOVERY_TRAP_SAFEGUARD_MIN_STRETCH = 0.50
+DISCOVERY_TRAP_SAFEGUARD_F_SCORE_MAX = 3
+DISCOVERY_TRAP_SAFEGUARD_F_SCORE_MIN_COVERAGE = 6 / 9
+DISCOVERY_TRAP_SAFEGUARD_GPA_MAX = 0.15
+DISCOVERY_TRAP_SAFEGUARD_RANK_MULTIPLIER = 0.25
+
+# Institutional-prior cold start.  These are literature-backed priors used
+# before the local paper-trading sample is large enough to trust as a primary
+# selector.  Local learning may only blend toward these values, not replace them.
+INSTITUTIONAL_PRIOR_ENABLED = True
+INSTITUTIONAL_PRIOR_ALPHA_WEIGHT = 0.0
+INSTITUTIONAL_PRIOR_RANK_WEIGHT = 0.15
+INSTITUTIONAL_PRIOR_MAX_TOTAL_WEIGHT = 0.20
+INSTITUTIONAL_PRIOR_STRONG_BUY_PERCENTILE = 0.90
+INSTITUTIONAL_PRIOR_MIN_CONFIDENCE = 0.55
+INSTITUTIONAL_PRIOR_MIN_COVERAGE = 0.45
+INSTITUTIONAL_PRIOR_DYNAMIC_COMPONENTS = True
+INSTITUTIONAL_PRIOR_DYNAMIC_BLEND = 0.50
+INSTITUTIONAL_PRIOR_SECTOR_COMPONENT_MIN_N = 8
+INSTITUTIONAL_PRIOR_TURNOVER_COST_ENABLED = True
+
+# Signal-backtest evaluation. The batched path downloads each ticker window
+# once and slices all matured signal horizons locally, avoiding thousands of
+# per-signal yfinance calls.
+SIGNAL_BACKTEST_BATCHED_EVALUATOR_ENABLED = True
+SIGNAL_BACKTEST_BATCH_SIZE = 75
+SIGNAL_BACKTEST_BATCH_HORIZONS = [5, 10, 30, 60, 90]
+
+# PIT warm-start and self-learning data pipeline.
+PIT_BACKFILL_DEFAULT_QUARTERS = 40                 # 10 years of quarterly statements
+HISTORICAL_PRICE_CACHE_DIR = "feature_cache/price_history"
+PRICE_CACHE_BATCH_SIZE = 75
+HISTORICAL_REPLAY_SOURCE = "replay_pit_v1"
+
+# Trade-aware labels (Lopez de Prado triple-barrier method). These are used by
+# the learner before enough live 30d returns mature, and are also persisted for
+# diagnostics.
+TRIPLE_BARRIER_HORIZON_DAYS = 30
+TRIPLE_BARRIER_TARGET_ATR_MULT = 2.0
+TRIPLE_BARRIER_STOP_ATR_MULT = 1.0
+
+# ML ranker upgrades: use triple-barrier labels when available, train an
+# optional meta-label classifier for Strong Buy gating, and blend regime-
+# conditioned models only after they have enough samples.
+ML_RANKER_USE_TRIPLE_BARRIER_LABELS = True
+ML_META_LABEL_ENABLED = True
+ML_META_LABEL_MIN_SAMPLES = 300
+META_LABEL_STRONG_BUY_GATE_ENABLED = True
+META_LABEL_STRONG_BUY_MIN_PROB = 0.60
+META_LABEL_RANK_MULTIPLIER_ON_FAIL = 0.90
+ML_REGIME_ENSEMBLE_ENABLED = True
+ML_REGIME_MIN_SAMPLES = 250
+ML_REGIME_BLEND_PCT = 0.35
+
+# Drift monitor: if live realised rank-IC breaks down, keep ML in shadow mode
+# until the model is retrained/reviewed.
+ML_DRIFT_MONITOR_ENABLED = True
+DRIFT_MONITOR_HORIZON_COL = "return_10d"
+DRIFT_MONITOR_MIN_DAYS = 20
+DRIFT_MONITOR_DELTA = 0.002
+DRIFT_MONITOR_THRESHOLD = 0.08
+DRIFT_MONITOR_ALPHA = 0.99
+DRIFT_KS_P_THRESHOLD = 0.01
+DRIFT_KS_MIN_SAMPLE = 30
+DRIFT_KS_COLUMNS = [
+    "quality_factor_score", "value_factor_score", "momentum_factor_score",
+    "bab_factor_score", "sleeve_quality", "sleeve_value",
+    "sleeve_momentum", "sleeve_low_risk", "sleeve_ready",
+]
+
+# Trading-cost objective: expected cost is both stored as an ML feature and
+# deducted from alpha in ranking. This scale is intentionally conservative.
+DISCOVERY_COST_PENALTY_SCALE = 0.15
+
+# Gate-first Strong Buy contract.  A weighted aggregate can create BUY/Watch
+# ideas, but STRONG BUY must also pass quality, gate, and entry-readiness checks.
+DISCOVERY_GATE_FIRST_ENABLED = True
+READY_STRONG_BUY_ALLOW_MISSING_DATA_REVIEW = True
+READY_STRONG_BUY_MIN_RR = 1.50
+READY_STRONG_BUY_MIN_CONFIDENCE = 0.70
+READY_STRONG_BUY_MIN_POSITION_WEIGHT = 0.005
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Action-label hard gates (calibrated against SEB SA / Trustpilot 2026 review).
+# Each gate cites the academic reference behind its threshold.  When a gate
+# cannot be evaluated (missing data) the candidate is NOT blocked — but the
+# coverage flag is recorded so the threshold-learner can debias over time.
+# ═══════════════════════════════════════════════════════════════════════════════
+ACTION_GATES_ENABLED = True            # Master toggle for Tier 1-4 action gates
+ACTION_GATES_SHADOW = False            # When True, log gate failures but don't downgrade
+
+# Tier 1 — distress / quality-of-earnings (Altman 1968; Beneish 1999;
+# Piotroski 2000; Sloan 1996; Cooper-Gulen-Schill 2008).
+ALTMAN_Z_GATE_ENABLED = True
+ALTMAN_Z_STRONG_BUY_MIN = 2.6           # Above grey-zone — safe for STRONG BUY
+ALTMAN_Z_BUY_MIN = 1.81                  # Below this = formal distress zone
+
+BENEISH_M_GATE_ENABLED = True
+BENEISH_M_STRONG_BUY_MAX = -2.22         # Conservative non-manipulator cut
+BENEISH_M_BUY_MAX = -1.78                # Beneish (1999) original threshold
+
+F_SCORE_STRONG_BUY_MIN = 6               # Piotroski recommended long cut (was: only blocked F<=3)
+F_SCORE_BUY_MIN = 5
+F_SCORE_GATE_MIN_COVERAGE = 6 / 9        # Must have computed >=6 of 9 components
+
+ACCRUALS_GATE_ENABLED = True
+ACCRUALS_FACTOR_STRONG_BUY_MIN = -0.60   # accruals_factor_score in [-1,1]; very-negative = high accruals
+ASSET_GROWTH_FACTOR_STRONG_BUY_MIN = -0.60   # investment_factor_score in [-1,1]
+
+NET_DEBT_EBITDA_STRONG_BUY_MAX = 3.0     # Above this = balance-sheet stress
+
+# Tier 2 — value-discipline caps (Greenblatt 2006; Loughran-Wellman 2011;
+# Asness-Liew-Pedersen-Thapar 2020).
+EV_EBIT_GATE_ENABLED = True
+EV_EBIT_STRONG_BUY_MAX = 30.0
+EV_EBIT_BUY_MAX = 50.0
+EV_SALES_STRONG_BUY_MAX = 8.0            # Loss-making/sub-scale ceiling
+EV_SALES_QMJ_OVERRIDE_PCTILE = 0.80      # QMJ percentile that lifts EV/Sales cap
+PE_FORWARD_STRONG_BUY_MAX = 30.0
+PE_FORWARD_GROWTH_OVERRIDE_CAGR = 0.25   # Override P/E cap if 3y EPS CAGR > this
+DEEP_VALUE_SPREAD_PCTILE = 0.80          # Up-weight value when E/P spread > this
+
+# Tier 3 — quality floors (Novy-Marx 2013; Damodaran cost-of-capital;
+# Asness-Frazzini-Pedersen 2019 QMJ; Bartov-Givoly-Hayn 2002).
+GPA_GATE_ENABLED = True
+GPA_PCTILE_STRONG_BUY_MIN = 0.25         # Bottom-quartile gross-profitability blocked
+
+ROIC_WACC_GATE_ENABLED = True
+ROIC_VS_WACC_STRONG_BUY_MIN_BPS = 200    # Need 200 bps spread for STRONG BUY
+
+QMJ_GATE_ENABLED = True
+QMJ_PCTILE_STRONG_BUY_MIN = 0.50         # QMJ below median blocked
+OP_MARGIN_YOY_DELTA_FLOOR_BPS = -150     # Margins compressed > 150 bps demote one label
+
+# Tier 4 — momentum sanity (Wilder 1978; Faber 2007; George-Hwang 2004;
+# Daniel-Moskowitz 2016).
+RSI_STRONG_BUY_MAX = 75                  # RSI above this caps action at BUY
+RSI_NEUTRAL_CAP = 80                     # RSI above this caps action at NEUTRAL
+STRETCH_200DMA_STRONG_BUY_MAX = 0.35     # > +35% above 200-DMA caps at BUY-with-limit
+ENTRY_STANCE_BLOCKS_STRONG_BUY = True    # Honour "Pullback Preferred" as a hard block
+MOMENTUM_VOL_SCALING_ENABLED = True
+
+# Tier 5 — self-learning threshold ensemble (Russo-Van Roy 2014;
+# Helmbold-Schapire-Singer-Warmuth 1998; López de Prado-Bailey 2014).
+THRESHOLD_LEARNER_ENABLED = True
+THRESHOLD_LEARNER_PROFILE = "moderate"   # "conservative" | "moderate" | "aggressive"
+THRESHOLD_LEARNER_STATE_FILE = "feature_cache/threshold_learner_state.json"
+THRESHOLD_PSR_MIN_TO_DEPLOY = 0.95
+SLEEVE_WEIGHTS_LEARNER = "exponentiated_gradient"
+SLEEVE_WEIGHTS_LEARNING_RATE = 0.05
+DRIFT_FORCE_CONSERVATIVE = True          # Drift alert => force conservative profile
+
+# Tier 6 — UI surfacing
+DISCOVERY_DIGEST_HIDE_GATE_FAILURES = True   # Hide STRONG BUYs that fail any Tier-1 gate
+DISCOVERY_LIMIT_PRICE_BUFFER = 0.05          # Limit price = max(200-DMA*1.05, support*1.02)
+
 # Insider / institutional thresholds
 SHORT_INTEREST_HIGH = 0.20  # 20% float short = crowded
 SHORT_INTEREST_LOW = 0.02  # <2% = no short pressure
@@ -89,8 +302,24 @@ MACRO_CORRELATION_MIN = 0.3  # Min |r| to use a macro expert
 MACRO_TICKERS = {
     "vix": "^VIX",
     "bonds_10y": "^TNX",
+    "bonds_2y": "^IRX",       # 2-year proxy (13-week T-bill × ~4 for short end)
     "oil": "CL=F",
 }
+
+# Extended macro tickers for factor timing (Arnott et al. 2019)
+MACRO_TICKERS_EXTENDED = {
+    "bonds_10y": "^TNX",      # 10-year yield
+    "bonds_2y": "^IRX",       # Short-term yield proxy (13-week T-bill)
+    "hy_spread": "HYG",       # High-yield corporate bond ETF (credit spread proxy)
+    "ig_spread": "LQD",       # Investment-grade bond ETF
+    "spy": "SPY",             # S&P 500 for equity risk premium
+}
+
+# Macro regime thresholds for factor timing
+MACRO_TERM_SPREAD_EXPANSION = 1.0     # 10Y-2Y spread > 1.0% = expansion (tilt momentum)
+MACRO_TERM_SPREAD_CONTRACTION = 0.0   # 10Y-2Y spread < 0% = inversion (tilt quality)
+MACRO_CREDIT_SPREAD_TIGHT = 0.02      # HY-IG < 2% = risk-on (tilt momentum)
+MACRO_CREDIT_SPREAD_WIDE = 0.05       # HY-IG > 5% = risk-off (tilt quality + low-vol)
 
 # Insider transaction settings
 INSIDER_LOOKBACK_DAYS = 90  # Consider transactions within last 90 days
@@ -122,6 +351,14 @@ FMP_BASE_URL = "https://financialmodelingprep.com/stable"
 FMP_PLAN = "starter"              # Plan tier for UI display
 FMP_RATE_LIMIT_PER_MIN = 300      # Starter plan: 300 calls/minute
 FMP_CACHE_TTL_QUARTERLY = 86400   # 24h — fundamentals change quarterly
+
+# Hugging Face token used by Stage 6 FinBERT sentiment.
+# Prefer HF_TOKEN; accept older/common aliases so local shells keep working.
+HF_TOKEN = (
+    os.environ.get("HF_TOKEN", "")
+    or os.environ.get("HUGGINGFACEHUB_API_TOKEN", "")
+    or os.environ.get("HUGGING_FACE_HUB_TOKEN", "")
+)
 FMP_CACHE_TTL_DAILY = 3600        # 1h — technicals, news
 FMP_CACHE_TTL_CALENDAR = 43200    # 12h — earnings calendar
 
@@ -129,14 +366,121 @@ FMP_CACHE_TTL_CALENDAR = 43200    # 12h — earnings calendar
 DISCOVERY_EXCHANGES = ["NYSE", "NASDAQ", "AMEX"]  # FMP screener (US only on Starter)
 DISCOVERY_FMP_LIMIT = 1000             # Per-exchange FMP screener limit (was 200)
 DISCOVERY_MIN_MCAP = 50_000_000        # £50M floor (liquidity only, no upper cap)
-DISCOVERY_VOLUME_MIN = 50_000          # Minimum daily volume (liquidity floor)
+DISCOVERY_VOLUME_MIN = 50_000          # Minimum daily volume (legacy raw-share floor; retained for FMP screener input)
+# Region-aware average dollar-volume floors (USD-equivalent) used at the
+# momentum prescreen. Replaces the raw share-volume gate which over-filters
+# expensive high-quality names and under-filters cheap low-quality ones.
+DISCOVERY_DOLLAR_VOLUME_FLOORS = {
+    "US": 3_000_000,        # NYSE/NASDAQ/AMEX
+    "DEVELOPED": 1_000_000, # UK, EU, JP, CA, AU, HK, SG
+    "OTHER": 500_000,       # Everything else
+}
 DISCOVERY_TOP_N_LIGHTWEIGHT = 600       # Stage 5a: lightweight scoring (tech + momentum)
 DISCOVERY_TOP_N_FULL_SCORE = 250        # Stage 5b: full 4-pillar analysis on top N
+DISCOVERY_INFO_WORKERS = 4              # yfinance .info workers for medium-cost fundamentals
+DISCOVERY_INFO_TIMEOUT_SECONDS = 8      # Per-ticker .info timeout before falling back to cache/empty
+DISCOVERY_INFO_PREFETCH_TIMEOUT_SECONDS = 150  # Total .info prefetch budget before fail-fast
+DISCOVERY_INFO_CIRCUIT_MIN_SAMPLE = 50  # Minimum responses before empty-rate circuit breaker can fire
+DISCOVERY_INFO_EMPTY_RATE_CIRCUIT = 0.85  # Treat broad empty .info responses as provider block
+DISCOVERY_STAGE5B_FMP_TOPUP_MAX_CALLS = 60  # Bound sequential FMP top-up calls in quick rank
+DISCOVERY_USE_ETF_DECOMPOSITION = True  # Enable ETF holdings decomposition for universe expansion
+DISCOVERY_RECONSTITUTE_UNIVERSE_ENABLED = True  # Refresh dynamic supplement before discovery
+DISCOVERY_RECONSTITUTE_TTL_HOURS = 24   # Skip expensive universe validation when cache is fresh
+DISCOVERY_USE_BENCHMARK_REBUILD = True  # Feed Wikipedia-sourced index constituents into reconstitute_universe()
+DISCOVERY_BENCHMARK_TTL_DAYS = 30        # Index rebalances are quarterly; 30d keeps us fresh w/o hammering Wikipedia
+ETF_HOLDINGS_CACHE_TTL = 604800        # 7 days — holdings change quarterly
+DISCOVERY_GLOBAL_MAX_TIER = 2          # Daily snapshot includes all configured tiers
+DISCOVERY_GLOBAL_INCLUDE_TIER2_DAILY = True  # Tier 2 is no longer rotated in/out by weekday
 DISCOVERY_BETA_MAX = 2.5               # Maximum beta (soft penalty above 2.0)
 DISCOVERY_CORRELATION_THRESHOLD = 0.70 # Max correlation with existing holdings
-DISCOVERY_SECTOR_CONCENTRATION_MAX = 0.40  # Max sector weight before penalty (relaxed)
+DISCOVERY_SECTOR_CONCENTRATION_MAX = 0.30  # Legacy alias for sector weight cap
 DISCOVERY_USE_GLOBAL_UNIVERSE = True   # Enable yfinance-based global screening
 DISCOVERY_TIER2_DAYS = [0, 3]          # Days to screen mid-caps (0=Mon, 3=Thu)
+
+# Hard universe exclusions. These are applied before the screener spends
+# feature or deep-scoring budget, and are intentionally broader than a static
+# ticker delete so excluded markets cannot leak back through ETF decomposition,
+# dynamic reconstitution, ADR aliases, or forced coverage.
+DISCOVERY_EXCLUDED_COUNTRIES = {
+    "KR",
+    "KOR",
+    "Korea",
+    "South Korea",
+    "Republic of Korea",
+}
+DISCOVERY_EXCLUDED_TICKER_SUFFIXES = (".KS", ".KQ")
+DISCOVERY_EXCLUDED_TICKERS = {
+    # Korean local listings / common ADRs and OTC symbols.
+    "005930.KS", "000660.KS", "003670.KS", "006400.KS", "028260.KS",
+    "032830.KS", "034730.KS", "051910.KS", "055550.KS", "066570.KS",
+    "096770.KS", "105560.KS", "SSNLF", "SMSN.IL", "SMSD.IL",
+    "PKX", "KB", "WF", "SHG", "KT", "SKM", "LPL",
+}
+
+# Stage 2 institutional cheap-screen sleeves.  These reserve part of the
+# prescreen budget for cached point-in-time factor evidence (quality, value,
+# low-risk/BAB) instead of letting price momentum consume every seat.
+DISCOVERY_STAGE2_FACTOR_SLEEVES_ENABLED = True
+DISCOVERY_STAGE2_FACTOR_RESERVE_PCT = 0.20
+DISCOVERY_STAGE2_FACTOR_QUALITY_PCT = 0.35
+DISCOVERY_STAGE2_FACTOR_VALUE_PCT = 0.25
+DISCOVERY_STAGE2_FACTOR_LOW_RISK_PCT = 0.30
+DISCOVERY_STAGE2_FACTOR_PEAD_PCT = 0.10
+DISCOVERY_STAGE2_FACTOR_MIN_COVERAGE = 0.25
+DISCOVERY_STAGE2_LOW_RISK_MIN_SCORE = 0.55
+DISCOVERY_STAGE2_DEFENSIVE_INDUSTRY_LANE_ENABLED = True
+DISCOVERY_STAGE2_DEFENSIVE_INDUSTRY_RESERVE_PCT = 0.12
+DISCOVERY_STAGE2_DEFENSIVE_INDUSTRY_MAX_PER_GROUP = 3
+DISCOVERY_STAGE2_DEFENSIVE_INDUSTRY_MIN_SCORE = 0.55
+DISCOVERY_STAGE2_DEFENSIVE_INDUSTRY_MIN_DOLLAR_VOLUME = 10_000_000
+DISCOVERY_STAGE2_DEFENSIVE_SECTORS = (
+    "Healthcare",
+    "Consumer Defensive",
+    "Consumer Staples",
+    "Utilities",
+    "Communication Services",
+    "Communication",
+    "Real Estate",
+)
+
+# Cohort-aware promotion: keep a strong global core, then backfill missing
+# region / sector / liquidity buckets so the funnel is not dominated by one
+# market regime or one crowded cluster.
+DISCOVERY_LIGHTWEIGHT_PRESELECT_PCT = 0.55
+DISCOVERY_LIGHTWEIGHT_REGION_FLOOR = 12
+DISCOVERY_LIGHTWEIGHT_SECTOR_FLOOR = 6
+DISCOVERY_LIGHTWEIGHT_LIQUIDITY_FLOOR = 8
+DISCOVERY_LIGHTWEIGHT_LENS_FLOOR = 30   # Min candidates per entry lens at Stage 5a (Asness et al. 2013)
+DISCOVERY_FULL_SCORE_PRESELECT_PCT = 0.55
+DISCOVERY_FULL_SCORE_REGION_FLOOR = 5
+DISCOVERY_FULL_SCORE_SECTOR_FLOOR = 3
+DISCOVERY_FULL_SCORE_LIQUIDITY_FLOOR = 4
+DISCOVERY_FULL_SCORE_LENS_FLOOR = 15    # Min candidates per entry lens at Stage 5c
+DISCOVERY_FULL_SCORE_LENS_MIN_COUNTS = {
+    "quality": 60,
+    "value": 55,
+    "composite": 40,
+    "momentum": 60,
+}
+DISCOVERY_FULL_SCORE_READY_RESERVE = 25
+DISCOVERY_FULL_SCORE_READY_MIN_SCORE = 0.20
+DISCOVERY_CHALLENGE_RESERVE_ENABLED = True
+DISCOVERY_CHALLENGE_RESERVE_N = 30
+DISCOVERY_CHALLENGE_AUTO_ENABLED = True
+DISCOVERY_CHALLENGE_TARGET_N = 60
+DISCOVERY_CHALLENGE_NEAR_MISS_PCT = 0.50
+DISCOVERY_CHALLENGE_FACTOR_PCT = 0.35
+DISCOVERY_CHALLENGE_MANUAL_PCT = 0.15
+DISCOVERY_CHALLENGE_MAX_PER_SECTOR = 8
+DISCOVERY_CHALLENGE_MAX_PER_COUNTRY = 10
+DISCOVERY_CHALLENGE_EXPIRY_DAYS = 30
+DISCOVERY_CHALLENGE_LOOKBACK_DAYS = 21
+DISCOVERY_CHALLENGE_MIN_DOLLAR_VOLUME = 5_000_000
+DISCOVERY_CHALLENGE_MIN_FACTOR_GROUPS = 2
+DISCOVERY_CHALLENGE_CACHE_PATH = "feature_cache/challenge_candidates.json"
+DISCOVERY_CHALLENGE_CACHE_MAX_AGE_HOURS = 12
+DISCOVERY_CHALLENGE_MANUAL_OVERRIDES = []
+DISCOVERY_CHALLENGE_TICKERS = []  # Legacy/manual fallback; auto generator is preferred.
 
 # Momentum screening (90-day cycle optimisation)
 DISCOVERY_MODE = "momentum_90d"        # "balanced" or "momentum_90d"
@@ -147,23 +491,56 @@ MOMENTUM_WEIGHTS = {                   # Pillar weights in momentum mode
     "forecast": 0.25,                 # MoE price prediction
 }
 MOMENTUM_TOP_N_PRESCREEN = 1000        # Keep top N by momentum score before filtering
-MOMENTUM_MIN_AVG_VOLUME = 100_000      # Minimum 20-day average volume for momentum
+MOMENTUM_MIN_AVG_VOLUME = DISCOVERY_VOLUME_MIN  # Legacy alias, kept in sync
 
 # Multi-lens entry (each lens gets a quota within MOMENTUM_TOP_N_PRESCREEN)
-DISCOVERY_LENS_MOMENTUM_PCT = 0.50     # 50% of slots to momentum leaders
-DISCOVERY_LENS_VALUE_PCT = 0.25        # 25% of slots to value/turnaround plays
-DISCOVERY_LENS_QUALITY_PCT = 0.25      # 25% of slots to quality-at-a-discount
+DISCOVERY_LENS_MOMENTUM_PCT = 0.35     # 35% momentum (reduced from 50% — Barroso & Santa-Clara 2015)
+DISCOVERY_LENS_VALUE_PCT = 0.25        # 25% value/turnaround plays
+DISCOVERY_LENS_QUALITY_PCT = 0.30      # 30% quality/steady outperformers (Novy-Marx 2013)
+DISCOVERY_LENS_COMPOSITE_PCT = 0.10    # 10% composite (momentum+quality intersection)
 
-# Region-balanced sampling (minimum % of deep-score slots per region)
-DISCOVERY_REGION_MIN_PCT = 0.15        # Each region gets at least 15% of deep-score slots
+# Region-balanced sampling (legacy; geographic minimums are no longer enforced)
+DISCOVERY_REGION_MIN_PCT = 0.15
 
 # Diversified final selector
-DISCOVERY_MAX_PER_SECTOR = 4           # Max candidates from any single sector in final output
-DISCOVERY_MIN_REGIONS = 2              # Minimum number of regions represented in top 10
+DISCOVERY_MAX_PER_SECTOR = 6           # Max candidates from any single sector (Kacperczyk et al. 2005)
+DISCOVERY_USE_INDUSTRY_DIVERSIFICATION = True
+DISCOVERY_MAX_PER_INDUSTRY = 3          # Sub-industry cap before falling back to sector labels
+DISCOVERY_MIN_REGIONS = 2              # Legacy; geographic minimums no longer enforced
+DISCOVERY_SECTOR_PCT_CAP = 0.30        # No GICS sector > 30% of portfolio weight
 
 # Timeout protection (prevents stuck tickers from blocking the whole run)
 DISCOVERY_PER_TICKER_TIMEOUT = 120     # Max seconds per ticker in deep analysis (Stage 6)
-ORCHESTRATOR_MAX_RUNTIME = 36000       # Max total orchestrator runtime in seconds (10 hours)
+SCORING_COMPONENT_TIMEOUT = 45         # Max seconds per scoring sub-component (tech/fund/sent)
+SCORING_FORECAST_TIMEOUT = 60          # Max seconds for forecast model per ticker
+SCORING_PARALLEL_COMPONENTS = True     # Run independent Stage 6 pillars in parallel per ticker
+SCORING_ADAPTIVE_WEIGHT_CACHE_TTL = 900 # Cache expensive adaptive-weight DB reads per process
+DISCOVERY_PIT_FIRST_STAGE5B = True      # Prefer PIT/FMP cached fundamentals before yfinance .info
+DISCOVERY_YFINANCE_INFO_FALLBACK = True # Use yfinance .info only when PIT/FMP data is thin
+DISCOVERY_STAGE5_READY_BOOST_ENABLED = True
+DISCOVERY_STAGE5_READY_BOOST_STRENGTH = 0.30  # Multiplier range roughly 0.85x..1.15x
+DISCOVERY_SLEEVES_ENABLED = True       # Cache-only multi-sleeve Stage 5a ranker
+DISCOVERY_SLEEVE_SECTOR_MAX = None     # Optional per-sector cap inside adaptive promotion
+DISCOVERY_SLEEVE_SECTOR_NEUTRAL_BLEND = 0.35
+DISCOVERY_SLEEVE_MIN_COVERAGE = 0.50
+DISCOVERY_SLEEVE_WEIGHTS = {
+    "quality": 0.24,
+    "momentum": 0.20,
+    "value": 0.18,
+    "low_risk": 0.15,
+    "ready": 0.15,
+    "pead": 0.08,
+}
+DISCOVERY_FORCE_INCLUDE_TICKERS = [
+    {"symbol": "CI", "companyName": "The Cigna Group", "sector": "Healthcare", "industry": "Healthcare Plans", "country": "US", "exchange": "NYSE", "index_source": "FORCED_HEALTHCARE_CORE"},
+    {"symbol": "ELV", "companyName": "Elevance Health, Inc.", "sector": "Healthcare", "industry": "Healthcare Plans", "country": "US", "exchange": "NYSE", "index_source": "FORCED_HEALTHCARE_CORE"},
+    {"symbol": "HUM", "companyName": "Humana Inc.", "sector": "Healthcare", "industry": "Healthcare Plans", "country": "US", "exchange": "NYSE", "index_source": "FORCED_HEALTHCARE_CORE"},
+    {"symbol": "CNC", "companyName": "Centene Corporation", "sector": "Healthcare", "industry": "Healthcare Plans", "country": "US", "exchange": "NYSE", "index_source": "FORCED_HEALTHCARE_CORE"},
+    {"symbol": "MOH", "companyName": "Molina Healthcare, Inc.", "sector": "Healthcare", "industry": "Healthcare Plans", "country": "US", "exchange": "NYSE", "index_source": "FORCED_HEALTHCARE_CORE"},
+]
+ORCHESTRATOR_MAX_RUNTIME = 57600       # Max total orchestrator runtime in seconds (16 hours)
+ORCHESTRATOR_LOCK_FILE = "feature_cache/orchestrator.lock"
+ORCHESTRATOR_LOCK_STALE_SECONDS = ORCHESTRATOR_MAX_RUNTIME + 1800
 
 # Multi-swap evaluation
 DISCOVERY_MAX_SWAPS_PER_RUN = 3        # Allow up to N swap recommendations per run
@@ -180,6 +557,9 @@ WILLIAMS_OVERSOLD = -80    # Williams %R < -80 = oversold
 
 # Earnings calendar
 EARNINGS_PROXIMITY_DAYS = 7  # Warn when earnings within N days
+RISK_OVERLAY_LIVE_TARGET_CHECK = False # Use cached analyst target info only during overlay
+RISK_OVERLAY_INFO_TIMEOUT_SECONDS = 3
+RISK_OVERLAY_POST_EARNINGS_CACHE_TTL = 43200
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Autonomous Email Engine (v4.0)
@@ -194,12 +574,17 @@ EMAIL_PASSWORD = os.environ.get("EMAIL_PASSWORD", "")   # app password
 
 # Orchestrator scheduling
 ORCHESTRATOR_DISCOVERY_FREQ_DAYS = 1   # Fallback: max days between runs (overridden by day-of-week)
-ORCHESTRATOR_DISCOVERY_DAYS = [6]  # Days of week to run discovery (6=Sun)
+ORCHESTRATOR_DISCOVERY_DAYS = [0, 1, 2, 3, 4]  # Mon-Fri (0=Mon ... 4=Fri)
 
 # Decision logic — swap hurdle rates
 HURDLE_RATE = 0.20             # candidate.aggregate_score must beat weakest by this margin
 PORTFOLIO_FIT_MIN = 0.50       # minimum portfolio_fit_score to qualify as swap candidate
-COOLDOWN_DAYS = 14             # suppress re-alerting same ticker for N days
+COOLDOWN_DAYS = 7             # suppress re-alerting same ticker for N days
+
+# Self-monitoring — "propose, don't apply". Reads telemetry from the
+# decision log and writes a recommendation JSON. Config is never mutated.
+AUTO_TUNE_ENABLED = True
+AUTO_TUNE_WINDOW_DAYS = 30
 
 # State + decision log
 ORCHESTRATOR_STATE_FILE = "orchestrator_state.json"
@@ -208,6 +593,7 @@ ORCHESTRATOR_LOG_FILE = "orchestrator_log.jsonl"
 # Paper Trading Ledger (SQLite)
 PAPER_TRADING_DB = "paper_trading.db"
 PAPER_TRADING_ENABLED = True                    # Log all signals to paper ledger
+PAPER_TRADING_LOG_DRY_RUN = False               # Keep dry runs read-only for paper ledger
 
 # Timeouts (seconds)
 DISCOVERY_TIMEOUT = 7200       # 2 hours max for expanded discovery pipeline
@@ -225,10 +611,14 @@ DISCOVERY_CROSS_SECTIONAL_ZSCORE = True
 
 # Position sizing / volatility management
 POSITION_RISK_BUDGET_PCT = 0.01             # Risk 1% of portfolio per trade before caps
+POSITION_ADV_PARTICIPATION_CAP = 0.10       # ≤10% of 20-day ADV per position (Almgren-Chriss)
 VOL_MANAGED_TARGET_ANN = 0.20               # 20% annualized target vol for alpha scaling
 VOL_MANAGED_FLOOR = 0.50                    # Never scale alpha below 50%
 VOL_MANAGED_CAP = 1.25                      # Never scale alpha above 125%
-PEAD_MAX_OVERLAY = 0.10                     # Cap PEAD / revision overlay magnitude
+PEAD_MAX_OVERLAY = 0.15                     # Cap PEAD / revision overlay magnitude (raised from 0.10)
+PEAD_FACTOR_WEIGHT = 0.12                   # Weight of PEAD factor in alpha blend (Martineau 2022)
+PEAD_SUE_WINDOW_QUARTERS = 8               # Quarters for SUE std dev calculation
+PEAD_ENABLED = True                         # Enable first-class PEAD factor
 DISCOVERY_MAX_RISK_PENALTY = 0.30           # Cap total risk overlay deduction per candidate
 DISCOVERY_MAX_PILLAR_WEIGHT = 0.70          # Cap any single pillar after adaptive redistribution
 
@@ -249,9 +639,48 @@ CURRENT_RATIO_MIN = 1.0                     # Below this = liquidity risk
 GOVERNANCE_FLAG_THRESHOLD = 3               # Number of warning signals to trigger flag
 
 # ML ranker guardrails — keep conservative until walk-forward sample is larger
-ML_RANKER_MIN_SAMPLES = 250                 # Minimum evaluated signals before ML can go live
+ML_RANKER_MIN_SAMPLES = 300                 # Minimum evaluated signals before ML can train live
 ML_RANKER_BLEND_PCT = 0.15                  # Small live blend when enabled
-ML_RANKER_SHADOW_ONLY = True                # Train/evaluate offline until enough evidence exists
+ML_RANKER_SHADOW_ONLY = False               # Live when enough data exists; still degrades gracefully
+ML_RANKER_SURFACE_SHADOW = True             # Cache ML scores even when live blend is disabled/blocked
+ML_RANKER_META_PROBA_FOR_ALL = True         # Cache meta-label probability for every deep-scored candidate
+ML_RANKER_PROMOTION_MIN_SAMPLES = 300       # Promotion gate after purged validation
+ML_RANKER_PROMOTION_MIN_RANK_IC = 0.02      # Positive, but not top-decile-only
+ML_RANKER_PROMOTION_MIN_R_SQUARED = -0.05   # Ranker is judged mainly on OOS rank IC
+ML_RANKER_EMBARGO_DAYS = 30                 # Purge overlapping 30d target windows
+ML_RANKER_MIN_TRAIN_SAMPLES = 80
+ML_RANKER_MODEL_CACHE_FILE = "feature_cache/ml_ranker_model.pkl"
+
+# Data confidence floor (Hou, Xue & Zhang 2020 — prevent data sparsity bias)
+CONFIDENCE_FLOOR = 0.60                     # Min confidence multiplier (was 0.30, crushed mid-caps)
+
+# Factor momentum (Ehsani & Linnainmaa 2022)
+FACTOR_MOMENTUM_MIN_UNIVERSE = 10         # Smallest cross-section that still permits quintile spreads
+FACTOR_MOMENTUM_LOOKBACK_1M = 21            # 1-month rolling window (trading days)
+FACTOR_MOMENTUM_LOOKBACK_3M = 63            # 3-month rolling window (trading days)
+FACTOR_MOMENTUM_CACHE_TTL = 86400           # 24h cache for factor returns
+FACTOR_MOMENTUM_REQUIRE_3M = True           # Need 3m confirmation before live tilt
+FACTOR_MOMENTUM_TILT_CAP = 0.35             # Conservative cap; no +/-1 one-month swings
+FACTOR_MOMENTUM_CONFIRMATION_MULT = 0.25    # Damp tilts when 1m and 3m disagree
+
+# Bayesian self-learning.  Starts from academic/commercial priors and only
+# blends toward realised local IC when there is enough evaluated history.
+BAYESIAN_SELF_LEARNING_ENABLED = True
+BAYESIAN_PRIOR_STRENGTH = 125               # Virtual observations backing the prior
+BAYESIAN_MAX_LIVE_BLEND = 0.25              # Local data cannot dominate cold-start priors
+BAYESIAN_MIN_SAMPLES = 30
+BAYESIAN_HORIZON_CHAIN = ["30d", "10d", "5d"]
+BAYESIAN_MIN_SAMPLES_BY_HORIZON = {"30d": 100, "10d": 250, "5d": 500}
+BAYESIAN_HORIZON_BLEND_MULT = {"30d": 1.0, "10d": 0.60, "5d": 0.35}
+BAYESIAN_EFFECTIVENESS_MIN_SAMPLES = 200
+BAYESIAN_EFFECTIVENESS_PRIOR_STRENGTH = 200
+BAYESIAN_DAILY_MAX_REL_DELTA = 0.20
+BAYESIAN_REGIME_CONDITIONAL = True
+
+# Calibration can use Lopez de Prado triple-barrier labels from PIT replay
+# instead of waiting for months of live 90d action outcomes.
+ACTION_CALIBRATION_USE_TRIPLE_BARRIER = True
+ACTION_CALIBRATION_MIN_SAMPLE_SIZE = 20
 
 # Broad universe for cross-sectional weight optimization (diverse sectors + geographies)
 BACKTEST_UNIVERSE = [

@@ -12,14 +12,16 @@ providing median sector P/E as a fallback when FMP sector_pe is unavailable.
 
 import json
 import logging
-import os
 from datetime import datetime, timedelta
 from pathlib import Path
 
 import numpy as np
 
 import config
+from engine.factors import compute_all_extended_factors, compute_fundamental_quality_metrics
+from utils.atomic_io import atomic_write_json
 from utils.data_fetch import get_insider_transactions, get_ticker_info
+from utils.safe_numeric import safe_float
 
 logger = logging.getLogger(__name__)
 
@@ -68,12 +70,7 @@ def _save_sector_pe_cache() -> None:
         _SECTOR_PE_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
         # Keep only the most recent 50 P/E values per sector (rolling window)
         trimmed = {s: pes[-50:] for s, pes in _sector_pe_data.items() if pes}
-        tmp = _SECTOR_PE_CACHE_PATH.with_suffix(".tmp")
-        with open(tmp, "w") as f:
-            json.dump(trimmed, f, separators=(",", ":"))
-            f.flush()
-            os.fsync(f.fileno())
-        tmp.replace(_SECTOR_PE_CACHE_PATH)
+        atomic_write_json(_SECTOR_PE_CACHE_PATH, trimmed, separators=(",", ":"))
     except OSError as e:
         logger.warning("Sector PE cache save failed: %s", e)
 
@@ -102,7 +99,7 @@ def _get_fmp_fundamentals(ticker: str) -> dict | None:
     try:
         from utils.fmp_client import (
             get_earnings_surprises, get_analyst_estimates,
-            get_key_metrics, get_income_statement,
+            get_key_metrics, get_income_statement, get_balance_sheet_statement,
             get_upgrades_downgrades, get_company_profile,
             get_sector_pe, get_earnings_calendar, is_available,
         )
@@ -117,6 +114,11 @@ def _get_fmp_fundamentals(ticker: str) -> dict | None:
             "analyst_estimates": get_analyst_estimates(ticker, period="quarter", limit=4),
             "key_metrics": get_key_metrics(ticker, period="quarter", limit=8),
             "income_statement": get_income_statement(ticker, period="quarter", limit=8),
+            "annual_income_statement": get_income_statement(ticker, period="annual", limit=5),
+            "balance_sheet_statement": get_balance_sheet_statement(ticker, period="annual", limit=5),
+            # Quarterly balance sheet enables TTM Piotroski / GPA (fixes annual
+            # staleness for cyclicals — roadmap step 2).
+            "quarterly_balance_sheet": get_balance_sheet_statement(ticker, period="quarter", limit=8),
             "upgrades_downgrades": get_upgrades_downgrades(ticker),
             "earnings_calendar": get_earnings_calendar(ticker),
             "sector": sector,
@@ -495,7 +497,22 @@ def _score_balance_sheet_strength(info: dict) -> tuple[float, list[str], dict]:
         "net_debt_ebitda": None,
         "cash_to_debt": None,
         "balance_sheet_grade": None,
+        "altman_z": None,
+        "altman_zone": "unknown",
+        "altman_coverage": 0.0,
     }
+
+    # Altman Z-Score (1968) — distress predictor.  Computed from yfinance info
+    # alone; missing components are pro-rated rather than blocking the gate.
+    try:
+        from engine.distress import altman_zone, compute_altman_z
+        z_res = compute_altman_z(info)
+        if z_res.z is not None:
+            data["altman_z"] = round(z_res.z, 3)
+            data["altman_zone"] = altman_zone(z_res.z)
+        data["altman_coverage"] = round(z_res.coverage, 2)
+    except Exception:
+        pass
 
     total_debt = info.get("totalDebt")
     total_cash = info.get("totalCash")
@@ -620,11 +637,16 @@ def analyse(ticker: str) -> dict:
     fmp_metrics = None
     if fmp and fmp.get("key_metrics") and isinstance(fmp["key_metrics"], list):
         fmp_metrics = fmp["key_metrics"][0]  # Most recent quarter
+    annual_income_statement = fmp.get("annual_income_statement") if fmp else None
+    balance_sheet_statement = fmp.get("balance_sheet_statement") if fmp else None
+    quarterly_income_statement = fmp.get("income_statement") if fmp else None
+    quarterly_balance_sheet = fmp.get("quarterly_balance_sheet") if fmp else None
 
     # Core metrics: prefer FMP quarterly data, fall back to yfinance
     pe_ratio = info.get("trailingPE") or info.get("forwardPE")
     if pe_ratio is None and fmp_metrics:
         pe_ratio = fmp_metrics.get("peRatio")
+    pe_ratio = safe_float(pe_ratio, default=None)
 
     # Determine sector: FMP profile > yfinance info
     ticker_sector = None
@@ -678,6 +700,17 @@ def analyse(ticker: str) -> dict:
     if fcf is not None and market_cap and market_cap > 0:
         fcf_yield = fcf / market_cap
 
+    quality_metrics = compute_fundamental_quality_metrics(
+        info,
+        annual_income_statements=annual_income_statement,
+        balance_sheet_statements=balance_sheet_statement,
+    )
+
+    # Extended institutional factors (Cooper 2008, Sloan 1996, Bhandari 1988)
+    extended_factors = compute_all_extended_factors(
+        info, {}, balance_sheet_statements=balance_sheet_statement,
+    )
+
     reasons = []
 
     # -----------------------------------------------------------------------
@@ -724,42 +757,27 @@ def analyse(ticker: str) -> dict:
     value_score = max(-1.0, min(1.0, value_score))
 
     # --- Sub-factor 2: QUALITY (30%) ---
-    # ROE, profit margin, D/E, short interest
-    quality_score = 0.0
-    if roe is not None:
-        if roe > 0.25:
-            quality_score += 0.4
-            reasons.append(f"high ROE ({roe:.0%})")
-        elif roe > 0.15:
-            quality_score += 0.2
-        elif roe < 0:
-            quality_score -= 0.3
-    if profit_margin is not None:
-        if profit_margin > 0.20:
-            quality_score += 0.3
-        elif profit_margin < 0:
-            quality_score -= 0.4
-            reasons.append(f"unprofitable (margin {profit_margin:.0%})")
-        elif profit_margin < 0.05:
-            quality_score -= 0.1
-    if debt_to_equity is not None:
-        if debt_to_equity > 200:
-            quality_score -= 0.3
-            reasons.append(f"high leverage (D/E {debt_to_equity:.0f}%)")
-        elif debt_to_equity > 100:
-            quality_score -= 0.1
-        elif debt_to_equity < 50:
-            quality_score += 0.2
-    else:
-        reasons.append("D/E unavailable")
-    if short_pct is not None:
-        if short_pct > config.SHORT_INTEREST_HIGH:
-            quality_score -= 0.2
-            reasons.append(f"high short interest ({short_pct:.1%})")
-        elif short_pct < config.SHORT_INTEREST_LOW:
-            quality_score += 0.1
-
-    quality_score = max(-1.0, min(1.0, quality_score))
+    # Gross profitability, ROE, FCF/assets, earnings stability
+    quality_score = quality_metrics["quality_score"]
+    if quality_metrics.get("gross_profitability") is not None:
+        gp = quality_metrics["gross_profitability"]
+        if gp >= 0.35:
+            reasons.append(f"gross profitability {gp:.1%}")
+        elif gp < 0.10:
+            reasons.append(f"weak gross profitability {gp:.1%}")
+    if quality_metrics.get("fcf_to_assets") is not None:
+        fcf_assets = quality_metrics["fcf_to_assets"]
+        if fcf_assets >= 0.05:
+            reasons.append(f"strong FCF/assets {fcf_assets:.1%}")
+        elif fcf_assets < 0:
+            reasons.append(f"negative FCF/assets {fcf_assets:.1%}")
+    if quality_metrics.get("earnings_stability") is not None:
+        stability = quality_metrics["earnings_stability"]
+        variance = quality_metrics.get("eps_growth_variance_5y")
+        if stability >= 0.25 and variance is not None:
+            reasons.append(f"stable EPS growth (5y var {variance:.2f})")
+        elif stability <= -0.25 and variance is not None:
+            reasons.append(f"unstable EPS growth (5y var {variance:.2f})")
 
     # --- Sub-factor 3: GROWTH (25%) ---
     # EPS growth, revenue growth, quarterly trends
@@ -918,6 +936,90 @@ def analyse(ticker: str) -> dict:
     score += bs_delta * 0.5
     reasons.extend(bs_reasons)
 
+    # --- Enterprise-grade factor bundle (EV/EBIT, GPA, F-score) ------------
+    # Roadmap items #1-#2.  Helpers are defensive — None on missing input.
+    # This block runs BEFORE the final score clip so the coverage-aware
+    # delta can contribute to `fundamental_score` itself (pillar path), not
+    # only to the downstream factor-tilt path.
+    try:
+        from engine import enterprise_factors as _ef
+
+        _ev_ebit = _ef.compute_ev_ebit(info) if info else {"ev_ebit": None, "ev_ebitda": None, "ev_ebit_score": None}
+
+        # ---- GPA: prefer TTM quarterly, fall back to annual ----------------
+        _gpa = _ef.compute_ttm_gpa(quarterly_income_statement, quarterly_balance_sheet)
+        if _gpa.get("gpa") is None and info:
+            # Annual fallback (Novy-Marx 2013): grossProfits / totalAssets
+            _gpa_annual = _ef.compute_gpa(info)
+            if _gpa_annual.get("gpa") is not None:
+                _gpa = {**_gpa_annual, "gpa_source": "annual_info"}
+
+        # ---- Piotroski: prefer TTM-rolling, fall back to annual ------------
+        # TTM needs ≥8Q income + ≥5Q balance sheet.  Annual path uses the
+        # two most-recent FMP annual statements; yfinance info provides CFO.
+        _fscore = _ef.compute_ttm_piotroski_f_score(
+            quarterly_income_statement, quarterly_balance_sheet, info=info,
+        )
+        if _fscore.get("f_score") is None and annual_income_statement and balance_sheet_statement:
+            _fscore_latest = None
+            _fscore_prior = None
+            try:
+                inc_rows = annual_income_statement if isinstance(annual_income_statement, list) else []
+                bs_rows = balance_sheet_statement if isinstance(balance_sheet_statement, list) else []
+                if inc_rows and bs_rows:
+                    _fscore_latest = _ef.extract_piotroski_period(
+                        income_row=inc_rows[0], balance_row=bs_rows[0],
+                        cashflow_row=None, info=info,
+                    )
+                if len(inc_rows) > 1 and len(bs_rows) > 1:
+                    _fscore_prior = _ef.extract_piotroski_period(
+                        income_row=inc_rows[1], balance_row=bs_rows[1],
+                        cashflow_row=None, info=None,
+                    )
+            except Exception:  # pragma: no cover
+                _fscore_latest = _fscore_prior = None
+            _fscore_annual = _ef.compute_piotroski_f_score(_fscore_latest, _fscore_prior)
+            if _fscore_annual.get("f_score") is not None:
+                _fscore = {**_fscore_annual, "f_score_source": "annual"}
+    except Exception as _ef_err:  # pragma: no cover — defensive
+        _logger = logging.getLogger(__name__)
+        _logger.debug("enterprise_factors bundle failed for %s: %s", ticker, _ef_err)
+        _ev_ebit = {"ev_ebit": None, "ev_ebitda": None, "ev_ebit_score": None}
+        _gpa = {"gpa": None, "gpa_score": None}
+        _fscore = {"f_score": None, "f_score_gate": False, "f_score_score": None, "f_score_coverage": 0.0}
+
+    # --- Enterprise pillar contribution (coverage-aware) -------------------
+    # Average the scores of whichever enterprise factors were computable, so
+    # names missing EBIT/statements aren't penalised for the gap.  The delta
+    # is weighted and clipped so it can tilt the pillar without dominating it.
+    # Paper refs: Loughran-Wellman 2011; Novy-Marx 2013; Piotroski 2000.
+    import config as _cfg
+    if getattr(_cfg, "ENTERPRISE_FACTORS_ENABLED", True):
+        _ent_weight = 0.20  # 20% of the pillar budget
+        _ent_scores = [
+            v for v in (
+                _ev_ebit.get("ev_ebit_score"),
+                _gpa.get("gpa_score"),
+                _fscore.get("f_score_score"),
+            )
+            if v is not None
+        ]
+        if _ent_scores:
+            _ent_mean = sum(_ent_scores) / len(_ent_scores)
+            # Cap contribution at ±_ent_weight so it tilts, never dominates.
+            _ent_delta = max(-_ent_weight, min(_ent_weight, _ent_weight * _ent_mean))
+            score += _ent_delta
+            if _ent_delta > 0.05:
+                reasons.append(
+                    f"enterprise factors favourable (EV/EBIT={_ev_ebit.get('ev_ebit')}, "
+                    f"F-score={_fscore.get('f_score')}, GPA={_gpa.get('gpa')})"
+                )
+            elif _ent_delta < -0.05:
+                reasons.append(
+                    f"enterprise factors weak (EV/EBIT={_ev_ebit.get('ev_ebit')}, "
+                    f"F-score={_fscore.get('f_score')}, GPA={_gpa.get('gpa')})"
+                )
+
     score = max(-1.0, min(1.0, score))
 
     # --- Governance red flag (metadata only — no score impact) ---
@@ -937,6 +1039,20 @@ def analyse(ticker: str) -> dict:
         "score": score,
         "reasons": reasons,
         "sector": ticker_sector,
+        # Enterprise factor bundle (Loughran-Wellman 2011, Piotroski 2000, Novy-Marx 2013)
+        "enterprise_value": _ev_ebit.get("enterprise_value"),
+        "ev_ebit": _ev_ebit.get("ev_ebit"),
+        "ev_ebitda": _ev_ebit.get("ev_ebitda"),
+        "ebit_yield": _ev_ebit.get("ebit_yield"),
+        "ev_ebit_score": _ev_ebit.get("ev_ebit_score"),
+        "gpa": _gpa.get("gpa"),
+        "gpa_score": _gpa.get("gpa_score"),
+        "f_score": _fscore.get("f_score"),
+        "f_score_gate": _fscore.get("f_score_gate", False),
+        "f_score_score": _fscore.get("f_score_score"),
+        "f_score_coverage": _fscore.get("f_score_coverage", 0.0),
+        "f_score_source": _fscore.get("f_score_source"),
+        "gpa_source": _gpa.get("gpa_source"),
         # yfinance metrics
         "pe_ratio": pe_ratio,
         "eps_growth": eps_growth,
@@ -958,8 +1074,14 @@ def analyse(ticker: str) -> dict:
         "roe": roe,
         "fcf_yield": fcf_yield,
         "market_cap": market_cap,
+        "quality_score_fundamental": quality_metrics["quality_score"],
+        "gross_profitability": quality_metrics.get("gross_profitability"),
+        "fcf_to_assets": quality_metrics.get("fcf_to_assets"),
+        "earnings_stability": quality_metrics.get("earnings_stability"),
+        "eps_growth_variance_5y": quality_metrics.get("eps_growth_variance_5y"),
         # FMP metrics
         "fmp_available": fmp_available,
+        "_earnings_surprises": fmp.get("earnings_surprises") if fmp else None,
         "earnings_beat_rate": earnings_beat_rate,
         "quarterly_trend": quarterly_trend,
         "estimate_revision": estimate_revision,
@@ -981,9 +1103,22 @@ def analyse(ticker: str) -> dict:
         "net_debt_ebitda": bs_data.get("net_debt_ebitda"),
         "cash_to_debt": bs_data.get("cash_to_debt"),
         "balance_sheet_grade": bs_data.get("balance_sheet_grade"),
+        # Distress / earnings-manipulation gates (Altman 1968; Beneish 1999)
+        "altman_z": bs_data.get("altman_z"),
+        "altman_zone": bs_data.get("altman_zone"),
+        "altman_coverage": bs_data.get("altman_coverage", 0.0),
         # Governance red flag
         "governance_flag": governance_flag,
         "governance_reasons": governance_reasons,
+        # Extended institutional factors
+        "investment_factor_score": extended_factors.get("investment_factor_score"),
+        "accruals_factor_score": extended_factors.get("accruals_factor_score"),
+        "leverage_factor_score": extended_factors.get("leverage_factor_score"),
+        "reversal_factor_score": extended_factors.get("reversal_factor_score"),
+        "residual_momentum_score": extended_factors.get("residual_momentum_score"),
+        "idiosyncratic_vol_score": extended_factors.get("idiosyncratic_vol_score"),
+        "pb_score": extended_factors.get("pb_score"),
+        "ps_score": extended_factors.get("ps_score"),
     }
 
 
@@ -1001,7 +1136,13 @@ def _empty_result(reason: str) -> dict:
         "analyst_rec": None, "num_analysts": None,
         "revenue_growth": None, "profit_margin": None,
         "roe": None, "fcf_yield": None, "market_cap": None,
+        "quality_score_fundamental": 0.0,
+        "gross_profitability": None,
+        "fcf_to_assets": None,
+        "earnings_stability": None,
+        "eps_growth_variance_5y": None,
         "fmp_available": False,
+        "_earnings_surprises": None,
         "earnings_beat_rate": None, "quarterly_trend": None,
         "estimate_revision": None, "peg_ratio": None,
         "sector_pe": None, "pe_vs_sector": None,
@@ -1014,6 +1155,13 @@ def _empty_result(reason: str) -> dict:
         # Balance sheet strength
         "current_ratio": None, "net_debt_ebitda": None,
         "cash_to_debt": None, "balance_sheet_grade": None,
+        # Distress / earnings-manipulation gates
+        "altman_z": None, "altman_zone": "unknown", "altman_coverage": 0.0,
         # Governance red flag
         "governance_flag": False, "governance_reasons": [],
+        # Extended institutional factors
+        "investment_factor_score": None, "accruals_factor_score": None,
+        "leverage_factor_score": None, "reversal_factor_score": None,
+        "residual_momentum_score": None, "idiosyncratic_vol_score": None,
+        "pb_score": None, "ps_score": None,
     }

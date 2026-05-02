@@ -3,7 +3,6 @@
 import json
 import logging
 import math
-import os
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -13,6 +12,7 @@ import pandas as pd
 from sklearn.linear_model import LinearRegression
 
 import config
+from utils.atomic_io import atomic_write_json
 from utils.analysis_cache import PersistentAnalysisCache
 from utils.data_fetch import get_macro_data, get_price_history
 
@@ -255,8 +255,14 @@ def compute_expert_weights(
     expert_maes: dict[str, list[float]],
     current_price: float,
     expert_predictions: dict[str, float] | None = None,
+    regime_label: str | None = None,
+    regime_maes: dict[str, dict[str, list[float]]] | None = None,
 ) -> dict[str, float]:
     """Weight experts inversely proportional to their rolling MAE.
+
+    Enhanced with regime-conditional weighting (Rapach, Strauss & Zhou 2010):
+    when regime data is available, uses regime-specific MAE history to weight
+    experts that perform well in the current market state.
 
     Flat-line experts (predicted ≈ current_price ± 0.1%) are zeroed out —
     they contribute no directional signal and dilute the ensemble.
@@ -273,12 +279,37 @@ def compute_expert_weights(
             if abs(pred - current_price) <= flatline_threshold:
                 flatline_experts.add(name)
 
+    # Select MAE source: regime-specific if available, else unconditional
+    effective_maes = expert_maes
+    if regime_label and regime_maes:
+        regime_specific = regime_maes.get(regime_label, {})
+        # Use regime MAE only for experts with sufficient history in this regime
+        min_regime_history = max(3, config.FORECAST_MIN_HISTORY // 2)
+        has_sufficient = any(
+            len(regime_specific.get(name, [])) >= min_regime_history
+            for name in EXPERT_NAMES
+        )
+        if has_sufficient:
+            # Blend: 70% regime-specific + 30% unconditional for stability
+            blended_maes = {}
+            for name in EXPERT_NAMES:
+                r_maes = regime_specific.get(name, [])
+                u_maes = expert_maes.get(name, [])
+                if len(r_maes) >= min_regime_history:
+                    r_avg = sum(r_maes[-config.FORECAST_ROLLING_WINDOW:]) / len(r_maes[-config.FORECAST_ROLLING_WINDOW:])
+                    u_avg = sum(u_maes[-config.FORECAST_ROLLING_WINDOW:]) / max(len(u_maes[-config.FORECAST_ROLLING_WINDOW:]), 1)
+                    blended_avg = 0.70 * r_avg + 0.30 * u_avg
+                    blended_maes[name] = [blended_avg]  # Wrap in list for compatibility
+                else:
+                    blended_maes[name] = u_maes
+            effective_maes = blended_maes
+
     raw_weights = {}
     for name in EXPERT_NAMES:
         if name in flatline_experts:
             raw_weights[name] = 0.0  # Zero weight — no directional signal
             continue
-        maes = expert_maes.get(name, [])
+        maes = effective_maes.get(name, [])
         if len(maes) < config.FORECAST_MIN_HISTORY:
             raw_weights[name] = equal_weight
         else:
@@ -363,12 +394,7 @@ def _load_store() -> dict:
 
 def _save_store(store: dict):
     path = _store_path()
-    tmp = path.with_suffix(".json.tmp")
-    with open(tmp, "w") as f:
-        json.dump(store, f, indent=2, default=str)
-        f.flush()
-        os.fsync(f.fileno())
-    tmp.replace(path)  # Atomic rename — prevents corruption from partial writes
+    atomic_write_json(path, store, indent=2, default=str)
 
 
 def _evaluate_past_predictions(store: dict) -> dict:
@@ -592,7 +618,21 @@ def forecast(ticker: str, horizon_days: int | None = None) -> EnsembleForecast:
     mae_key = f"{ticker}_{horizon_days}"
     ticker_maes = store.get("rolling_maes", {}).get(mae_key, {})
     expert_preds_map = {e.name: e.predicted_price for e in expert_results}
-    weights = compute_expert_weights(ticker_maes, current_price, expert_preds_map)
+
+    # Regime-conditional expert weighting (Rapach, Strauss & Zhou 2010)
+    regime_label = None
+    regime_maes = store.get("regime_maes", {}).get(mae_key)
+    try:
+        from engine.regime import get_vix_regime
+        vix_regime = get_vix_regime()
+        regime_label = vix_regime.get("regime_label")
+    except Exception:
+        pass
+
+    weights = compute_expert_weights(
+        ticker_maes, current_price, expert_preds_map,
+        regime_label=regime_label, regime_maes=regime_maes,
+    )
 
     # Weighted ensemble
     predicted = sum(

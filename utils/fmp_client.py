@@ -377,6 +377,40 @@ def get_income_statement(
     return data if isinstance(data, list) else None
 
 
+def get_balance_sheet_statement(
+    ticker: str, period: str = "annual", limit: int = 8,
+) -> list[dict] | None:
+    """Balance-sheet statement with total assets and debt fields.
+
+    NOTE: US tickers only on Starter plan.
+    """
+    if _is_non_us_ticker(ticker):
+        return None
+    data = _fmp_get(
+        "/balance-sheet-statement",
+        {"symbol": ticker, "period": period, "limit": limit},
+        ttl=config.FMP_CACHE_TTL_QUARTERLY,
+    )
+    return data if isinstance(data, list) else None
+
+
+def get_cash_flow_statement(
+    ticker: str, period: str = "annual", limit: int = 8,
+) -> list[dict] | None:
+    """Cash-flow statement with operating cash flow and capex.
+
+    NOTE: US tickers only on Starter plan.
+    """
+    if _is_non_us_ticker(ticker):
+        return None
+    data = _fmp_get(
+        "/cash-flow-statement",
+        {"symbol": ticker, "period": period, "limit": limit},
+        ttl=config.FMP_CACHE_TTL_QUARTERLY,
+    )
+    return data if isinstance(data, list) else None
+
+
 def get_company_profile(ticker: str) -> dict | None:
     """Company overview: sector, industry, market cap, description."""
     data = _fmp_get(
