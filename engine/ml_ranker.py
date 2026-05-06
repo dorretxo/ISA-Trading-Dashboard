@@ -64,11 +64,16 @@ _model_cache: dict = {
     "oos_rank_ic_lgbm": None,
     "oos_r_squared": None,
     "meta_precision": None,
+    "meta_recall": None,
+    "meta_brier": None,
+    "meta_log_loss": None,
+    "meta_calibration": None,
     "promotion_eligible": False,
 }
 
 _RETRAIN_HOURS = 24.0
 _MODEL_CACHE_PATH = Path(getattr(config, "ML_RANKER_MODEL_CACHE_FILE", "feature_cache/ml_ranker_model.pkl"))
+_META_CALIBRATION_PATH = Path("feature_cache/meta_calibration.json")
 
 # Walk-forward validation settings
 _MIN_TRAIN_SAMPLES = int(getattr(config, "ML_RANKER_MIN_TRAIN_SAMPLES", 80))
@@ -125,6 +130,56 @@ def _save_persisted_model() -> None:
         tmp.replace(_MODEL_CACHE_PATH)
     except Exception as exc:
         logger.debug("Persisted ML ranker save failed: %s", exc)
+
+
+def _probability_summary(values) -> dict:
+    """Small JSON-safe distribution summary for classifier probabilities."""
+    try:
+        import numpy as np
+
+        arr = np.asarray(values, dtype=float)
+        arr = arr[np.isfinite(arr)]
+        if arr.size == 0:
+            return {"count": 0}
+        return {
+            "count": int(arr.size),
+            "min": float(np.min(arr)),
+            "p50": float(np.quantile(arr, 0.50)),
+            "p90": float(np.quantile(arr, 0.90)),
+            "p95": float(np.quantile(arr, 0.95)),
+            "max": float(np.max(arr)),
+        }
+    except Exception:
+        return {"count": 0}
+
+
+def _write_meta_calibration_report(report: dict) -> None:
+    """Persist meta-label calibration diagnostics for UI/ops visibility."""
+    try:
+        import json
+        from utils.atomic_io import atomic_write_json
+
+        state_path = Path(getattr(config, "ORCHESTRATOR_STATE_FILE", "orchestrator_state.json"))
+        if state_path.exists():
+            try:
+                state = json.loads(state_path.read_text(encoding="utf-8"))
+                cached = state.get("cached_discovery") or []
+                live_probs = [
+                    float(c.get("meta_label_proba"))
+                    for c in cached
+                    if isinstance(c, dict) and c.get("meta_label_proba") is not None
+                ]
+                live_dist = _probability_summary(live_probs)
+                threshold = float(report.get("threshold") or getattr(config, "META_LABEL_STRONG_BUY_MIN_PROB", 0.60))
+                live_dist["count_at_or_above_threshold"] = sum(1 for v in live_probs if v >= threshold)
+                report["latest_cached_live_distribution"] = live_dist
+            except Exception as exc:
+                logger.debug("Live meta-prob distribution unavailable: %s", exc)
+
+        _META_CALIBRATION_PATH.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_json(_META_CALIBRATION_PATH, report, indent=2)
+    except Exception as exc:
+        logger.debug("Meta-label calibration report write failed: %s", exc)
 
 
 def _xgboost_available() -> bool:
@@ -398,13 +453,19 @@ def _add_missingness_indicators(X):
 
 
 def _impute_with_medians(X, medians):
-    """Replace NaN values with precomputed medians."""
+    """Replace NaN values with precomputed medians, then zero out any
+    remaining ``+inf`` / ``-inf`` produced by interaction features (e.g.
+    division by zero).  Without the second step XGBoost / LightGBM raise
+    ``Input X contains infinity`` and the model never trains.
+    """
     import numpy as np
     n_features = X.shape[1]
     for col in range(min(n_features, len(medians))):
         mask = np.isnan(X[:, col])
         X[mask, col] = medians[col]
-    return X
+    # Zero out any remaining non-finite values introduced by interaction
+    # features (ratios, products) so the trainer sees a clean matrix.
+    return np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0, copy=False)
 
 
 def _prepare_feature_array(features: dict):
@@ -834,6 +895,10 @@ def train_model(min_samples: int | None = None, *, force: bool = False) -> bool:
 
         meta_model = None
         meta_precision = None
+        meta_recall = None
+        meta_brier = None
+        meta_log_loss = None
+        meta_calibration = None
         if getattr(config, "ML_META_LABEL_ENABLED", True):
             meta_mask = np.isfinite(tb_labels)
             min_meta_n = int(getattr(config, "ML_META_LABEL_MIN_SAMPLES", 300))
@@ -843,22 +908,97 @@ def train_model(min_samples: int | None = None, *, force: bool = False) -> bool:
                     try:
                         primary_pred = model.predict(X_extended).reshape(-1, 1)
                         meta_X = np.column_stack([X_extended[meta_mask], primary_pred[meta_mask]])
-                        meta_model, meta_backend = _build_classifier()
+                        meta_dates = dates[meta_mask].astype(str)
+                        order = np.argsort(meta_dates)
+                        meta_X = meta_X[order]
+                        meta_y = meta_y[order]
+                        meta_dates = meta_dates[order]
                         split = max(int(len(meta_y) * 0.80), 1)
-                        meta_model.fit(meta_X[:split], meta_y[:split])
-                        if split < len(meta_y):
+                        cal_n = len(meta_y) - split
+                        threshold = float(getattr(config, "META_LABEL_STRONG_BUY_MIN_PROB", 0.60))
+                        base_meta_model, meta_backend = _build_classifier()
+
+                        can_calibrate = (
+                            split >= 100
+                            and cal_n >= 100
+                            and len(set(meta_y[:split].tolist())) > 1
+                            and len(set(meta_y[split:].tolist())) > 1
+                        )
+                        if can_calibrate:
+                            base_meta_model.fit(meta_X[:split], meta_y[:split])
+                            method = "isotonic" if cal_n >= 1000 else "sigmoid"
+                            try:
+                                from sklearn.calibration import CalibratedClassifierCV
+
+                                try:
+                                    from sklearn.frozen import FrozenEstimator
+                                    meta_model = CalibratedClassifierCV(
+                                        FrozenEstimator(base_meta_model),
+                                        method=method,
+                                    )
+                                except Exception:
+                                    meta_model = CalibratedClassifierCV(
+                                        base_meta_model,
+                                        method=method,
+                                        cv="prefit",
+                                    )
+                                meta_model.fit(meta_X[split:], meta_y[split:])
+                                meta_backend = f"{meta_backend}+{method}_calibrated"
+                            except Exception as cal_exc:
+                                logger.debug("Meta-label calibration failed; using raw classifier: %s", cal_exc)
+                                meta_model = base_meta_model
                             prob = meta_model.predict_proba(meta_X[split:])[:, 1]
-                            threshold = float(getattr(config, "META_LABEL_STRONG_BUY_MIN_PROB", 0.60))
-                            pred = (prob >= threshold).astype(int)
-                            selected = pred == 1
-                            if selected.any():
-                                meta_precision = float(meta_y[split:][selected].mean())
-                        meta_model.fit(meta_X, meta_y)
+                            cal_y = meta_y[split:]
+                        else:
+                            meta_model = base_meta_model
+                            meta_model.fit(meta_X, meta_y)
+                            prob = meta_model.predict_proba(meta_X)[:, 1]
+                            cal_y = meta_y
+
+                        pred = (prob >= threshold).astype(int)
+                        selected = pred == 1
+                        if selected.any():
+                            meta_precision = float(cal_y[selected].mean())
+                        positives = int((cal_y == 1).sum())
+                        if positives:
+                            meta_recall = float(((pred == 1) & (cal_y == 1)).sum() / positives)
+                        try:
+                            from sklearn.metrics import brier_score_loss, log_loss
+
+                            meta_brier = float(brier_score_loss(cal_y, prob))
+                            meta_log_loss = float(log_loss(cal_y, np.clip(prob, 1e-6, 1.0 - 1e-6)))
+                        except Exception:
+                            meta_brier = None
+                            meta_log_loss = None
+
+                        meta_calibration = {
+                            "trained_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                            "backend": meta_backend,
+                            "samples": int(len(meta_y)),
+                            "train_samples": int(split if can_calibrate else len(meta_y)),
+                            "calibration_samples": int(cal_n if can_calibrate else 0),
+                            "calibrated": bool(can_calibrate and "calibrated" in meta_backend),
+                            "threshold": threshold,
+                            "positive_rate": float(meta_y.mean()),
+                            "calibration_positive_rate": float(cal_y.mean()),
+                            "precision_at_threshold": meta_precision,
+                            "recall_at_threshold": meta_recall,
+                            "brier": meta_brier,
+                            "log_loss": meta_log_loss,
+                            "probability_distribution": _probability_summary(prob),
+                            "count_at_or_above_threshold": int(selected.sum()),
+                            "date_range": {
+                                "start": str(meta_dates[0]) if len(meta_dates) else None,
+                                "end": str(meta_dates[-1]) if len(meta_dates) else None,
+                            },
+                        }
+                        _write_meta_calibration_report(meta_calibration)
                         logger.info(
-                            "Meta-label classifier trained on %d samples (%s, precision=%s)",
+                            "Meta-label classifier trained on %d samples (%s, precision=%s, brier=%s)",
                             int(meta_mask.sum()),
                             meta_backend,
                             "n/a" if meta_precision is None else f"{meta_precision:.3f}",
+                            "n/a" if meta_brier is None else f"{meta_brier:.3f}",
                         )
                     except Exception as exc:
                         logger.debug("Meta-label classifier training failed: %s", exc)
@@ -871,6 +1011,10 @@ def train_model(min_samples: int | None = None, *, force: bool = False) -> bool:
         _model_cache["ensemble_weight_xgb"] = ensemble_weight_xgb
         _model_cache["oos_rank_ic_lgbm"] = lgbm_ic
         _model_cache["meta_precision"] = meta_precision
+        _model_cache["meta_recall"] = meta_recall
+        _model_cache["meta_brier"] = meta_brier
+        _model_cache["meta_log_loss"] = meta_log_loss
+        _model_cache["meta_calibration"] = meta_calibration
         _model_cache["medians"] = medians
         _model_cache["missing_cols_mask"] = missing_cols_mask
         _model_cache["trained_at"] = time.time()
@@ -984,6 +1128,10 @@ def get_diagnostics() -> dict:
         "oos_rank_ic_lgbm": _model_cache.get("oos_rank_ic_lgbm"),
         "oos_r_squared": _model_cache.get("oos_r_squared"),
         "meta_precision": _model_cache.get("meta_precision"),
+        "meta_recall": _model_cache.get("meta_recall"),
+        "meta_brier": _model_cache.get("meta_brier"),
+        "meta_log_loss": _model_cache.get("meta_log_loss"),
+        "meta_calibration": _model_cache.get("meta_calibration"),
         "promotion_eligible": bool(_model_cache.get("promotion_eligible", False) or metric_eligible),
         "trained_at": _model_cache.get("trained_at", 0),
         "n_features": len(FEATURE_COLS),

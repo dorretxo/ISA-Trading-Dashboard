@@ -297,6 +297,11 @@ def build_alert_email(
     artifact_timestamps = artifact_timestamps or {}
     discovery_packets = sort_trade_packets(discovery_candidates or [])
     lead_packet = discovery_packets[0] if discovery_packets else None
+    strong_buy_packets = [p for p in discovery_packets if p.get("action") == "STRONG BUY"]
+    lead_strong_buy = next(
+        (p for p in strong_buy_packets if p.get("trade_ready")),
+        strong_buy_packets[0] if strong_buy_packets else None,
+    )
 
     # --- Subject line ---
     parts = []
@@ -308,6 +313,17 @@ def build_alert_email(
         top_action = top["candidate"].get("action", "NEUTRAL")
         top_verb = "buy" if top_action in ("BUY", "STRONG BUY") else "review"
         parts.append(f"Swap: {top_verb} {top['candidate']['ticker']} +{top['score_delta']:.2f} delta")
+    if lead_strong_buy:
+        # Name up to 3 STRONG BUY tickers in subject so the user sees the
+        # full slate at a glance — was previously naming only the lead and
+        # appending "+N", which made multi-emission days look like
+        # one-emission days.
+        sb_named = [p["ticker"] for p in strong_buy_packets[:3]]
+        sb_remaining = max(0, len(strong_buy_packets) - len(sb_named))
+        sb_label = ", ".join(sb_named)
+        extra = f" +{sb_remaining}" if sb_remaining else ""
+        suffix = " ready" if lead_strong_buy.get("trade_ready") else ""
+        parts.append(f"Discovery: {sb_label} STRONG BUY{extra}{suffix}")
     if not parts and lead_packet:
         if lead_packet.get("trade_ready"):
             parts.append(f"Discovery: {lead_packet['ticker']} ready")

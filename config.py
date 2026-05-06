@@ -111,6 +111,63 @@ OPTIMIZER_METHOD_WEIGHT_MIN = 0.05                # Floor per method in the ense
 OPTIMIZER_METHOD_WEIGHT_MAX = 0.50                # Cap per method in the ensemble
 OPTIMIZER_BL_TAU = 0.05                           # Black-Litterman prior scaling
 
+# --- Cold-start STRONG BUY scorecard (Hull 2018 / Patton-Timmermann 2009) ---
+# Replaces the conjunctive 10-predicate AND-gate with a continuous
+# cross-sectional weighted score.  Trap-safeguard and V2-reject vetoes still
+# apply (they exclude candidates from the scoring cohort entirely).
+STRONG_BUY_SCORECARD_ENABLED = True                # Master toggle for parallel promotion path
+STRONG_BUY_SCORECARD_TOP_PCT = 0.05                # Top-N% by sb_score eligible for STRONG BUY
+STRONG_BUY_SCORECARD_MIN_Z = 0.50                  # Minimum sb_score (z-score scale) to promote
+SB_SCORECARD_W_AGG = 0.40                          # weight: aggregate_score (z)
+SB_SCORECARD_W_FSCORE = 0.15                       # weight: f_score / 9 (z, coverage-gated)
+SB_SCORECARD_W_GPA = 0.10                          # weight: gross profitability (z)
+SB_SCORECARD_W_META = 0.10                         # weight: meta_success_prob (raw)
+SB_SCORECARD_W_PRIOR = 0.10                        # weight: institutional prior percentile (z)
+SB_SCORECARD_W_MOM = 0.05                          # weight: momentum_factor_score (z)
+SB_SCORECARD_W_QUAL = 0.05                         # weight: quality_factor_score (z)
+SB_SCORECARD_W_VAL = 0.05                          # weight: value_factor_score (z)
+SB_SCORECARD_STRETCH_PENALTY = 0.20                # penalty per unit above stretch threshold
+SB_SCORECARD_STRETCH_THRESHOLD = 0.50              # SMA200 stretch above which penalty kicks in
+# Post-action-gates "high-conviction" override: restore STRONG BUY when the
+# additive scorecard evidence is overwhelming, even if a single Tier gate
+# flagged a single-axis problem (F-score, EV/EBIT, entry-stance).
+STRONG_BUY_SCORECARD_OVERRIDE_ENABLED = True
+STRONG_BUY_SCORECARD_OVERRIDE_Z = 1.0              # min sb_score (z) to override gate cap
+STRONG_BUY_SCORECARD_OVERRIDE_TOP_N = 5            # max candidates restored per run
+
+# --- Conformal prediction (Vovk-Gammerman-Shafer 2005, Angelopoulos-Bates 2021)
+CONFORMAL_ENABLED = True                           # Compute conformal p-value per candidate
+CONFORMAL_CALIBRATION_DAYS = 365                   # Look-back window for calibration set
+CONFORMAL_MIN_CALIBRATION_N = 50                   # Min mature 90d returns to enable
+CONFORMAL_K_IC_FALLBACK = 0.10                     # Fallback k_ic when Fama-MacBeth unavailable
+
+# --- Multi-horizon IC weighting (Lo & MacKinlay 1990, Hou-Xue-Zhang 2017) ---
+# Combines 5d/10d/30d/60d/90d IC via information half-life so the system
+# responds to regime change in days (not quarters) while anchoring on 90d.
+ADAPTIVE_WEIGHTS_MULTI_HORIZON_ENABLED = True
+MULTI_HORIZON_IC_WEIGHTS = {                       # weight per horizon
+    "5d": 0.20,
+    "10d": 0.30,
+    "30d": 0.30,
+    "60d": 0.10,
+    "90d": 0.10,
+}
+MULTI_HORIZON_IC_MIN_SAMPLES = 20                  # Per-horizon sample floor
+# Pillar-IC floor: 0.05 (legacy) flattened weights to equal because realistic
+# equity-factor ICs are 0.01-0.03 (Grinold-Kahn 2000).  Lower floor preserves
+# differentiation while still preventing single-pillar zero-out.
+ADAPTIVE_WEIGHTS_IC_FLOOR = 0.01
+
+# --- Active labelling (Settles 2010, Cohn-Atlas-Ladner 1994) ---
+# Records candidates whose sb_score lies just-below STRONG BUY override so
+# their realised 90d returns become high-information-gain training samples
+# for boundary refinement.  Uncertainty sampling near the decision boundary
+# is 3-10× more label-efficient than random.
+ACTIVE_LABEL_ENABLED = True
+ACTIVE_LABEL_SB_SCORE_LOW = 0.70                   # lower bound of borderline band
+ACTIVE_LABEL_SB_SCORE_HIGH = 1.00                  # equals STRONG_BUY_SCORECARD_OVERRIDE_Z
+ACTIVE_LABEL_MAX_RECORDS = 25                      # cap per run (sector-stratified)
+
 # --- Enterprise factor bundle (roadmap items #1-#10) -----------------------
 ENTERPRISE_FACTORS_ENABLED = True                  # Master toggle
 EV_EBIT_YIELD_ANCHOR = 0.10                        # 10% EBIT/EV is median
@@ -168,6 +225,13 @@ PIT_BACKFILL_DEFAULT_QUARTERS = 40                 # 10 years of quarterly state
 HISTORICAL_PRICE_CACHE_DIR = "feature_cache/price_history"
 PRICE_CACHE_BATCH_SIZE = 75
 HISTORICAL_REPLAY_SOURCE = "replay_pit_v1"
+HISTORICAL_REPLAY_FRESH_REPORT_PATH = "feature_cache/replay_parity_refresh.json"
+HISTORICAL_REPLAY_FRESH_DEFAULT_TOP_N = 250
+HISTORICAL_REPLAY_FRESH_DEFAULT_DAYS = 7
+HISTORICAL_REPLAY_CROSS_SECTIONAL_MOMENTUM = False  # Shadow-only; latest parity run showed worse momentum alignment.
+HISTORICAL_REPLAY_TTM_MIN_QUARTER_GAP_DAYS = 45
+HISTORICAL_REPLAY_TTM_MAX_QUARTER_GAP_DAYS = 130
+HISTORICAL_REPLAY_TTM_GPA_MAX = 1.50
 
 # Trade-aware labels (Lopez de Prado triple-barrier method). These are used by
 # the learner before enough live 30d returns mature, and are also persisted for
@@ -184,7 +248,20 @@ ML_META_LABEL_ENABLED = True
 ML_META_LABEL_MIN_SAMPLES = 300
 META_LABEL_STRONG_BUY_GATE_ENABLED = True
 META_LABEL_STRONG_BUY_MIN_PROB = 0.60
+META_LABEL_STRONG_BUY_DYNAMIC_THRESHOLD = True
+META_LABEL_STRONG_BUY_DYNAMIC_FLOOR = 0.55
+META_LABEL_STRONG_BUY_DYNAMIC_PCTILE = 0.90
+META_LABEL_STRONG_BUY_DYNAMIC_MULTIPLIER = 0.92
+META_LABEL_STRONG_BUY_DYNAMIC_MIN_CANDIDATES = 20
+META_LABEL_STRONG_BUY_DYNAMIC_COMPRESSED_FLOOR = 0.45
+META_LABEL_STRONG_BUY_DYNAMIC_COMPRESSED_PCTILE = 0.95
 META_LABEL_RANK_MULTIPLIER_ON_FAIL = 0.90
+META_LABEL_CORE_READY_DYNAMIC_THRESHOLD = True
+META_LABEL_CORE_READY_DYNAMIC_MIN_CANDIDATES = 2
+META_LABEL_CORE_READY_DYNAMIC_FLOOR = 0.45
+META_LABEL_CORE_READY_DYNAMIC_PCTILE = 0.50
+META_LABEL_CORE_READY_DYNAMIC_MULTIPLIER = 0.98
+META_LABEL_CORE_READY_DYNAMIC_MAX_THRESHOLD = 0.55
 ML_REGIME_ENSEMBLE_ENABLED = True
 ML_REGIME_MIN_SAMPLES = 250
 ML_REGIME_BLEND_PCT = 0.35
@@ -216,6 +293,21 @@ READY_STRONG_BUY_ALLOW_MISSING_DATA_REVIEW = True
 READY_STRONG_BUY_MIN_RR = 1.50
 READY_STRONG_BUY_MIN_CONFIDENCE = 0.70
 READY_STRONG_BUY_MIN_POSITION_WEIGHT = 0.005
+READY_STRONG_BUY_PRIOR_SOFT_PASS_ENABLED = True
+READY_STRONG_BUY_PRIOR_SOFT_PERCENTILE = 0.80
+READY_STRONG_BUY_PRIOR_SOFT_CONFIDENCE = 0.55
+READY_STRONG_BUY_PRIOR_SOFT_COVERAGE = 0.40
+READY_STRONG_BUY_PRIOR_SOFT_MIN_SCORE = 0.00
+READY_STRONG_BUY_NEAR_READY_MIN_SCORE = 0.70
+READY_STRONG_BUY_CALIBRATION_REPORT_PATH = "feature_cache/ready_contract_calibration.json"
+READY_STRONG_BUY_VETO_REPORT_PATH = "feature_cache/final_strong_buy_veto_report.json"
+DISCOVERY_LIVE_SANITY_REPORT_PATH = "feature_cache/live_run_sanity.json"
+DISCOVERY_SWAPS_REQUIRE_ENTRY_READY = True
+REPLAY_LIVE_PARITY_REPORT_PATH = "feature_cache/replay_live_parity_report.json"
+REPLAY_LIVE_PARITY_TOLERANCE = 0.15
+REPLAY_LIVE_PARITY_MAX_DATE_GAP_DAYS = 7
+READY_ENTRY_NEAR_HIGH_PULLBACK_RET30 = 0.12
+READY_ENTRY_NEAR_HIGH_MIN_UPSIDE = 8.0
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Action-label hard gates (calibrated against SEB SA / Trustpilot 2026 review).
@@ -225,6 +317,8 @@ READY_STRONG_BUY_MIN_POSITION_WEIGHT = 0.005
 # ═══════════════════════════════════════════════════════════════════════════════
 ACTION_GATES_ENABLED = True            # Master toggle for Tier 1-4 action gates
 ACTION_GATES_SHADOW = False            # When True, log gate failures but don't downgrade
+ACTION_GATES_SECTOR_RELATIVE_QUALITY_PCTILES = True
+ACTION_GATES_SECTOR_RELATIVE_MIN_N = 8
 
 # Tier 1 — distress / quality-of-earnings (Altman 1968; Beneish 1999;
 # Piotroski 2000; Sloan 1996; Cooper-Gulen-Schill 2008).
@@ -276,12 +370,19 @@ RSI_NEUTRAL_CAP = 80                     # RSI above this caps action at NEUTRAL
 STRETCH_200DMA_STRONG_BUY_MAX = 0.35     # > +35% above 200-DMA caps at BUY-with-limit
 ENTRY_STANCE_BLOCKS_STRONG_BUY = True    # Honour "Pullback Preferred" as a hard block
 MOMENTUM_VOL_SCALING_ENABLED = True
+ACTION_GATES_CORE_READY_STRETCH_OVERRIDE_ENABLED = True
+ACTION_GATES_CORE_READY_STRETCH_MAX = 0.40
+ACTION_GATES_CORE_READY_STRETCH_MIN_RR = 2.0
+ACTION_GATES_CORE_READY_STRETCH_MIN_SCORE = 0.95
 
 # Tier 5 — self-learning threshold ensemble (Russo-Van Roy 2014;
 # Helmbold-Schapire-Singer-Warmuth 1998; López de Prado-Bailey 2014).
 THRESHOLD_LEARNER_ENABLED = True
 THRESHOLD_LEARNER_PROFILE = "moderate"   # "conservative" | "moderate" | "aggressive"
 THRESHOLD_LEARNER_STATE_FILE = "feature_cache/threshold_learner_state.json"
+THRESHOLD_LEARNER_UPDATE_REPORT_PATH = "feature_cache/threshold_learner_update_report.json"
+THRESHOLD_LEARNER_INFER_MISSING_PROFILE = True
+THRESHOLD_LEARNER_MISSING_PROFILE_FALLBACK = "moderate"
 THRESHOLD_PSR_MIN_TO_DEPLOY = 0.95
 SLEEVE_WEIGHTS_LEARNER = "exponentiated_gradient"
 SLEEVE_WEIGHTS_LEARNING_RATE = 0.05
@@ -382,7 +483,15 @@ DISCOVERY_INFO_TIMEOUT_SECONDS = 8      # Per-ticker .info timeout before fallin
 DISCOVERY_INFO_PREFETCH_TIMEOUT_SECONDS = 150  # Total .info prefetch budget before fail-fast
 DISCOVERY_INFO_CIRCUIT_MIN_SAMPLE = 50  # Minimum responses before empty-rate circuit breaker can fire
 DISCOVERY_INFO_EMPTY_RATE_CIRCUIT = 0.85  # Treat broad empty .info responses as provider block
+DISCOVERY_YAHOO_METADATA_POLICY = "cache_only"  # cache_only | live_fallback; avoid Yahoo quoteSummary crumb blocks in live discovery
+DISCOVERY_YAHOO_METADATA_HEALTH_PATH = "feature_cache/yahoo_metadata_health.json"
+DISCOVERY_IDENTITY_WARNING_ALLOW_YAHOO_NETWORK = False
+DISCOVERY_RISK_OVERLAY_ALLOW_YAHOO_EARNINGS = False
 DISCOVERY_STAGE5B_FMP_TOPUP_MAX_CALLS = 60  # Bound sequential FMP top-up calls in quick rank
+DISCOVERY_STAGE5B_FMP_TOPUP_TIME_BUDGET = 90  # Bound slow sequential FMP top-ups in quick rank
+DISCOVERY_STAGE5B_SCORING_TIMEOUT = 900  # Internal budget for Stage 5b scoring loop
+DISCOVERY_STAGE5B_MIN_SCORED_FOR_TIMEOUT = 100  # Minimum scored before deadline can return partial panel
+DISCOVERY_STAGE5B_PIT_BATCH_RECORD = True  # Batch live PIT writes instead of rewriting JSON per ticker
 DISCOVERY_USE_ETF_DECOMPOSITION = True  # Enable ETF holdings decomposition for universe expansion
 DISCOVERY_RECONSTITUTE_UNIVERSE_ENABLED = True  # Refresh dynamic supplement before discovery
 DISCOVERY_RECONSTITUTE_TTL_HOURS = 24   # Skip expensive universe validation when cache is fresh
@@ -415,6 +524,22 @@ DISCOVERY_EXCLUDED_TICKERS = {
     "032830.KS", "034730.KS", "051910.KS", "055550.KS", "066570.KS",
     "096770.KS", "105560.KS", "SSNLF", "SMSN.IL", "SMSD.IL",
     "PKX", "KB", "WF", "SHG", "KT", "SKM", "LPL",
+}
+DISCOVERY_TICKER_ALIASES = {
+    # Static benchmark constituents can use exchange tickers that Yahoo does
+    # not price directly. Resolve them before universe membership and pricing.
+    "BAE.L": "BA.L",        # BAE Systems
+    "CMC.L": "CMCX.L",      # CMC Markets
+    "DSM.AS": "DSFIR.AS",   # dsm-firmenich after DSM/Firmenich merger
+}
+DISCOVERY_TICKER_QUARANTINE = {
+    # Current Yahoo no-data symbols from `python -m utils.validate_universe`
+    # on 2026-05-03. Aliasable names are handled above instead of quarantined.
+    "0011.HK", "1COV.DE", "AHT.L", "ARMN", "BDEV.L", "BPSO.MI", "BVIC.L",
+    "CINE.L", "CRH.L", "CSGN.SW", "DARK.L", "GFI.PA",
+    "GPAY.L", "ICP.L", "ILD.PA", "MGGT.L", "NCM.AX", "PHNX.L",
+    "SGC.L", "SMDS.L", "SNDR.L", "STM.MI", "STM.PA", "TKWY.AS",
+    "URW.AS", "WIN.L",
 }
 
 # Stage 2 institutional cheap-screen sleeves.  These reserve part of the
@@ -462,8 +587,20 @@ DISCOVERY_FULL_SCORE_LENS_MIN_COUNTS = {
     "composite": 40,
     "momentum": 60,
 }
+DISCOVERY_FULL_SCORE_READY_LANE_ENABLED = True
+DISCOVERY_FULL_SCORE_READY_LANE_PCT = 0.30
+DISCOVERY_FULL_SCORE_READY_LANE_MIN_SCORE = 0.58
+DISCOVERY_FULL_SCORE_READY_LANE_MAX_REPLACE_PCT = 0.45
 DISCOVERY_FULL_SCORE_READY_RESERVE = 25
-DISCOVERY_FULL_SCORE_READY_MIN_SCORE = 0.20
+DISCOVERY_FULL_SCORE_READY_MIN_SCORE = 0.55
+DISCOVERY_FULL_SCORE_CHEAP_QUALITY_RESERVE_ENABLED = True
+DISCOVERY_FULL_SCORE_CHEAP_QUALITY_RESERVE = 20
+DISCOVERY_FULL_SCORE_CHEAP_QUALITY_MIN_SCORE = 0.55
+DISCOVERY_FUNDAMENTAL_REFRESH_QUEUE_MAX = 200
+DISCOVERY_FUNDAMENTAL_REFRESH_QUEUE_MIN_PRIORITY = 1.0
+DISCOVERY_FUNDAMENTAL_REFRESH_QUEUE_PATH = "feature_cache/fundamental_refresh_queue.json"
+DISCOVERY_FUNDAMENTAL_REFRESH_RESULTS_PATH = "feature_cache/fundamental_refresh_results.json"
+DISCOVERY_FUNDAMENTAL_REFRESH_MAX_TICKERS = 40
 DISCOVERY_CHALLENGE_RESERVE_ENABLED = True
 DISCOVERY_CHALLENGE_RESERVE_N = 30
 DISCOVERY_CHALLENGE_AUTO_ENABLED = True
@@ -575,6 +712,7 @@ EMAIL_PASSWORD = os.environ.get("EMAIL_PASSWORD", "")   # app password
 # Orchestrator scheduling
 ORCHESTRATOR_DISCOVERY_FREQ_DAYS = 1   # Fallback: max days between runs (overridden by day-of-week)
 ORCHESTRATOR_DISCOVERY_DAYS = [0, 1, 2, 3, 4]  # Mon-Fri (0=Mon ... 4=Fri)
+DISCOVERY_REQUIRED_BENCHMARKS = ("SP500", "SPMIDCAP400")
 
 # Decision logic — swap hurdle rates
 HURDLE_RATE = 0.20             # candidate.aggregate_score must beat weakest by this margin
@@ -640,7 +778,10 @@ GOVERNANCE_FLAG_THRESHOLD = 3               # Number of warning signals to trigg
 
 # ML ranker guardrails — keep conservative until walk-forward sample is larger
 ML_RANKER_MIN_SAMPLES = 300                 # Minimum evaluated signals before ML can train live
-ML_RANKER_BLEND_PCT = 0.15                  # Small live blend when enabled
+ML_RANKER_BLEND_PCT = 0.30                  # Increased 0.15→0.30 after IC study confirmed
+                                             # ML rank-IC=0.16 vs aggregate_score IC≈-0.01.
+                                             # ML signal has 16x better IC; 30% blend is the
+                                             # mid-point between conservative 15% and 50%.
 ML_RANKER_SHADOW_ONLY = False               # Live when enough data exists; still degrades gracefully
 ML_RANKER_SURFACE_SHADOW = True             # Cache ML scores even when live blend is disabled/blocked
 ML_RANKER_META_PROBA_FOR_ALL = True         # Cache meta-label probability for every deep-scored candidate

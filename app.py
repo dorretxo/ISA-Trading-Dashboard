@@ -687,6 +687,22 @@ def _help(key: str) -> str:
     return _HELP_TEXT.get(key, "")
 
 
+@st.cache_data(ttl=60)
+def _load_live_sanity_report() -> dict:
+    path = Path(__file__).parent / getattr(
+        config,
+        "DISCOVERY_LIVE_SANITY_REPORT_PATH",
+        "feature_cache/live_run_sanity.json",
+    )
+    try:
+        if path.exists():
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            return raw if isinstance(raw, dict) else {}
+    except Exception:
+        return {}
+    return {}
+
+
 def _action_next_step(action: str, stance: str | None = None) -> str:
     action_code = str(action or "").upper()
     stance_code = str(stance or "").lower()
@@ -1129,12 +1145,34 @@ def _render_candidate_detail_card(cand, label: str = "Selected") -> None:
         + (f" | {format_currency(_mcap / 1e9, 'GBP', decimals=1)}B mcap" if _mcap > 0 else "")
     )
     _top_pick_chip = '<span class="top-pick-badge">&#9733; Top Pick</span>' if _top_pick else ''
+    # Scorecard + conformal transparency chips (cold-start fix Phase 2 Steps 4 + 5).
+    _sb_score = safe_float(getattr(cand, "sb_score", None), default=None)
+    _conformal_p = safe_float(getattr(cand, "conformal_p", None), default=None)
+    _scorecard_chip = ""
+    if _sb_score is not None:
+        _sb_tone = "buy" if _sb_score >= 1.0 else ("data" if _sb_score >= 0.5 else "neutral")
+        _scorecard_chip = (
+            f'<span class="signal-badge {_sb_tone}" '
+            f'title="STRONG BUY scorecard composite (z-score across 8 pillar+factor inputs).">'
+            f'SB Score: {_sb_score:+.2f}σ</span>'
+        )
+    _conformal_chip = ""
+    if _conformal_p is not None:
+        _confidence_pct = max(0.0, min(1.0, 1.0 - _conformal_p))
+        _cp_tone = "buy" if _conformal_p < 0.05 else ("data" if _conformal_p < 0.25 else "neutral")
+        _conformal_chip = (
+            f'<span class="confidence-chip {_cp_tone}" '
+            f'title="Conformal upper-tail probability (Vovk-Gammerman-Shafer 2005).">'
+            f'Conformal: {_confidence_pct:.0%}</span>'
+        )
     _badge_html = (
         f'<div class="badge-row">'
         f'{_top_pick_chip}'
         f'<span class="signal-badge {_action_tone}">{_html.escape(_plain_action(_action))}</span>'
         f'<span class="signal-badge {_entry_tone}">{_html.escape(_entry_stance)}</span>'
         f'<span class="confidence-chip {_conf_tone}">{_html.escape(_conf_label)}</span>'
+        f'{_scorecard_chip}'
+        f'{_conformal_chip}'
         f'</div>'
     )
     _hero_class = "rec-hero top-pick" if _top_pick else "rec-hero"
@@ -1402,7 +1440,7 @@ with st.sidebar:
     st.markdown("### What to do")
 
     # Refresh triggers live recomputation; normal load uses cache
-    _force_refresh = st.button("Refresh recommendations", use_container_width=True, type="primary")
+    _force_refresh = st.button("Refresh recommendations", width="stretch", type="primary")
     if _force_refresh:
         clear_cache()
 
@@ -1607,7 +1645,7 @@ with tab_dashboard:
             )
             st.plotly_chart(
                 fig_donut,
-                use_container_width=True,
+                width="stretch",
                 config={"displayModeBar": False},
                 key="portfolio_action_donut_chart",
             )
@@ -1620,6 +1658,42 @@ with tab_dashboard:
     ]):
         cnt = action_counts[action_name]
         act_cols[i].metric(_plain_action(action_name), cnt)
+
+    _disc_packets = sort_trade_packets(_dash.cached_discovery or [])
+    _disc_strong = [p for p in _disc_packets if p.get("action") == "STRONG BUY"]
+    _sanity_report = _load_live_sanity_report()
+    if _dash.cached_discovery or _sanity_report:
+        st.markdown("#### Latest screener handoff")
+        if _disc_strong:
+            st.success(
+                f"{len(_disc_strong)} STRONG BUY from the latest screener: "
+                f"{', '.join(p['ticker'] for p in _disc_strong[:5])}"
+            )
+            _strong_rows = []
+            for packet in _disc_strong[:5]:
+                _strong_rows.append({
+                    "Ticker": packet["ticker"],
+                    "Status": "Ready now" if packet.get("trade_ready") else packet.get("entry_stance", ""),
+                    "Opportunity score": f"{safe_float(packet.get('final_rank')):.3f}",
+                    "Entry": _format_price(packet.get("entry_price"), packet.get("currency", "USD")),
+                    "Stop": _format_price(packet.get("stop_loss"), packet.get("currency", "USD")),
+                    "Target": _format_price(packet.get("take_profit"), packet.get("currency", "USD")),
+                    "Reward/risk": f"{safe_float(packet.get('r_r_ratio')):.1f}x" if packet.get("r_r_ratio") else "-",
+                    "Portfolio fit": f"{safe_float(packet.get('portfolio_fit_score')):.2f}",
+                })
+            st.dataframe(pd.DataFrame(_strong_rows), hide_index=True, width="stretch")
+        elif _dash.cached_discovery:
+            _buy_count = sum(1 for p in _disc_packets if p.get("action") == "BUY")
+            st.info(f"No STRONG BUY in the latest screener cache. BUY candidates: {_buy_count}.")
+
+        if _sanity_report:
+            _warnings = _sanity_report.get("warnings") or []
+            if _warnings:
+                st.warning("Handoff check needs review: " + " | ".join(str(w) for w in _warnings[:3]))
+            else:
+                _db_count = (_sanity_report.get("signal_backtest") or {}).get("strong_buy_count", 0)
+                _email_count = (_sanity_report.get("email") or {}).get("strong_buy_count_visible", 0)
+                st.caption(f"Handoff check passed | Email visible: {_email_count} | Backtest ledger: {_db_count}")
 
     # Portfolio health gauge
     gauge_fig = go.Figure(go.Indicator(
@@ -1642,7 +1716,7 @@ with tab_dashboard:
     gauge_fig.update_layout(**{**_PLOTLY_LAYOUT, "margin": dict(l=30, r=30, t=50, b=10)}, height=160)
     st.plotly_chart(
         gauge_fig,
-        use_container_width=True,
+        width="stretch",
         config={"displayModeBar": False},
         key="portfolio_health_gauge_chart",
     )
@@ -1674,7 +1748,7 @@ with tab_dashboard:
                     )
                     st.plotly_chart(
                         sector_fig,
-                        use_container_width=True,
+                        width="stretch",
                         config={"displayModeBar": False},
                         key="portfolio_sector_allocation_chart",
                     )
@@ -1698,7 +1772,7 @@ with tab_dashboard:
                     )
                     st.plotly_chart(
                         corr_fig,
-                        use_container_width=True,
+                        width="stretch",
                         config={"displayModeBar": False},
                         key="portfolio_correlation_heatmap",
                     )
@@ -1777,7 +1851,7 @@ with tab_dashboard:
                         for s in _stress
                     ]
                     st.caption("**Historical stress replays** - how the current portfolio would have behaved in past selloffs.")
-                    st.dataframe(_sc_rows, use_container_width=True, hide_index=True)
+                    st.dataframe(_sc_rows, width="stretch", hide_index=True)
                     if _worst and _worst.get("portfolio_return", 0) < -0.15:
                         st.warning(
                             f"Worst historical replay '{_worst['name']}': "
@@ -1898,7 +1972,7 @@ with tab_dashboard:
             )
             st.plotly_chart(
                 alloc_fig,
-                use_container_width=True,
+                width="stretch",
                 config={"displayModeBar": False},
                 key="portfolio_allocation_comparison_chart",
             )
@@ -1914,7 +1988,7 @@ with tab_dashboard:
                 }
                 for pw in position_weights
             ])
-            st.dataframe(alloc_df, hide_index=True, use_container_width=True)
+            st.dataframe(alloc_df, hide_index=True, width="stretch")
 
     # ---------------------------------------------------------------------------
     # Portfolio Optimizer (Ensemble) — from cache or live
@@ -1992,12 +2066,12 @@ with tab_dashboard:
                 with mwc1:
                     st.plotly_chart(
                         _mw_fig,
-                        use_container_width=True,
+                        width="stretch",
                         config={"displayModeBar": False},
                         key="portfolio_optimizer_method_weights_chart",
                     )
                 with mwc2:
-                    st.dataframe(pd.DataFrame(_mw_rows), hide_index=True, use_container_width=True)
+                    st.dataframe(pd.DataFrame(_mw_rows), hide_index=True, width="stretch")
 
             for w in _opt_data.get("warnings", []):
                 st.info(w)
@@ -2027,7 +2101,7 @@ with tab_dashboard:
             )
             st.plotly_chart(
                 _opt_fig,
-                use_container_width=True,
+                width="stretch",
                 config={"displayModeBar": False},
                 key="portfolio_optimizer_allocation_chart",
             )
@@ -2044,7 +2118,7 @@ with tab_dashboard:
                 "Sector": h.get("sector", ""),
                 "FX Cost": format_pct(safe_float(h['fx_cost_if_rebalanced']) * 100, decimals=2, plus_sign=False) if safe_float(h.get("fx_cost_if_rebalanced", 0)) > 0 else "—",
             } for h in _opt_h])
-            st.dataframe(_opt_rows, hide_index=True, use_container_width=True)
+            st.dataframe(_opt_rows, hide_index=True, width="stretch")
 
             # Per-method comparison (ensemble only)
             if _is_ensemble and _per_method_w:
@@ -2069,7 +2143,7 @@ with tab_dashboard:
                     _row["Ensemble"] = format_pct(safe_float(h["optimal_weight"]) * 100, plus_sign=False)
                     _per_method_rows.append(_row)
                 st.markdown("**Per-method weights** — side-by-side comparison")
-                st.dataframe(pd.DataFrame(_per_method_rows), hide_index=True, use_container_width=True)
+                st.dataframe(pd.DataFrame(_per_method_rows), hide_index=True, width="stretch")
 
             # Rebalance trades
             _trades = _opt_data.get("rebalance_trades", [])
@@ -2178,7 +2252,7 @@ with tab_holdings:
                 "Exit warning": _exit_flag,
             })
         with st.expander(f"Summary table ({len(_summary_rows)} holdings)", expanded=False):
-            st.dataframe(_summary_rows, use_container_width=True, hide_index=True)
+            st.dataframe(_summary_rows, width="stretch", hide_index=True)
 
     # ---------------------------------------------------------------------------
     # Holding cards
@@ -2525,7 +2599,7 @@ with tab_holdings:
                         )
                         st.plotly_chart(
                             fig_ov,
-                            use_container_width=True,
+                            width="stretch",
                             config={"displayModeBar": False},
                             key=f"holding_overview_chart_{r['ticker'].replace('.', '_')}",
                         )
@@ -2657,7 +2731,7 @@ with tab_holdings:
                         )
                         st.plotly_chart(
                             fig_radar,
-                            use_container_width=True,
+                            width="stretch",
                             config={"displayModeBar": False},
                             key=f"holding_radar_chart_{r['ticker'].replace('.', '_')}",
                         )
@@ -2890,7 +2964,7 @@ with tab_holdings:
                             )
                             st.plotly_chart(
                                 fig_expert,
-                                use_container_width=True,
+                                width="stretch",
                                 config={"displayModeBar": False},
                                 key=f"forecast_expert_weights_{r['ticker'].replace('.', '_')}_{horizon}",
                             )
@@ -2909,7 +2983,7 @@ with tab_holdings:
                                     "Influence": f"{weight:.1%}",
                                     "Avg miss": f"{mae_val:.2f}" if mae_val is not None else "-",
                                 })
-                            st.dataframe(pd.DataFrame(expert_rows), hide_index=True, use_container_width=True)
+                            st.dataframe(pd.DataFrame(expert_rows), hide_index=True, width="stretch")
 
                         # Long-horizon forecast (if available)
                         if r.get("forecast_price_long") is not None:
@@ -2970,7 +3044,7 @@ with tab_analytics:
                 "Portfolio value": format_currency(_pv, "GBP", decimals=0),
                 "Gain / loss": format_currency(_pv - safe_float(_proj.current_value), "GBP", decimals=0),
             })
-        st.dataframe(pd.DataFrame(ci_data), hide_index=True, use_container_width=True)
+        st.dataframe(pd.DataFrame(ci_data), hide_index=True, width="stretch")
 
         # Per-ticker breakdown
         st.markdown("#### Holding-level outlook")
@@ -2988,7 +3062,7 @@ with tab_analytics:
                 "Chance of gain": f"{safe_float(tp.prob_positive):.0%}",
                 "Annual volatility": f"{safe_float(tp.annual_volatility):.0%}",
             })
-        st.dataframe(pd.DataFrame(ticker_rows), hide_index=True, use_container_width=True)
+        st.dataframe(pd.DataFrame(ticker_rows), hide_index=True, width="stretch")
 
         # Swap impact analysis — uses cached discovery candidates from orchestrator state
         st.markdown("#### Swap impact")
@@ -3123,7 +3197,7 @@ with tab_analytics:
                     fig_mae.update_traces(hovertemplate="%{y}: average miss %{x:.2f}<extra></extra>")
                     st.plotly_chart(
                         fig_mae,
-                        use_container_width=True,
+                        width="stretch",
                         config={"displayModeBar": False},
                         key="forecast_mae_chart",
                     )
@@ -3137,7 +3211,7 @@ with tab_analytics:
                             break
 
                 with st.expander("Full forecast-miss table"):
-                    st.dataframe(mae_df, use_container_width=True)
+                    st.dataframe(mae_df, width="stretch")
 
         # ── Tab 2: Weight Distribution ──
         with tab_weights:
@@ -3176,7 +3250,7 @@ with tab_analytics:
                     )
                     st.plotly_chart(
                         fig_w,
-                        use_container_width=True,
+                        width="stretch",
                         config={"displayModeBar": False},
                         key="forecast_weight_bar_chart",
                     )
@@ -3206,13 +3280,13 @@ with tab_analytics:
                     )
                     st.plotly_chart(
                         fig_radar_w,
-                        use_container_width=True,
+                        width="stretch",
                         config={"displayModeBar": False},
                         key="forecast_weight_radar_chart",
                     )
 
                 with st.expander("Full model mix table (%)"):
-                    st.dataframe(weight_df, use_container_width=True)
+                    st.dataframe(weight_df, width="stretch")
 
         # ── Tab 3: Signal Impact Analysis ──
         with tab_impact:
@@ -3262,7 +3336,7 @@ with tab_analytics:
                     )
                     st.plotly_chart(
                         fig_impact,
-                        use_container_width=True,
+                        width="stretch",
                         config={"displayModeBar": False},
                         key="forecast_signal_impact_chart",
                     )
@@ -3274,7 +3348,7 @@ with tab_analytics:
                     wcol.metric("Least helpful", worst_expert, f"{impact_series[worst_expert]:+.2f} vs blend", delta_color="inverse")
 
                 with st.expander("Full model-impact table"):
-                    st.dataframe(impact_df, use_container_width=True)
+                    st.dataframe(impact_df, width="stretch")
 
                 st.markdown("---")
                 st.markdown("**Model ranking across the portfolio**")
@@ -3289,7 +3363,7 @@ with tab_analytics:
                         for v in avg_impact.values
                     ],
                 })
-                st.dataframe(summary_df, hide_index=True, use_container_width=True)
+                st.dataframe(summary_df, hide_index=True, width="stretch")
 
         # ── Tab 4: Weight Optimization ──
         with tab_backtest:
@@ -3346,7 +3420,7 @@ with tab_analytics:
                     )
                     st.plotly_chart(
                         fig_wcomp,
-                        use_container_width=True,
+                        width="stretch",
                         config={"displayModeBar": False},
                         key="weight_optimization_comparison_chart",
                     )
@@ -3367,7 +3441,7 @@ with tab_analytics:
                             "Grid Search": "{:.1%}", "Recommended": "{:.1%}",
                             "Change": "{:+.1%}",
                         }),
-                        hide_index=True, use_container_width=True,
+                        hide_index=True, width="stretch",
                     )
 
                     # Summary metrics
@@ -3399,7 +3473,7 @@ with tab_analytics:
                                         else "Weak"
                                     ),
                                 })
-                        st.dataframe(pd.DataFrame(ic_rows), hide_index=True, use_container_width=True)
+                        st.dataframe(pd.DataFrame(ic_rows), hide_index=True, width="stretch")
 
                     # Expandable sections
                     with st.expander("Per-stock score breakdown"):
@@ -3421,7 +3495,7 @@ with tab_analytics:
                                 "Recommendation": _plain_action(_score_to_action(agg)),
                                 f"Actual {config.FORECAST_HORIZON_DAYS}d Return": f"{s.forward_return_pct:+.2f}%",
                             })
-                        st.dataframe(pd.DataFrame(stock_rows), hide_index=True, use_container_width=True)
+                        st.dataframe(pd.DataFrame(stock_rows), hide_index=True, width="stretch")
 
                     with st.expander("Top 10 model-mix combinations"):
                         top_rows = []
@@ -3435,7 +3509,7 @@ with tab_analytics:
                                 "Forecast": f"{w['forecast']:.0%}",
                                 "Fitness": f"{entry['fitness']:.4f}",
                             })
-                        st.dataframe(pd.DataFrame(top_rows), hide_index=True, use_container_width=True)
+                        st.dataframe(pd.DataFrame(top_rows), hide_index=True, width="stretch")
 
                     if opt.skipped_tickers:
                         with st.expander(f"Skipped tickers ({len(opt.skipped_tickers)})"):
@@ -3491,7 +3565,7 @@ with tab_analytics:
                         )
                         st.plotly_chart(
                             fig_roll,
-                            use_container_width=True,
+                            width="stretch",
                             config={"displayModeBar": False},
                             key="forecast_rolling_accuracy_chart",
                         )
@@ -3513,7 +3587,7 @@ with tab_analytics:
                                 "Predictions": stats["count"],
                             })
                         st.dataframe(pd.DataFrame(expert_perf_rows), hide_index=True,
-                                     use_container_width=True)
+                                     width="stretch")
 
                     # Per-ticker breakdown
                     if perf.get("per_ticker"):
@@ -3531,7 +3605,7 @@ with tab_analytics:
                                 "Predictions": stats["count"],
                             })
                         st.dataframe(pd.DataFrame(ticker_perf_rows), hide_index=True,
-                                     use_container_width=True)
+                                     width="stretch")
                 else:
                     st.info(
                         f"Need at least 5 evaluated predictions for performance metrics. "
@@ -3590,6 +3664,64 @@ with tab_discovery:
         )
     except Exception:
         pass  # Regime data unavailable — banner is optional
+
+    with st.expander("Ticker why-not lookup", expanded=False):
+        _why_col1, _why_col2 = st.columns([3, 1])
+        with _why_col1:
+            _why_ticker = st.text_input(
+                "Ticker",
+                value="MLI",
+                key="discovery_why_not_ticker",
+                label_visibility="collapsed",
+            ).upper().strip()
+        with _why_col2:
+            _run_why_not = st.button("Run lookup", width="stretch", key="discovery_why_not_run")
+        if _run_why_not and _why_ticker:
+            try:
+                from utils.ticker_diagnostics import build_ticker_diagnostic, write_ticker_diagnostic
+                _diag = build_ticker_diagnostic(_why_ticker)
+                _diag_path = write_ticker_diagnostic(_why_ticker)
+                st.session_state["discovery_why_not_diag"] = _diag
+                st.session_state["discovery_why_not_path"] = str(_diag_path)
+            except Exception as _diag_err:
+                st.warning(f"Diagnostic failed: {_diag_err}")
+        _diag = st.session_state.get("discovery_why_not_diag")
+        if isinstance(_diag, dict):
+            _univ = _diag.get("universe") or {}
+            _feat = _diag.get("feature_cache") or {}
+            _cached = _diag.get("cached_discovery") or {}
+            _parity = _diag.get("replay_live_parity") or {}
+            _tb = _diag.get("tb_history") or []
+            _wins = sum(int(r.get("rows") or 0) for r in _tb if int(r.get("tb_label") or 0) > 0)
+            _losses = sum(int(r.get("rows") or 0) for r in _tb if int(r.get("tb_label") or 0) < 0)
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Effective universe", "Yes" if _univ.get("in_effective_global_universe") else "No")
+            m2.metric("Latest feature file", "Present" if _feat.get("present_in_latest") else "Absent")
+            m3.metric("Cached rank", _cached.get("rank") or "-")
+            m4.metric("TB wins / losses", f"{_wins} / {_losses}")
+            _diag_path = st.session_state.get("discovery_why_not_path")
+            if _diag_path:
+                st.caption(f"Saved diagnostic: {_diag_path}")
+            _cand = (_cached.get("candidate") or {}) if isinstance(_cached, dict) else {}
+            _blockers = _cand.get("strong_buy_blockers") or _cand.get("ready_contract_reasons") or []
+            if _blockers:
+                st.markdown("**Latest blockers**")
+                st.write(_blockers)
+            if _diag.get("source_summary"):
+                st.markdown("**Signal history**")
+                st.dataframe(pd.DataFrame(_diag["source_summary"]), hide_index=True, width="stretch")
+            if _parity.get("comparisons"):
+                st.markdown("**Replay/live parity**")
+                st.dataframe(pd.DataFrame(_parity["comparisons"]), hide_index=True, width="stretch")
+            if _diag.get("latest_rows"):
+                st.markdown("**Latest stored rows**")
+                _latest_df = pd.DataFrame(_diag["latest_rows"])
+                _cols = [c for c in [
+                    "run_date", "source", "action", "aggregate_score", "final_rank",
+                    "value_factor_score", "quality_factor_score", "institutional_prior_percentile",
+                    "ready_contract_status", "threshold_profile", "tb_label",
+                ] if c in _latest_df.columns]
+                st.dataframe(_latest_df[_cols], hide_index=True, width="stretch")
 
     # Auto-load cached discovery results from dashboard data on first visit
     if "discovery_results" not in st.session_state:
@@ -3682,6 +3814,7 @@ with tab_discovery:
                             earnings_days=c.get("earnings_days"),
                             cap_tier=c.get("cap_tier") or "unknown",
                             confidence_discount=c.get("confidence_discount") or 1.0,
+                            effective_data_confidence=c.get("effective_data_confidence"),
                             max_weight_scale=c.get("max_weight_scale") or 1.0,
                             post_earnings_recent=c.get("post_earnings_recent") or False,
                             post_earnings_days=c.get("post_earnings_days"),
@@ -3708,15 +3841,75 @@ with tab_discovery:
                             kelly_cap_fraction=c.get("kelly_cap_fraction"),
                             support_levels=c.get("support_levels") or {},
                             regime_info=c.get("regime_info") or {},
+                            regime=c.get("regime"),
                             quality_score_fundamental=c.get("quality_score_fundamental") or 0.0,
                             gross_profitability=c.get("gross_profitability"),
                             fcf_to_assets=c.get("fcf_to_assets"),
                             earnings_stability=c.get("earnings_stability"),
                             eps_growth_variance_5y=c.get("eps_growth_variance_5y"),
+                            qmj_factor_score=c.get("qmj_factor_score"),
+                            pead_factor_score=c.get("pead_factor_score"),
+                            sue_score=c.get("sue_score"),
+                            revision_momentum_3m=c.get("revision_momentum_3m"),
+                            bab_factor_score=c.get("bab_factor_score"),
+                            turnover_cost_score=c.get("turnover_cost_score"),
+                            enterprise_value=c.get("enterprise_value"),
+                            ev_ebit=c.get("ev_ebit"),
+                            ev_ebitda=c.get("ev_ebitda"),
+                            ebit_yield=c.get("ebit_yield"),
+                            ev_ebit_score=c.get("ev_ebit_score"),
+                            gpa=c.get("gpa"),
+                            gpa_score=c.get("gpa_score"),
+                            f_score=c.get("f_score"),
+                            f_score_gate=c.get("f_score_gate") or False,
+                            f_score_score=c.get("f_score_score"),
+                            f_score_coverage=c.get("f_score_coverage") or 0.0,
+                            sma_200=c.get("sma_200"),
+                            price_vs_sma200_stretch=c.get("price_vs_sma200_stretch"),
+                            altman_z=c.get("altman_z"),
+                            altman_zone=c.get("altman_zone") or "unknown",
+                            beneish_m=c.get("beneish_m"),
+                            rsi=c.get("rsi"),
+                            action_gate_ceiling=c.get("action_gate_ceiling") or "STRONG BUY",
+                            action_gate_reasons=c.get("action_gate_reasons") or [],
+                            action_gate_flags=c.get("action_gate_flags") or {},
+                            limit_price=c.get("limit_price"),
+                            limit_price_method=c.get("limit_price_method"),
+                            limit_price_rationale=c.get("limit_price_rationale"),
+                            threshold_profile=c.get("threshold_profile") or "moderate",
+                            gate_v2_status=c.get("gate_v2_status") or "PASS",
+                            gate_v2_reasons=c.get("gate_v2_reasons") or [],
+                            trap_safeguard_triggered=c.get("trap_safeguard_triggered") or False,
+                            trap_safeguard_reason=c.get("trap_safeguard_reason"),
+                            institutional_prior_score=c.get("institutional_prior_score") or 0.0,
+                            institutional_prior_percentile=c.get("institutional_prior_percentile") or 0.0,
+                            institutional_prior_confidence=c.get("institutional_prior_confidence") or 0.0,
+                            institutional_prior_coverage=c.get("institutional_prior_coverage") or 0.0,
+                            institutional_prior_components=c.get("institutional_prior_components") or {},
+                            institutional_prior_rank=c.get("institutional_prior_rank") or 0.0,
+                            ready_contract_core_status=c.get("ready_contract_core_status") or "FAIL",
+                            ready_contract_core_reasons=c.get("ready_contract_core_reasons") or [],
+                            ready_contract_status=c.get("ready_contract_status") or "FAIL",
+                            ready_contract_reasons=c.get("ready_contract_reasons") or [],
+                            ready_contract_score=c.get("ready_contract_score"),
+                            ready_contract_soft_passes=c.get("ready_contract_soft_passes") or [],
+                            strong_buy_blockers=c.get("strong_buy_blockers") or [],
+                            strong_buy_eligible=bool(c.get("strong_buy_eligible")),
+                            ready_lane_score=c.get("ready_lane_score"),
+                            ready_lane_missing_fields=c.get("ready_lane_missing_fields") or [],
                             factor_momentum_tilt=c.get("factor_momentum_tilt") or {},
                             network_momentum=c.get("network_momentum"),
                             qa_sentiment_score=c.get("qa_sentiment_score"),
                             ml_alpha_raw=c.get("ml_alpha_raw"),
+                            ml_shadow_score=c.get("ml_shadow_score"),
+                            meta_success_prob=c.get("meta_label_proba"),
+                            sleeve_composite=c.get("sleeve_composite"),
+                            sleeve_momentum=c.get("sleeve_momentum"),
+                            sleeve_quality=c.get("sleeve_quality"),
+                            sleeve_value=c.get("sleeve_value"),
+                            sleeve_low_risk=c.get("sleeve_low_risk"),
+                            sleeve_pead=c.get("sleeve_pead"),
+                            sleeve_ready=c.get("sleeve_ready"),
                             analysis_degraded=c.get("analysis_degraded", False),
                             analysis_degraded_reason=c.get("analysis_degraded_reason"),
                             alpha_rank=c.get("alpha_rank") or 0.0,
@@ -3737,6 +3930,9 @@ with tab_discovery:
                             # Asymmetric / binary outcome flag
                             asymmetric_risk_flag=c.get("asymmetric_risk_flag", False),
                             asymmetric_risk_reason=c.get("asymmetric_risk_reason"),
+                            selection_rank=c.get("selection_rank") or 0.0,
+                            timing_rank=c.get("timing_rank") or 0.0,
+                            portfolio_fit_rank=c.get("portfolio_fit_rank") or 0.0,
                             final_rank=_final_rank,
                         ))
                     st.session_state["discovery_results"] = DiscoveryResult(
@@ -3766,7 +3962,7 @@ with tab_discovery:
         _run_discovery = st.button(
             "Re-run screener",
             type="primary",
-            use_container_width=True,
+            width="stretch",
             disabled=_orch_status["running"],
         )
     with _disc_col2:
@@ -3937,7 +4133,7 @@ with tab_discovery:
                     "Ready-to-buy names surface first, then pullback setups. "
                     "Identity warnings and weak execution plans are demoted."
                 )
-                st.dataframe(pd.DataFrame(_setup_rows), hide_index=True, use_container_width=True)
+                st.dataframe(pd.DataFrame(_setup_rows), hide_index=True, width="stretch")
 
             st.markdown("#### Recommendation view")
             _lens = st.radio(
@@ -4032,7 +4228,7 @@ with tab_discovery:
                     _selection = st.dataframe(
                         _styled,
                         hide_index=True,
-                        use_container_width=True,
+                        width="stretch",
                         selection_mode="single-row",
                         on_select="rerun",
                         key="disc_all_scored_table",
@@ -4059,7 +4255,7 @@ with tab_discovery:
                             "Stage": r.stage,
                             "Reason": r.reason,
                         })
-                    st.dataframe(pd.DataFrame(rej_rows), hide_index=True, use_container_width=True)
+                    st.dataframe(pd.DataFrame(rej_rows), hide_index=True, width="stretch")
 
         elif not disc.error:
             st.info("No candidates found meeting the criteria. Try adjusting discovery parameters in config.py.")
@@ -4094,7 +4290,7 @@ with tab_discovery:
                             "Avg return - low score": f"{s['avg_return_low']:+.1f}%",
                             "Samples": s["sample_size"],
                         } for s in _pstats]
-                        st.dataframe(pd.DataFrame(ps_rows), hide_index=True, use_container_width=True)
+                        st.dataframe(pd.DataFrame(ps_rows), hide_index=True, width="stretch")
 
                     # --- Action Calibration ---
                     if _acal:
@@ -4105,7 +4301,7 @@ with tab_discovery:
                             "Accuracy": f"{a['hit_rate']:.0%}",
                             "Samples": a["sample_size"],
                         } for a in _acal]
-                        st.dataframe(pd.DataFrame(ac_rows), hide_index=True, use_container_width=True)
+                        st.dataframe(pd.DataFrame(ac_rows), hide_index=True, width="stretch")
 
                     # --- Regime Effectiveness ---
                     if _rstats:
@@ -4116,7 +4312,7 @@ with tab_discovery:
                             "Best score driver": _plain_pillar(r["best_pillar"] or "-"),
                             "Samples": r["sample_size"],
                         } for r in _rstats]
-                        st.dataframe(pd.DataFrame(re_rows), hide_index=True, use_container_width=True)
+                        st.dataframe(pd.DataFrame(re_rows), hide_index=True, width="stretch")
 
                     # --- Stop/Target + Forecast Stats ---
                     st_col, fc_col = st.columns(2)
@@ -4156,7 +4352,7 @@ with tab_discovery:
                             "Beat SPY": "Yes" if p.get("beat_market") else "No",
                             "Recommendation OK": "Yes" if p.get("action_correct") else "No",
                         } for p in _perf]
-                        st.dataframe(pd.DataFrame(perf_rows), hide_index=True, use_container_width=True)
+                        st.dataframe(pd.DataFrame(perf_rows), hide_index=True, width="stretch")
 
                         # Summary metrics
                         returns = [p["return_90d"] for p in _perf if p.get("return_90d") is not None]
@@ -4210,7 +4406,7 @@ with tab_discovery:
                             "Worst": f"{h.worst:+.1f}%",
                             "N": h.sample_size,
                         } for h in _sc.horizons])
-                        st.dataframe(_h_rows, hide_index=True, use_container_width=True)
+                        st.dataframe(_h_rows, hide_index=True, width="stretch")
 
                     # Per-regime table
                     if _sc.regimes:
@@ -4222,7 +4418,7 @@ with tab_discovery:
                             "Best score driver": _plain_pillar(r.best_pillar or "-"),
                             "N": r.sample_size,
                         } for r in _sc.regimes])
-                        st.dataframe(_r_rows, hide_index=True, use_container_width=True)
+                        st.dataframe(_r_rows, hide_index=True, width="stretch")
 
                     # Stop/target + forecast
                     st_c, fc_c = st.columns(2)
@@ -4372,7 +4568,7 @@ with tab_analytics:
             _winners = sum(1 for t in _trade_history if t.get("pnl", 0) > 0)
             tc3.metric("Win rate", f"{_winners / len(_trade_history) * 100:.0f}%" if _trade_history else "-")
 
-            st.dataframe(pd.DataFrame(_th_rows), hide_index=True, use_container_width=True)
+            st.dataframe(pd.DataFrame(_th_rows), hide_index=True, width="stretch")
         else:
             st.info("No trades recorded yet. Use the 'Record a Sale' tab when you sell a stock on your broker.")
 
@@ -4441,7 +4637,7 @@ with tab_analytics:
                         "Gain/loss": f"{u['unrealized_pnl']:+,.2f}",
                         "Return": f"{u['unrealized_pnl_pct']:+.1f}%",
                     })
-                st.dataframe(pd.DataFrame(ur_rows), hide_index=True, use_container_width=True)
+                st.dataframe(pd.DataFrame(ur_rows), hide_index=True, width="stretch")
 
         # --- Signal Log tab ---
         with tab_signals:
@@ -4461,7 +4657,7 @@ with tab_analytics:
                         "Recommendation": _plain_action(s.get("action")) if s.get("action") else "-",
                         "Swap from": s.get("swap_from") or "-",
                     })
-                st.dataframe(pd.DataFrame(sig_rows), hide_index=True, use_container_width=True)
+                st.dataframe(pd.DataFrame(sig_rows), hide_index=True, width="stretch")
             else:
                 st.info("No paper trade signals recorded yet. Signals are logged automatically by the daily orchestrator.")
 
@@ -4478,7 +4674,7 @@ with tab_analytics:
                     "Avg entry": f"{p['avg_entry_price']:.4f}",
                     "Opened": p["opened_at"],
                 } for p in positions]
-                st.dataframe(pd.DataFrame(pos_rows), hide_index=True, use_container_width=True)
+                st.dataframe(pd.DataFrame(pos_rows), hide_index=True, width="stretch")
 
             if realized:
                 st.markdown("#### Closed trades")
@@ -4492,7 +4688,7 @@ with tab_analytics:
                     "Hold": f"{r['hold_days']}d" if r.get("hold_days") else "-",
                     "Closed": r["closed_at"],
                 } for r in realized]
-                st.dataframe(pd.DataFrame(rl_rows), hide_index=True, use_container_width=True)
+                st.dataframe(pd.DataFrame(rl_rows), hide_index=True, width="stretch")
 
             if not positions and not realized:
                 st.info("No paper positions yet. Positions are created when pending signals are filled at next-session open.")
@@ -4511,7 +4707,7 @@ with tab_analytics:
                     "Min (bps)": f"{t['min_slippage_bps']:+.1f}",
                     "Max (bps)": f"{t['max_slippage_bps']:+.1f}",
                 } for t in slip_by_ticker]
-                st.dataframe(pd.DataFrame(sl_rows), hide_index=True, use_container_width=True)
+                st.dataframe(pd.DataFrame(sl_rows), hide_index=True, width="stretch")
 
                 # Overall stats
                 stats = get_slippage_stats()

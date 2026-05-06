@@ -623,6 +623,12 @@ def _compute_stage2_factor_metrics(ticker: str, candidate: dict, momentum_metric
             debt_assets = debt / assets
             quality_components.append(float(np.clip((0.45 - debt_assets) / 0.35, -1.0, 1.0)))
             coverage += 0.10
+        cash = safe_float(latest.get("cash"), default=0.0)
+        ebitda_latest = safe_float(latest.get("ebitda"), default=None)
+        if ebitda_latest is not None and ebitda_latest > 0:
+            out["_net_debt_ebitda"] = ((debt or 0.0) - (cash or 0.0)) / ebitda_latest
+        if debt is not None and debt > 0:
+            out["_cash_to_debt"] = (cash or 0.0) / debt
 
         mcap = _candidate_market_cap(candidate, latest)
         if mcap and mcap > 0:
@@ -636,7 +642,6 @@ def _compute_stage2_factor_metrics(ticker: str, candidate: dict, momentum_metric
                 out["_fcf_yield"] = fcf_yield
             ebit = safe_float(latest.get("ebit"), default=None)
             debt_for_ev = safe_float(latest.get("total_debt"), default=debt or 0.0)
-            cash = safe_float(latest.get("cash"), default=0.0)
             ev = mcap + max(debt_for_ev or 0.0, 0.0) - max(cash or 0.0, 0.0)
             if ebit is not None and ebit > 0 and ev > 0:
                 ebit_yield = ebit / ev
@@ -733,6 +738,42 @@ def _effective_group_floor(target_n: int, configured_floor: int, groups: set[str
     return max(1, min(configured_floor, target_n // len(valid_groups)))
 
 
+def _scaled_lens_min_counts(lens_min_counts: dict[str, int] | None, target_n: int) -> dict[str, int]:
+    """Scale full-run lens quotas down for bounded discovery runs.
+
+    The production config expresses minimum counts for the normal 250-name
+    Stage 5b panel. A smaller verification run (for example top 20 or 60)
+    should preserve the same lens mix instead of filling every slot with the
+    first configured lens.
+    """
+    if not lens_min_counts or target_n <= 0:
+        return {}
+    raw = {
+        str(k): max(0, int(v or 0))
+        for k, v in lens_min_counts.items()
+        if max(0, int(v or 0)) > 0
+    }
+    raw_total = sum(raw.values())
+    if raw_total <= 0:
+        return {}
+    if raw_total <= target_n:
+        return raw
+
+    scaled_float = {lens: count * target_n / raw_total for lens, count in raw.items()}
+    scaled = {lens: int(np.floor(value)) for lens, value in scaled_float.items()}
+    remainder = target_n - sum(scaled.values())
+    for lens, _frac in sorted(
+        ((lens, value - scaled[lens]) for lens, value in scaled_float.items()),
+        key=lambda item: item[1],
+        reverse=True,
+    ):
+        if remainder <= 0:
+            break
+        scaled[lens] += 1
+        remainder -= 1
+    return {lens: count for lens, count in scaled.items() if count > 0}
+
+
 def _adaptive_promote_candidates(
     candidates: list[dict],
     *,
@@ -762,6 +803,8 @@ def _adaptive_promote_candidates(
     )
     if len(ordered) <= target_n:
         return ordered
+
+    lens_min_counts = _scaled_lens_min_counts(lens_min_counts, target_n)
 
     selected: list[dict] = []
     selected_symbols: set[str] = set()
@@ -874,8 +917,9 @@ def _promote_ready_reserve(
     def _ready(c: dict) -> float:
         return safe_float(c.get("_cheap_ready_score"), default=0.0)
 
+    target_ready = min(max(0, reserve_n), target_n)
     current_ready = sum(1 for c in selected if _ready(c) >= min_ready_score)
-    if current_ready >= reserve_n:
+    if current_ready >= target_ready:
         return selected
 
     ready_pool = sorted(
@@ -891,14 +935,17 @@ def _promote_ready_reserve(
         return selected
 
     protected_symbols: set[str] = set()
-    lens_min_counts = getattr(config, "DISCOVERY_FULL_SCORE_LENS_MIN_COUNTS", {}) or {}
+    lens_min_counts = _scaled_lens_min_counts(
+        getattr(config, "DISCOVERY_FULL_SCORE_LENS_MIN_COUNTS", {}) or {},
+        target_n,
+    )
     lens_counts: dict[str, int] = {}
     for candidate in selected:
         lens = str(candidate.get("_entry_lens", "") or "")
         lens_counts[lens] = lens_counts.get(lens, 0) + 1
 
     for candidate in ready_pool:
-        if current_ready >= reserve_n:
+        if current_ready >= target_ready:
             break
         replacement_idx = None
         replacement_score = float("inf")
@@ -931,6 +978,244 @@ def _promote_ready_reserve(
     selected = selected[:target_n]
     selected.sort(key=lambda c: safe_float(c.get(score_key), default=0.0), reverse=True)
     return selected
+
+
+def _cheap_quality_score(candidate: dict) -> float:
+    """Cheap-quality reserve score for MLI-style mid-cap candidates.
+
+    The score intentionally uses only Stage-5 cached/PIT-safe fields and does
+    not change the final action label.  It exists to make sure cheap, clean,
+    liquid quality names reach the expensive scoring stage.
+    """
+    if _candidate_exclusion_reason(candidate):
+        return 0.0
+
+    score = 0.0
+    ev_ebit = safe_float(candidate.get("_ev_ebit"), default=None)
+    if ev_ebit is not None and ev_ebit > 0:
+        if ev_ebit <= 18:
+            score += 0.24
+        elif ev_ebit <= 25:
+            score += 0.16
+        elif ev_ebit <= 32:
+            score += 0.06
+
+    f_score = safe_float(candidate.get("_f_score"), default=None)
+    f_cov = safe_float(candidate.get("_f_score_coverage"), default=0.0)
+    if f_score is not None and f_cov >= 0.45:
+        if f_score >= 7:
+            score += 0.20
+        elif f_score >= 6:
+            score += 0.16
+        elif f_score >= 5:
+            score += 0.08
+
+    gpa = safe_float(candidate.get("_gpa"), default=None)
+    pit_quality = safe_float(candidate.get("_pit_quality_score"), default=None)
+    if gpa is not None:
+        if gpa >= 0.20:
+            score += 0.18
+        elif gpa >= 0.15:
+            score += 0.14
+        elif gpa >= 0.10:
+            score += 0.07
+    if pit_quality is not None and pit_quality > 0:
+        score += min(0.12, 0.12 * pit_quality)
+
+    net_debt = safe_float(candidate.get("_net_debt_ebitda"), default=None)
+    cash_to_debt = safe_float(candidate.get("_cash_to_debt"), default=None)
+    if net_debt is not None:
+        if net_debt <= 0:
+            score += 0.12
+        elif net_debt <= 1.0:
+            score += 0.08
+    elif cash_to_debt is not None and cash_to_debt >= 1.0:
+        score += 0.08
+
+    ret30 = safe_float(candidate.get("_ret_30d"), default=None)
+    ret90 = safe_float(candidate.get("_ret_90d"), default=None)
+    if ret30 is not None:
+        if -0.05 <= ret30 <= 0.18:
+            score += 0.08
+        elif 0.18 < ret30 <= 0.28:
+            score += 0.02
+        elif ret30 > 0.35:
+            score -= 0.12
+    if ret90 is not None and -0.10 <= ret90 <= 0.35:
+        score += 0.04
+    if candidate.get("_above_sma50") and candidate.get("_above_sma200"):
+        score += 0.08
+    if safe_float(candidate.get("_avg_dollar_volume"), default=0.0) >= 5_000_000:
+        score += 0.04
+    return float(np.clip(score, 0.0, 1.0))
+
+
+def _promote_cheap_quality_reserve(
+    pool: list[dict],
+    selected: list[dict],
+    *,
+    target_n: int,
+    reserve_n: int,
+    min_score: float,
+    score_key: str,
+) -> list[dict]:
+    """Reserve Stage-6 seats for cheap-quality names before final gates decide."""
+    if reserve_n <= 0 or not pool or not selected:
+        return selected
+    selected = list(selected or [])[:target_n]
+    selected_symbols = {_candidate_symbol(c) for c in selected}
+    target_count = min(max(0, reserve_n), target_n)
+    current_count = sum(
+        1 for c in selected
+        if safe_float(c.get("_cheap_quality_score"), default=0.0) >= min_score
+    )
+    if current_count >= target_count:
+        return selected
+
+    pool_ranked = sorted(
+        [
+            c for c in pool
+            if _candidate_symbol(c)
+            and _candidate_symbol(c) not in selected_symbols
+            and safe_float(c.get("_cheap_quality_score"), default=0.0) >= min_score
+        ],
+        key=lambda c: (
+            safe_float(c.get("_cheap_quality_score"), default=0.0),
+            safe_float(c.get(score_key), default=0.0),
+        ),
+        reverse=True,
+    )
+    if not pool_ranked:
+        return selected
+
+    protected_symbols: set[str] = set()
+    promoted = 0
+    for candidate in pool_ranked:
+        if current_count >= target_count:
+            break
+        replacement_idx = None
+        replacement_key: tuple[float, float] | None = None
+        for idx, existing in enumerate(selected):
+            symbol = _candidate_symbol(existing)
+            if symbol in protected_symbols:
+                continue
+            existing_cq = safe_float(existing.get("_cheap_quality_score"), default=0.0)
+            if existing_cq >= min_score:
+                continue
+            key = (existing_cq, safe_float(existing.get(score_key), default=-999.0))
+            if replacement_idx is None or key < replacement_key:
+                replacement_idx = idx
+                replacement_key = key
+        if replacement_idx is None:
+            break
+        selected[replacement_idx] = candidate
+        symbol = _candidate_symbol(candidate)
+        protected_symbols.add(symbol)
+        selected_symbols.add(symbol)
+        candidate["_cheap_quality_reserved"] = True
+        current_count += 1
+        promoted += 1
+
+    if promoted:
+        logger.info("Cheap-quality reserve promoted %d candidates into %s shortlist", promoted, score_key)
+    selected.sort(key=lambda c: safe_float(c.get(score_key), default=0.0), reverse=True)
+    return selected[:target_n]
+
+
+def _promote_ready_lane(
+    pool: list[dict],
+    selected: list[dict],
+    *,
+    target_n: int,
+    reserve_n: int,
+    min_ready_score: float,
+    score_key: str,
+) -> list[dict]:
+    """Reserve Stage 6 seats for names likely to be buyable today.
+
+    The lane does not bypass final scoring or action gates. It only ensures
+    that deep analysis sees enough candidates with clean cheap setup and
+    cached/PIT evidence instead of spending every slot on stretched watchlist
+    ideas.
+    """
+    if reserve_n <= 0 or not pool or not selected:
+        return selected
+
+    target_ready = min(max(0, reserve_n), target_n)
+    selected = list(selected or [])[:target_n]
+    selected_symbols = {_candidate_symbol(c) for c in selected}
+
+    def _ready(c: dict) -> float:
+        return safe_float(c.get("_ready_lane_score"), default=0.0)
+
+    current_ready = sum(1 for c in selected if _ready(c) >= min_ready_score)
+    if current_ready >= target_ready:
+        return selected
+
+    ready_pool = sorted(
+        [
+            c for c in pool
+            if _candidate_symbol(c)
+            and _candidate_symbol(c) not in selected_symbols
+            and _ready(c) >= min_ready_score
+        ],
+        key=lambda c: (_ready(c), safe_float(c.get(score_key), default=0.0)),
+        reverse=True,
+    )
+    if not ready_pool:
+        return selected
+
+    lens_min_counts = _scaled_lens_min_counts(
+        getattr(config, "DISCOVERY_FULL_SCORE_LENS_MIN_COUNTS", {}) or {},
+        target_n,
+    )
+    lens_counts: dict[str, int] = {}
+    for candidate in selected:
+        lens = str(candidate.get("_entry_lens", "") or "")
+        lens_counts[lens] = lens_counts.get(lens, 0) + 1
+
+    max_replace = max(
+        1,
+        int(round(target_n * float(getattr(config, "DISCOVERY_FULL_SCORE_READY_LANE_MAX_REPLACE_PCT", 0.45)))),
+    )
+    replaced = 0
+    protected_symbols: set[str] = set()
+    for candidate in ready_pool:
+        if current_ready >= target_ready or replaced >= max_replace:
+            break
+        replacement_idx = None
+        replacement_key: tuple[float, float] | None = None
+        for idx, existing in enumerate(selected):
+            symbol = _candidate_symbol(existing)
+            if symbol in protected_symbols:
+                continue
+            if _ready(existing) >= min_ready_score:
+                continue
+            existing_lens = str(existing.get("_entry_lens", "") or "")
+            min_for_lens = int(lens_min_counts.get(existing_lens, 0) or 0)
+            if min_for_lens > 0 and lens_counts.get(existing_lens, 0) <= min_for_lens:
+                continue
+            key = (
+                _ready(existing),
+                safe_float(existing.get(score_key), default=-999.0),
+            )
+            if replacement_key is None or key < replacement_key:
+                replacement_idx = idx
+                replacement_key = key
+        if replacement_idx is None:
+            break
+        old_lens = str(selected[replacement_idx].get("_entry_lens", "") or "")
+        new_lens = str(candidate.get("_entry_lens", "") or "")
+        selected[replacement_idx] = candidate
+        lens_counts[old_lens] = max(0, lens_counts.get(old_lens, 0) - 1)
+        lens_counts[new_lens] = lens_counts.get(new_lens, 0) + 1
+        selected_symbols.add(_candidate_symbol(candidate))
+        protected_symbols.add(_candidate_symbol(candidate))
+        current_ready += 1
+        replaced += 1
+
+    selected.sort(key=lambda c: safe_float(c.get(score_key), default=0.0), reverse=True)
+    return selected[:target_n]
 
 
 def _promote_challenge_reserve(
@@ -1303,6 +1588,178 @@ def _gate_review_is_missing_data_only(gate_status: str, gate_reasons: list[str] 
     return all(any(marker in reason for marker in missing_markers) for reason in reasons)
 
 
+def apply_action_label(
+    result: dict,
+    *,
+    pillars_all_zero: bool,
+    adjusted_aggregate: float,
+    sector: str = "",
+    industry: str = "",
+) -> tuple[str, str, bool]:
+    """Pure action-label assignment matching the live discovery gate stack.
+
+    Centralises the threshold + F-score gate + V2-gate + trap-safeguard rules
+    that determine STRONG BUY / BUY / NEUTRAL / AVOID / MANUAL REVIEW. Used by
+    both the discovery scoring path (advisory) and by the action-label backfill
+    path so historical rows in `signal_backtest` can be re-labelled with the
+    same logic that fires live.
+
+    Returns:
+        action: STRONG BUY | BUY | NEUTRAL | AVOID | INSUFFICIENT DATA | MANUAL REVIEW
+        gate_v2_status: PASS | REVIEW | REJECT (advisory)
+        trap_triggered: bool
+
+    Note: this helper is side-effect free (no logging, no rank multiplication).
+    Callers in the live path apply rank discounts and log gate hits separately
+    so this function can be invoked from backfill scripts without polluting logs.
+    """
+    if pillars_all_zero:
+        return ("INSUFFICIENT DATA", "REVIEW", False)
+
+    if adjusted_aggregate >= config.SCORE_STRONG_BUY_THRESHOLD:
+        action = "STRONG BUY"
+    elif adjusted_aggregate >= config.SCORE_BUY_THRESHOLD:
+        action = "BUY"
+    elif adjusted_aggregate >= config.SCORE_KEEP_THRESHOLD:
+        action = "NEUTRAL"
+    else:
+        action = "AVOID"
+
+    # Piotroski F-score downgrade (gated by config flag).
+    if getattr(config, "F_SCORE_GATE_ENABLED", False):
+        fs = _optional_float(result.get("f_score"))
+        fs_cov = _optional_float(result.get("f_score_coverage")) or 0.0
+        if (
+            fs is not None
+            and fs_cov >= 6.0 / 9.0
+            and fs <= 3
+            and action in ("STRONG BUY", "BUY")
+        ):
+            action = "NEUTRAL"
+
+    stretch = _price_vs_sma200_stretch(result)
+    gate_v2_status, _ = _evaluate_discovery_gates_v2(
+        result, sector=sector, industry=industry, stretch=stretch
+    )
+    trap_triggered, _ = _evaluate_trap_safeguard(
+        result, sector=sector, industry=industry, stretch=stretch
+    )
+
+    v2_shadow = bool(getattr(config, "DISCOVERY_GATES_V2_SHADOW", True))
+    gate_first_active = (
+        bool(getattr(config, "DISCOVERY_GATE_FIRST_ENABLED", True))
+        and not v2_shadow
+    )
+    v2_active = (
+        bool(getattr(config, "DISCOVERY_GATES_V2_ENABLED", False))
+        and not v2_shadow
+    ) or gate_first_active
+
+    if v2_active and gate_v2_status == "REJECT":
+        if action in ("STRONG BUY", "BUY", "NEUTRAL"):
+            action = "MANUAL REVIEW"
+
+    if trap_triggered:
+        if action in ("STRONG BUY", "BUY", "NEUTRAL"):
+            action = "MANUAL REVIEW"
+
+    return (action, gate_v2_status, trap_triggered)
+
+
+def _prior_passes_ready_contract(prior) -> tuple[bool, list[str], list[str]]:
+    """Evaluate the institutional prior with a calibrated near-miss allowance."""
+    if getattr(prior, "passes_strong_buy_bar", False):
+        return True, [], []
+
+    reasons = list(getattr(prior, "reasons", []) or ["institutional prior below bar"])
+    if not bool(getattr(config, "READY_STRONG_BUY_PRIOR_SOFT_PASS_ENABLED", True)):
+        return False, reasons, []
+
+    percentile = safe_float(getattr(prior, "percentile", None), default=0.0)
+    confidence = safe_float(getattr(prior, "confidence", None), default=0.0)
+    coverage = safe_float(getattr(prior, "coverage", None), default=0.0)
+    score = safe_float(getattr(prior, "score", None), default=-1.0)
+
+    soft_pct = float(getattr(config, "READY_STRONG_BUY_PRIOR_SOFT_PERCENTILE", 0.80))
+    soft_conf = float(getattr(config, "READY_STRONG_BUY_PRIOR_SOFT_CONFIDENCE", 0.55))
+    soft_cov = float(getattr(config, "READY_STRONG_BUY_PRIOR_SOFT_COVERAGE", 0.40))
+    soft_score = float(getattr(config, "READY_STRONG_BUY_PRIOR_SOFT_MIN_SCORE", 0.0))
+    if (
+        percentile >= soft_pct
+        and confidence >= soft_conf
+        and coverage >= soft_cov
+        and score >= soft_score
+    ):
+        return True, [], [
+            (
+                "institutional prior soft-pass "
+                f"(pct {percentile:.0%}, conf {confidence:.0%}, cov {coverage:.0%})"
+            )
+        ]
+    return False, reasons, []
+
+
+def _ready_contract_score(
+    *,
+    gate_status: str,
+    trap_triggered: bool,
+    prior,
+    prior_pass: bool,
+    entry_stance: str,
+    entry_price,
+    stop_loss,
+    take_profit,
+    rr_ratio,
+    position_weight,
+    data_confidence: float,
+    gate_reasons: list[str] | None = None,
+) -> float:
+    """Continuous readiness score used for calibration and near-ready reports."""
+    if trap_triggered:
+        return 0.0
+
+    gate_status_norm = str(gate_status or "PASS").upper()
+    gate_ok = (
+        gate_status_norm == "PASS"
+        or _gate_review_is_missing_data_only(gate_status_norm, gate_reasons)
+    )
+    if gate_status_norm == "REJECT":
+        gate_ok = False
+
+    prior_pct = safe_float(getattr(prior, "percentile", None), default=0.0)
+    prior_conf = safe_float(getattr(prior, "confidence", None), default=0.0)
+    prior_cov = safe_float(getattr(prior, "coverage", None), default=0.0)
+    prior_component = 1.0 if prior_pass else np.mean([
+        min(1.0, prior_pct / max(float(getattr(config, "INSTITUTIONAL_PRIOR_STRONG_BUY_PERCENTILE", 0.90)), 1e-9)),
+        min(1.0, prior_conf / max(float(getattr(config, "INSTITUTIONAL_PRIOR_MIN_CONFIDENCE", 0.55)), 1e-9)),
+        min(1.0, prior_cov / max(float(getattr(config, "INSTITUTIONAL_PRIOR_MIN_COVERAGE", 0.45)), 1e-9)),
+    ])
+
+    entry_component = {"Ready": 1.0, "Pullback Preferred": 0.55, "Watch Only": 0.0}.get(str(entry_stance), 0.0)
+    levels_component = float(
+        safe_float(entry_price, default=0.0) > 0
+        and safe_float(stop_loss, default=0.0) > 0
+        and safe_float(take_profit, default=0.0) > 0
+    )
+    min_rr = float(getattr(config, "READY_STRONG_BUY_MIN_RR", 1.50))
+    rr_component = min(1.0, max(0.0, safe_float(rr_ratio, default=0.0) / max(min_rr, 1e-9)))
+    min_conf = float(getattr(config, "READY_STRONG_BUY_MIN_CONFIDENCE", 0.70))
+    conf_component = min(1.0, max(0.0, safe_float(data_confidence, default=0.0) / max(min_conf, 1e-9)))
+    min_weight = float(getattr(config, "READY_STRONG_BUY_MIN_POSITION_WEIGHT", 0.005))
+    weight_component = min(1.0, max(0.0, safe_float(position_weight, default=0.0) / max(min_weight, 1e-9)))
+
+    score = (
+        0.20 * float(prior_component)
+        + 0.20 * entry_component
+        + 0.10 * levels_component
+        + 0.20 * rr_component
+        + 0.15 * conf_component
+        + 0.10 * weight_component
+        + 0.05 * (1.0 if gate_ok else 0.0)
+    )
+    return float(np.clip(score, 0.0, 1.0))
+
+
 def _evaluate_ready_strong_buy_contract(
     *,
     gate_status: str,
@@ -1316,9 +1773,11 @@ def _evaluate_ready_strong_buy_contract(
     position_weight,
     data_confidence: float,
     gate_reasons: list[str] | None = None,
-) -> tuple[str, list[str]]:
+    return_details: bool = False,
+):
     """Strict contract for a name to be labelled STRONG BUY and ready now."""
     reasons: list[str] = []
+    soft_passes: list[str] = []
     gate_status_norm = str(gate_status or "PASS").upper()
     if gate_status_norm == "REJECT":
         reasons.append(f"gate status {gate_status_norm}")
@@ -1326,8 +1785,11 @@ def _evaluate_ready_strong_buy_contract(
         reasons.append(f"gate status {gate_status_norm}")
     if trap_triggered:
         reasons.append("trap safeguard triggered")
-    if not getattr(prior, "passes_strong_buy_bar", False):
-        reasons.extend(getattr(prior, "reasons", []) or ["institutional prior below bar"])
+    prior_pass, prior_reasons, prior_soft_passes = _prior_passes_ready_contract(prior)
+    if not prior_pass:
+        reasons.extend(prior_reasons)
+    else:
+        soft_passes.extend(prior_soft_passes)
     if entry_stance != "Ready":
         reasons.append(f"entry stance is {entry_stance}")
     if not (safe_float(entry_price, default=0.0) > 0):
@@ -1345,7 +1807,36 @@ def _evaluate_ready_strong_buy_contract(
     min_conf = float(getattr(config, "READY_STRONG_BUY_MIN_CONFIDENCE", 0.70))
     if data_confidence < min_conf:
         reasons.append(f"data confidence below {min_conf:.0%}")
-    return ("PASS" if not reasons else "FAIL"), reasons
+    status = "PASS" if not reasons else "FAIL"
+    score = _ready_contract_score(
+        gate_status=gate_status_norm,
+        trap_triggered=trap_triggered,
+        prior=prior,
+        prior_pass=prior_pass,
+        entry_stance=entry_stance,
+        entry_price=entry_price,
+        stop_loss=stop_loss,
+        take_profit=take_profit,
+        rr_ratio=rr_ratio,
+        position_weight=position_weight,
+        data_confidence=data_confidence,
+        gate_reasons=gate_reasons,
+    )
+    details = {
+        "score": round(score, 4),
+        "soft_passes": soft_passes,
+        "thresholds": {
+            "min_rr": min_rr,
+            "min_confidence": min_conf,
+            "min_position_weight": min_weight,
+            "prior_soft_percentile": float(getattr(config, "READY_STRONG_BUY_PRIOR_SOFT_PERCENTILE", 0.80)),
+            "prior_soft_confidence": float(getattr(config, "READY_STRONG_BUY_PRIOR_SOFT_CONFIDENCE", 0.55)),
+            "prior_soft_coverage": float(getattr(config, "READY_STRONG_BUY_PRIOR_SOFT_COVERAGE", 0.40)),
+        },
+    }
+    if return_details:
+        return status, reasons, details
+    return status, reasons
 
 
 def _institutional_prior_weights() -> tuple[float, float]:
@@ -1374,6 +1865,120 @@ def _institutional_prior_rank_term(prior, weight: float) -> float:
     score = safe_float(getattr(prior, "score", None), default=0.0)
     confidence = safe_float(getattr(prior, "confidence", None), default=0.0)
     return float(weight * score * max(0.0, min(1.0, confidence)))
+
+
+def _zscore_array(values: list[float | None]) -> list[float]:
+    """Cross-sectional z-score with NaN-safe handling and 1-element/zero-std fallbacks."""
+    arr = np.array(
+        [float(v) if v is not None and np.isfinite(float(v)) else np.nan for v in values],
+        dtype=float,
+    )
+    mask = ~np.isnan(arr)
+    if mask.sum() < 2:
+        return [0.0 for _ in values]
+    mean = float(np.mean(arr[mask]))
+    std = float(np.std(arr[mask], ddof=0))
+    if std < 1e-9:
+        return [0.0 for _ in values]
+    out = []
+    for v in arr:
+        if np.isnan(v):
+            out.append(0.0)
+        else:
+            out.append((float(v) - mean) / std)
+    return out
+
+
+def compute_strong_buy_scorecard(candidates: list) -> dict[str, float]:
+    """Cross-sectional weighted scorecard (Hull 2018 / Patton-Timmermann 2009).
+
+    Replaces the historic 10-predicate AND-gate with a single continuous score
+    that combines the same signals additively.  Multiple weak indicators
+    aggregate into a strong one; we keep the trap safeguard as an explicit
+    post-veto so commodity-cycle traps still cannot reach STRONG BUY.
+
+    Inputs (all optional — missing values contribute 0 z-score):
+        aggregate_score (40%) — pillar-driven signal
+        f_score / 9     (15%) — Piotroski quality
+        gpa             (10%) — Novy-Marx 2013 gross profitability
+        meta_success_prob (10%) — meta-label calibrator output
+        institutional_prior_rank (10%) — Asness-Frazzini-Pedersen factor prior
+        momentum / quality / value factor scores (5% each)
+        stretch - 0.50  (-20% penalty when above) — overextension trap
+
+    Returns:
+        {ticker: sb_score} where sb_score is on a roughly z-score scale.
+    """
+    if not candidates:
+        return {}
+
+    def _g(c, name, default=None):
+        return getattr(c, name, default)
+
+    agg = [_g(c, "aggregate_score") for c in candidates]
+    fscore = [_g(c, "f_score") for c in candidates]
+    fcov = [_g(c, "f_score_coverage") for c in candidates]
+    gpa = [_g(c, "gpa") for c in candidates]
+    meta = [_g(c, "meta_success_prob") for c in candidates]
+    ip_pct = [_g(c, "institutional_prior_percentile") for c in candidates]
+    mom = [_g(c, "momentum_factor_score") for c in candidates]
+    qual = [_g(c, "quality_factor_score") for c in candidates]
+    val = [_g(c, "value_factor_score") for c in candidates]
+    stretch = [_g(c, "price_vs_sma200_stretch") for c in candidates]
+
+    # F-score is meaningful only with sufficient coverage.
+    fscore_filtered = [
+        (fs / 9.0) if (fs is not None and (fc or 0.0) >= 6.0 / 9.0) else None
+        for fs, fc in zip(fscore, fcov)
+    ]
+    # Meta probability is already 0..1; use raw.
+    meta_clean = [(float(m) if m is not None else None) for m in meta]
+
+    z_agg = _zscore_array(agg)
+    z_fs = _zscore_array(fscore_filtered)
+    z_gpa = _zscore_array(gpa)
+    z_meta = _zscore_array(meta_clean)
+    z_ip = _zscore_array(ip_pct)
+    z_mom = _zscore_array(mom)
+    z_qual = _zscore_array(qual)
+    z_val = _zscore_array(val)
+
+    w_agg = float(getattr(config, "SB_SCORECARD_W_AGG", 0.40))
+    w_fs = float(getattr(config, "SB_SCORECARD_W_FSCORE", 0.15))
+    w_gpa = float(getattr(config, "SB_SCORECARD_W_GPA", 0.10))
+    w_meta = float(getattr(config, "SB_SCORECARD_W_META", 0.10))
+    w_ip = float(getattr(config, "SB_SCORECARD_W_PRIOR", 0.10))
+    w_mom = float(getattr(config, "SB_SCORECARD_W_MOM", 0.05))
+    w_qual = float(getattr(config, "SB_SCORECARD_W_QUAL", 0.05))
+    w_val = float(getattr(config, "SB_SCORECARD_W_VAL", 0.05))
+    stretch_penalty = float(getattr(config, "SB_SCORECARD_STRETCH_PENALTY", 0.20))
+    stretch_threshold = float(getattr(config, "SB_SCORECARD_STRETCH_THRESHOLD", 0.50))
+
+    out: dict[str, float] = {}
+    for i, c in enumerate(candidates):
+        ticker = getattr(c, "ticker", None) or getattr(c, "symbol", None)
+        if not ticker:
+            continue
+        s = (
+            w_agg * z_agg[i]
+            + w_fs * z_fs[i]
+            + w_gpa * z_gpa[i]
+            + w_meta * z_meta[i]
+            + w_ip * z_ip[i]
+            + w_mom * z_mom[i]
+            + w_qual * z_qual[i]
+            + w_val * z_val[i]
+        )
+        st = stretch[i]
+        if st is not None and float(st) > stretch_threshold:
+            s -= stretch_penalty * (float(st) - stretch_threshold)
+        out[ticker] = float(s)
+        # Persist on the candidate for downstream UI / cache.
+        try:
+            c.sb_score = float(s)
+        except (AttributeError, TypeError):
+            pass
+    return out
 
 
 def _percentile_regime_label(macro_regime) -> str:
@@ -1420,6 +2025,15 @@ def _assign_percentile_actions(candidates: list, *, regime: str = "NEUTRAL") -> 
     if not scored:
         return
 
+    # Compute the cross-sectional STRONG BUY scorecard once for the cohort.
+    # The scorecard is a continuous combination of the same signals that
+    # otherwise act as a 10-predicate AND-gate; it widens the STRONG BUY
+    # funnel without bypassing the trap safeguard or V2 reject vetoes
+    # (already excluded from `scored` above).
+    scorecard_enabled = bool(getattr(config, "STRONG_BUY_SCORECARD_ENABLED", True))
+    if scorecard_enabled:
+        compute_strong_buy_scorecard(scored)
+
     label = str(regime or "NEUTRAL").upper()
     is_bear = label in ("BEAR", "RISK_OFF", "TRANSITION_DOWN")
     strong_pct = float(getattr(
@@ -1436,13 +2050,43 @@ def _assign_percentile_actions(candidates: list, *, regime: str = "NEUTRAL") -> 
     strong_floor = float(getattr(config, "PERCENTILE_STRONG_BUY_MIN_AGG", 0.0))
     buy_floor = float(getattr(config, "PERCENTILE_BUY_MIN_AGG", -0.05))
     min_prior_pct = float(getattr(config, "PERCENTILE_STRONG_BUY_MIN_PRIOR_PCT", 0.85))
-    meta_floor = float(getattr(config, "META_LABEL_STRONG_BUY_MIN_PROB", 0.60))
+    try:
+        from engine.auto_tune import get_core_ready_meta_strong_buy_min_prob, get_meta_strong_buy_min_prob
+        meta_floor = float(get_meta_strong_buy_min_prob(scored))
+        core_ready_meta_floor = float(get_core_ready_meta_strong_buy_min_prob(scored))
+    except Exception:
+        meta_floor = float(getattr(config, "META_LABEL_STRONG_BUY_MIN_PROB", 0.60))
+        core_ready_meta_floor = meta_floor
 
     ranked = sorted(scored, key=lambda c: safe_float(c.aggregate_score, default=-999.0), reverse=True)
     n = len(ranked)
     strong_cut = max(1, int(np.ceil(n * max(0.0, min(1.0, strong_pct)))))
     buy_cut = max(strong_cut, int(np.ceil(n * max(0.0, min(1.0, buy_pct)))))
     neutral_cut = max(buy_cut, int(np.ceil(n * max(0.0, min(1.0, neutral_pct)))))
+
+    # Scorecard parallel-promotion path: rank by sb_score and find the
+    # cohort threshold for the top X%.  A candidate is scorecard-eligible
+    # for STRONG BUY when it sits in the top sb-cut AND its sb_score
+    # crosses the calibrated absolute threshold.  This widens the funnel
+    # without bypassing the trap-safeguard / V2-reject vetoes (excluded
+    # from `scored` above) and still respects the F-score floor below.
+    sb_rank: dict[str, int] = {}
+    sb_threshold = float(getattr(config, "STRONG_BUY_SCORECARD_MIN_Z", 0.50))
+    sb_top_pct = float(getattr(config, "STRONG_BUY_SCORECARD_TOP_PCT", 0.05))
+    sb_promotions = 0
+    if scorecard_enabled:
+        sb_ranked = sorted(
+            scored,
+            key=lambda c: safe_float(getattr(c, "sb_score", None), default=-999.0),
+            reverse=True,
+        )
+        for i, c in enumerate(sb_ranked):
+            tk = getattr(c, "ticker", None) or getattr(c, "symbol", None)
+            if tk:
+                sb_rank[tk] = i
+        sb_cut_n = max(1, int(np.ceil(n * max(0.0, min(1.0, sb_top_pct)))))
+    else:
+        sb_cut_n = 0
 
     action_counts = {"STRONG BUY": 0, "BUY": 0, "NEUTRAL": 0, "AVOID": 0, "MANUAL REVIEW": 0}
     for idx, c in enumerate(ranked):
@@ -1454,6 +2098,20 @@ def _assign_percentile_actions(candidates: list, *, regime: str = "NEUTRAL") -> 
             and safe_float(c.f_score_coverage, default=0.0) >= 6.0 / 9.0
             and _fscore_val <= 3
         )
+
+        # Scorecard eligibility for this candidate.
+        tk = getattr(c, "ticker", None) or getattr(c, "symbol", None)
+        sb_score_val = safe_float(getattr(c, "sb_score", None), default=None)
+        scorecard_strong = (
+            scorecard_enabled
+            and tk is not None
+            and sb_rank.get(tk, n + 1) < sb_cut_n
+            and sb_score_val is not None
+            and sb_score_val >= sb_threshold
+            and score >= strong_floor
+            and not fscore_block
+        )
+
         if c.action == "MANUAL REVIEW":
             new_action = "MANUAL REVIEW"
         elif (
@@ -1464,16 +2122,38 @@ def _assign_percentile_actions(candidates: list, *, regime: str = "NEUTRAL") -> 
             and not fscore_block
         ):
             meta_prob = getattr(c, "meta_success_prob", None)
-            if meta_prob is not None and safe_float(meta_prob, default=0.0) < meta_floor:
-                new_action = "BUY" if score >= buy_floor else "NEUTRAL"
-                c.strong_buy_eligible = False
-                c.ready_contract_status = "FAIL"
-                c.ready_contract_reasons = list(c.ready_contract_reasons or [])
-                c.ready_contract_reasons.append(
-                    f"Meta-label confidence {safe_float(meta_prob, default=0.0):.0%} below {meta_floor:.0%}"
-                )
+            candidate_meta_floor = (
+                core_ready_meta_floor
+                if str(getattr(c, "ready_contract_core_status", "") or "").upper() == "PASS"
+                else meta_floor
+            )
+            if meta_prob is not None and safe_float(meta_prob, default=0.0) < candidate_meta_floor:
+                # Original meta-label gate failure — but if the scorecard
+                # confirms strong cohort-relative quality, we keep STRONG BUY
+                # rather than demoting to BUY.  The scorecard combines the
+                # same signals as the gate but additively.
+                if scorecard_strong:
+                    new_action = "STRONG BUY"
+                    sb_promotions += 1
+                else:
+                    new_action = "BUY" if score >= buy_floor else "NEUTRAL"
+                    c.strong_buy_eligible = False
+                    c.ready_contract_status = "FAIL"
+                    c.ready_contract_reasons = list(c.ready_contract_reasons or [])
+                    meta_reason = (
+                        f"Meta-label confidence {safe_float(meta_prob, default=0.0):.0%} below {candidate_meta_floor:.0%}"
+                    )
+                    c.ready_contract_reasons.append(meta_reason)
+                    c.strong_buy_blockers = list(c.ready_contract_reasons)
             else:
                 new_action = "STRONG BUY"
+        elif scorecard_strong:
+            # Parallel scorecard promotion: drops the strong_buy_eligible /
+            # IP-percentile / meta-prob conjunctive checks because their
+            # aggregate signal is already captured by sb_score.  Trap
+            # safeguard and V2-reject still veto via `scored` filter.
+            new_action = "STRONG BUY"
+            sb_promotions += 1
         elif idx < buy_cut and score >= buy_floor and not fscore_block:
             new_action = "BUY"
         elif idx < neutral_cut or score >= config.SCORE_KEEP_THRESHOLD:
@@ -1487,11 +2167,14 @@ def _assign_percentile_actions(candidates: list, *, regime: str = "NEUTRAL") -> 
         action_counts[new_action] = action_counts.get(new_action, 0) + 1
 
     logger.info(
-        "Percentile discovery actions applied (%s): strong_cut=%d buy_cut=%d n=%d counts=%s",
+        "Percentile discovery actions applied (%s): strong_cut=%d buy_cut=%d n=%d "
+        "scorecard_top=%d sb_promotions=%d counts=%s",
         label,
         strong_cut,
         buy_cut,
         n,
+        sb_cut_n,
+        sb_promotions,
         action_counts,
     )
 
@@ -1545,6 +2228,7 @@ def _assign_percentile_actions(candidates: list, *, regime: str = "NEUTRAL") -> 
                     if not getattr(c, "ready_contract_reasons", None):
                         c.ready_contract_reasons = []
                     c.ready_contract_reasons = list(c.ready_contract_reasons) + (c.action_gate_reasons or [])
+                    c.strong_buy_blockers = list(c.ready_contract_reasons)
                     c.ready_contract_status = "FAIL"
                 c.action = capped
             logger.info(
@@ -1555,6 +2239,39 @@ def _assign_percentile_actions(candidates: list, *, regime: str = "NEUTRAL") -> 
             )
         except Exception as exc:
             logger.exception("Action gates failed (continuing with percentile labels): %s", exc)
+
+    # High-conviction scorecard override (post-action-gates).
+    # When the additive scorecard evidence is overwhelming (sb_score in the
+    # very top of the cohort AND above an absolute z floor), restore STRONG
+    # BUY even if individual Tier gates flagged it.  Rationale: any single
+    # gate (F-score, EV/EBIT, entry-stance) is a noisy filter; a +1.0σ
+    # composite combining 8 such signals has substantially higher SNR than
+    # any one of them.  Trap-safeguard / V2-reject still veto via the
+    # earlier `scored` filter so this cannot resurrect a true value trap.
+    if scorecard_enabled and bool(getattr(config, "STRONG_BUY_SCORECARD_OVERRIDE_ENABLED", True)):
+        override_z = float(getattr(config, "STRONG_BUY_SCORECARD_OVERRIDE_Z", 1.0))
+        override_top_n = int(getattr(config, "STRONG_BUY_SCORECARD_OVERRIDE_TOP_N", 5))
+        # Re-rank by sb_score across all original `scored` candidates.
+        eligible = [c for c in scored if getattr(c, "sb_score", None) is not None]
+        eligible.sort(key=lambda c: safe_float(c.sb_score, default=-999.0), reverse=True)
+        n_override = 0
+        for c in eligible[:override_top_n]:
+            sb_val = safe_float(c.sb_score, default=-999.0)
+            if sb_val < override_z:
+                break
+            # Don't resurrect MANUAL REVIEW (trap / V2 reject reached scoring earlier
+            # would already have been filtered out of `scored`).
+            if c.action in ("MANUAL REVIEW", "INSUFFICIENT DATA"):
+                continue
+            if c.action != "STRONG BUY":
+                logger.info(
+                    "Scorecard override: %s sb_score=%+.3f >= %.2f -> STRONG BUY (was %s)",
+                    c.ticker, sb_val, override_z, c.action,
+                )
+                c.action = "STRONG BUY"
+                n_override += 1
+        if n_override:
+            logger.info("Scorecard override: %d candidates restored to STRONG BUY", n_override)
 
 
 # ---------------------------------------------------------------------------
@@ -1631,6 +2348,7 @@ class ScoredCandidate:
     earnings_days: int | None = None
     cap_tier: str = "unknown"
     confidence_discount: float = 1.0
+    effective_data_confidence: float | None = None
     max_weight_scale: float = 1.0
     # Post-earnings + 52w high
     post_earnings_recent: bool = False
@@ -1732,11 +2450,19 @@ class ScoredCandidate:
     institutional_prior_score: float = 0.0
     institutional_prior_percentile: float = 0.0
     institutional_prior_confidence: float = 0.0
+    institutional_prior_coverage: float = 0.0
     institutional_prior_components: dict = field(default_factory=dict)
     institutional_prior_rank: float = 0.0
+    ready_contract_core_status: str = "FAIL"
+    ready_contract_core_reasons: list = field(default_factory=list)
     ready_contract_status: str = "FAIL"
     ready_contract_reasons: list = field(default_factory=list)
+    ready_contract_score: float | None = None
+    ready_contract_soft_passes: list = field(default_factory=list)
+    strong_buy_blockers: list = field(default_factory=list)
     strong_buy_eligible: bool = False
+    ready_lane_score: float | None = None
+    ready_lane_missing_fields: list = field(default_factory=list)
     # Factor momentum (Ehsani & Linnainmaa 2022)
     factor_momentum_tilt: dict = field(default_factory=dict)
     network_momentum: float | None = None
@@ -1764,6 +2490,12 @@ class ScoredCandidate:
     selection_rank: float = 0.0
     timing_rank: float = 0.0
     portfolio_fit_rank: float = 0.0
+    # STRONG BUY scorecard (continuous combination of pillar + factor signals;
+    # additive substitute for the historic 10-predicate AND-gate).
+    sb_score: float | None = None
+    # Distribution-free conformal p-value (Vovk-Gammerman-Shafer 2005);
+    # populated when calibration set has ≥ 50 mature 90d returns.
+    conformal_p: float | None = None
     # Final
     final_rank: float = 0.0
 
@@ -1782,6 +2514,7 @@ class DiscoveryResult:
     run_time_seconds: float = 0.0
     fx_penalties_applied: int = 0
     error: str | None = None
+    stage_timings: dict = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -1902,7 +2635,12 @@ def _compute_ticker_identity_warning(
     """Warn when discovery metadata and live quote metadata appear inconsistent."""
     from utils.data_fetch import get_cached_ticker_info, get_ticker_info
 
-    info = get_ticker_info(ticker)
+    info = get_cached_ticker_info(ticker)
+    if (
+        not info
+        and getattr(config, "DISCOVERY_IDENTITY_WARNING_ALLOW_YAHOO_NETWORK", False)
+    ):
+        info = get_ticker_info(ticker, allow_network=True)
     if not info:
         return None
 
@@ -1946,6 +2684,12 @@ def _derive_entry_stance(
     earnings_near: bool,
 ) -> str:
     """Classify whether a candidate looks ready, pullback-worthy, or not actionable today."""
+    near_high_pullback_ret = float(getattr(config, "READY_ENTRY_NEAR_HIGH_PULLBACK_RET30", 0.12))
+    near_high_min_upside = float(getattr(config, "READY_ENTRY_NEAR_HIGH_MIN_UPSIDE", 8.0))
+    near_high_requires_pullback = near_52w_high and (
+        return_30d >= near_high_pullback_ret
+        or (analyst_upside is not None and analyst_upside < near_high_min_upside)
+    )
     if (
         governance_flag
         or asymmetric_risk_flag
@@ -1962,7 +2706,7 @@ def _derive_entry_stance(
 
     if (
         is_parabolic
-        or near_52w_high
+        or near_high_requires_pullback
         or (analyst_upside is not None and analyst_upside < 5)
         or insider_sells > insider_buys
         or earnings_near
@@ -2978,7 +3722,16 @@ def _cheap_ready_score(candidate: dict) -> float:
         elif 0.78 <= pct_high < 0.88:
             score += 0.08
         elif pct_high > 1.02:
-            score -= 0.10
+            score -= 0.22
+        elif pct_high >= 0.985:
+            score -= 0.18
+
+    ret30 = safe_float(candidate.get("_ret_30d"), default=None)
+    if ret30 is not None:
+        if ret30 >= 0.18:
+            score -= 0.20
+        elif ret30 >= 0.12:
+            score -= 0.08
 
     vol = safe_float(candidate.get("_vol_20d"), default=None)
     if vol is not None:
@@ -2997,6 +3750,125 @@ def _cheap_ready_score(candidate: dict) -> float:
     return float(np.clip(score, 0.0, 1.0))
 
 
+def _stage5_value_support(candidate: dict) -> tuple[bool, list[str]]:
+    """Cheap value/growth support available before Stage 6."""
+    reasons: list[str] = []
+    ev_ebit = safe_float(candidate.get("_ev_ebit"), default=None)
+    fcf_yield = safe_float(candidate.get("_fcf_yield"), default=None)
+    revenue_growth = safe_float(candidate.get("_revenue_growth"), default=None)
+    pe = safe_float(candidate.get("_pe_ratio"), default=None)
+    peg = safe_float(candidate.get("_peg_ratio"), default=None)
+
+    support = False
+    if ev_ebit is not None and 0 < ev_ebit <= 25:
+        support = True
+        reasons.append("EV/EBIT support")
+    if fcf_yield is not None and fcf_yield >= 0.03:
+        support = True
+        reasons.append("FCF yield support")
+    if revenue_growth is not None and revenue_growth >= 0.15:
+        support = True
+        reasons.append("growth support")
+    if pe is not None and 0 < pe <= 30:
+        support = True
+        reasons.append("P/E support")
+    if peg is not None and 0 < peg <= 1.2:
+        support = True
+        reasons.append("PEG support")
+    return support, reasons
+
+
+def _gate_aware_ready_lane_score(candidate: dict) -> float:
+    """Estimate whether a Stage 5 candidate can become ready-to-buy today.
+
+    This is deliberately stricter than ``_cheap_ready_score``. It uses only
+    cached/PIT-safe fields, but tries to mirror the later Ready Strong Buy
+    contract: acceptable entry setup, enough quality/value evidence, and no
+    obvious stretch/valuation flags.
+    """
+    if _candidate_exclusion_reason(candidate):
+        return 0.0
+
+    score = 0.30 * _cheap_ready_score(candidate)
+
+    pct_high = safe_float(candidate.get("_pct_from_high"), default=None)
+    ret30 = safe_float(candidate.get("_ret_30d"), default=None)
+    ret90 = safe_float(candidate.get("_ret_90d"), default=None)
+    vol = safe_float(candidate.get("_vol_20d"), default=None)
+    if candidate.get("_above_sma50") and candidate.get("_above_sma200"):
+        score += 0.08
+    if pct_high is not None:
+        if 0.80 <= pct_high <= 0.975:
+            score += 0.16
+        elif pct_high >= 0.99:
+            score -= 0.22
+    if ret30 is not None:
+        if -0.05 <= ret30 <= 0.12:
+            score += 0.12
+        elif ret30 >= 0.18:
+            score -= 0.18
+    if ret90 is not None and ret30 is not None and ret90 > 0 and ret30 < ret90 * 0.75:
+        score += 0.05
+    if vol is not None:
+        if vol <= 0.35:
+            score += 0.05
+        elif vol >= 0.60:
+            score -= 0.08
+
+    f_score = safe_float(candidate.get("_f_score"), default=None)
+    f_cov = safe_float(candidate.get("_f_score_coverage"), default=0.0)
+    gpa = safe_float(candidate.get("_gpa"), default=None)
+    pit_quality = safe_float(candidate.get("_pit_quality_score"), default=None)
+    if f_score is not None and f_cov >= 0.45:
+        score += 0.12 if f_score >= 5 else -0.12
+    elif f_score is None:
+        score -= 0.04
+    if gpa is not None:
+        if gpa >= 0.15:
+            score += 0.14
+        elif gpa >= 0.08:
+            score += 0.06
+        else:
+            score -= 0.08
+    elif pit_quality is None:
+        score -= 0.04
+    if pit_quality is not None and pit_quality > 0:
+        score += min(0.08, 0.08 * pit_quality)
+
+    value_support, _ = _stage5_value_support(candidate)
+    if value_support:
+        score += 0.14
+    else:
+        score -= 0.08
+
+    ev_ebit = safe_float(candidate.get("_ev_ebit"), default=None)
+    pe = safe_float(candidate.get("_pe_ratio"), default=None)
+    if ev_ebit is not None and ev_ebit > 50:
+        score -= 0.15
+    elif ev_ebit is not None and ev_ebit > 30:
+        score -= 0.08
+    if pe is not None and pe > 60:
+        score -= 0.15
+    elif pe is not None and pe > 35:
+        score -= 0.08
+
+    if safe_float(candidate.get("_avg_dollar_volume"), default=0.0) >= 5_000_000:
+        score += 0.04
+    return float(np.clip(score, 0.0, 1.0))
+
+
+def _ready_lane_missing_fields(candidate: dict) -> list[str]:
+    missing: list[str] = []
+    if candidate.get("_f_score") is None or safe_float(candidate.get("_f_score_coverage"), default=0.0) < 0.45:
+        missing.append("f_score")
+    if candidate.get("_gpa") is None:
+        missing.append("gpa")
+    value_support, _ = _stage5_value_support(candidate)
+    if not value_support:
+        missing.append("value_support")
+    return missing
+
+
 def _stage_quick_rank(
     candidates: list[dict],
     top_n: int,
@@ -3010,7 +3882,7 @@ def _stage_quick_rank(
               P/E, market cap, earnings growth, ROE from yfinance + FMP where available.
     Stage 5c: Multi-lens selection of top N for full deep analysis.
     """
-    from utils.data_fetch import get_ticker_info
+    from utils.data_fetch import get_cached_ticker_info, get_ticker_info
 
     lightweight_n = getattr(config, "DISCOVERY_TOP_N_LIGHTWEIGHT", 150)
 
@@ -3108,7 +3980,7 @@ def _stage_quick_rank(
             return (symbol, cached, "cache")
         try:
             timeout = int(getattr(config, "DISCOVERY_INFO_TIMEOUT_SECONDS", 8))
-            info = get_ticker_info(symbol, timeout=timeout)
+            info = get_ticker_info(symbol, timeout=timeout, allow_network=True)
             return (symbol, info, "network" if info else "empty")
         except Exception:
             return (symbol, {}, "error")
@@ -3171,6 +4043,10 @@ def _stage_quick_rank(
         if getattr(config, "DISCOVERY_YFINANCE_INFO_FALLBACK", True)
         and not _has_stage5b_min_info(info_map.get(sym, {}))
     ]
+    yahoo_metadata_policy = str(
+        getattr(config, "DISCOVERY_YAHOO_METADATA_POLICY", "cache_only") or "cache_only"
+    ).lower()
+    yahoo_live_metadata_enabled = yahoo_metadata_policy in {"live", "live_fallback", "network"}
 
     symbol_iter = iter(symbols_for_yf)
     pending: dict[concurrent.futures.Future, str] = {}
@@ -3178,6 +4054,7 @@ def _stage_quick_rank(
     empty_count = 0
     cache_count = 0
     network_count = 0
+    skipped_count = 0
     _prefetch_start = time.time()
 
     def _submit_until_full(pool: concurrent.futures.ThreadPoolExecutor) -> None:
@@ -3188,95 +4065,163 @@ def _stage_quick_rank(
                 return
             pending[pool.submit(_prefetch_info, sym)] = sym
 
-    pool = concurrent.futures.ThreadPoolExecutor(max_workers=_INFO_WORKERS)
-    try:
-        _submit_until_full(pool)
-        while pending:
-            remaining = _INFO_PREFETCH_TIMEOUT - (time.time() - _prefetch_start)
-            if remaining <= 0:
-                logger.warning(
-                    "Stage 5b .info prefetch budget exhausted after %d/%d tickers; using fallback for the rest",
-                    done_count,
-                    len(symbols_for_yf),
-                )
-                break
-            done, _ = concurrent.futures.wait(
-                pending,
-                timeout=min(remaining, max(1.0, float(getattr(config, "DISCOVERY_INFO_TIMEOUT_SECONDS", 8)) + 2.0)),
-                return_when=concurrent.futures.FIRST_COMPLETED,
-            )
-            if not done:
-                logger.warning(
-                    "Stage 5b .info prefetch stalled after %d/%d tickers; using fallback for the rest",
-                    done_count,
-                    len(symbols_for_yf),
-                )
-                break
-
-            for future in done:
-                sym = pending.pop(future)
-                try:
-                    fetched_sym, info, source = future.result(timeout=0)
-                    sym = fetched_sym or sym
-                    info_map[sym] = _merge_info(info_map.get(sym, {}), info or {})
-                except Exception:
-                    source = "error"
-                    info_map[sym] = info_map.get(sym, {})
-
+    if not yahoo_live_metadata_enabled:
+        for sym in symbols_for_yf:
+            cached = get_cached_ticker_info(sym)
+            if cached:
+                info_map[sym] = _merge_info(info_map.get(sym, {}), cached)
+                cache_count += 1
                 done_count += 1
-                if source == "cache":
-                    cache_count += 1
-                elif source == "network":
-                    network_count += 1
-                else:
-                    empty_count += 1
-
-                if progress_callback and done_count % 50 == 0:
-                    progress_callback(
-                        f"Fetching fundamentals... ({done_count}/{len(symbols_for_yf)})",
-                        done_count, len(symbols_for_yf),
-                    )
-
-            if (
-                done_count >= _INFO_CIRCUIT_MIN
-                and empty_count / max(done_count, 1) >= _INFO_EMPTY_RATE_CIRCUIT
-            ):
-                logger.warning(
-                    "Stage 5b .info circuit breaker fired: empty_rate=%.0f%% after %d responses; using fallback for remaining tickers",
-                    100.0 * empty_count / max(done_count, 1),
-                    done_count,
-                )
-                break
-
+            else:
+                skipped_count += 1
+        if symbols_for_yf:
+            logger.info(
+                "Stage 5b Yahoo metadata policy=%s: skipped %d live .info calls; using PIT/FMP/cache only",
+                yahoo_metadata_policy,
+                skipped_count,
+            )
+    else:
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=_INFO_WORKERS)
+        try:
             _submit_until_full(pool)
-    finally:
-        for future in pending:
-            future.cancel()
-        pool.shutdown(wait=False, cancel_futures=True)
+            while pending:
+                remaining = _INFO_PREFETCH_TIMEOUT - (time.time() - _prefetch_start)
+                if remaining <= 0:
+                    logger.warning(
+                        "Stage 5b .info prefetch budget exhausted after %d/%d tickers; using fallback for the rest",
+                        done_count,
+                        len(symbols_for_yf),
+                    )
+                    break
+                done, _ = concurrent.futures.wait(
+                    pending,
+                    timeout=min(remaining, max(1.0, float(getattr(config, "DISCOVERY_INFO_TIMEOUT_SECONDS", 8)) + 2.0)),
+                    return_when=concurrent.futures.FIRST_COMPLETED,
+                )
+                if not done:
+                    logger.warning(
+                        "Stage 5b .info prefetch stalled after %d/%d tickers; using fallback for the rest",
+                        done_count,
+                        len(symbols_for_yf),
+                    )
+                    break
+
+                for future in done:
+                    sym = pending.pop(future)
+                    try:
+                        fetched_sym, info, source = future.result(timeout=0)
+                        sym = fetched_sym or sym
+                        info_map[sym] = _merge_info(info_map.get(sym, {}), info or {})
+                    except Exception:
+                        source = "error"
+                        info_map[sym] = info_map.get(sym, {})
+
+                    done_count += 1
+                    if source == "cache":
+                        cache_count += 1
+                    elif source == "network":
+                        network_count += 1
+                    else:
+                        empty_count += 1
+
+                    if progress_callback and done_count % 50 == 0:
+                        progress_callback(
+                            f"Fetching fundamentals... ({done_count}/{len(symbols_for_yf)})",
+                            done_count, len(symbols_for_yf),
+                        )
+
+                if (
+                    done_count >= _INFO_CIRCUIT_MIN
+                    and empty_count / max(done_count, 1) >= _INFO_EMPTY_RATE_CIRCUIT
+                ):
+                    logger.warning(
+                        "Stage 5b .info circuit breaker fired: empty_rate=%.0f%% after %d responses; using fallback for remaining tickers",
+                        100.0 * empty_count / max(done_count, 1),
+                        done_count,
+                    )
+                    break
+
+                _submit_until_full(pool)
+        finally:
+            for future in pending:
+                future.cancel()
+            pool.shutdown(wait=False, cancel_futures=True)
 
     for sym in symbols:
         info_map.setdefault(sym, {})
 
     logger.info(
-        "Stage 5b: PIT/FMP prefill pit=%d fmp=%d; yfinance .info fetched for %d/%d fallback tickers across %d candidates (cache=%d, network=%d, empty=%d)",
+        "Stage 5b: PIT/FMP prefill pit=%d fmp=%d; Yahoo metadata policy=%s fetched %d/%d fallback tickers across %d candidates (cache=%d, network=%d, empty=%d, skipped=%d)",
         pit_prefill_count,
         fmp_prefill_count,
+        yahoo_metadata_policy,
         done_count,
         len(symbols_for_yf),
         len(symbols),
         cache_count,
         network_count,
         empty_count,
+        skipped_count,
     )
+    try:
+        atomic_write_json(
+            getattr(config, "DISCOVERY_YAHOO_METADATA_HEALTH_PATH", "feature_cache/yahoo_metadata_health.json"),
+            {
+                "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                "stage": "stage5b",
+                "policy": yahoo_metadata_policy,
+                "candidates": len(symbols),
+                "fallback_tickers": len(symbols_for_yf),
+                "pit_prefill": pit_prefill_count,
+                "fmp_prefill": fmp_prefill_count,
+                "cache": cache_count,
+                "network": network_count,
+                "empty": empty_count,
+                "skipped": skipped_count,
+                "circuit_breaker_would_have_sampled": _INFO_CIRCUIT_MIN,
+            },
+            indent=2,
+        )
+    except Exception as _health_e:
+        logger.debug("Yahoo metadata health write failed: %s", _health_e)
 
     scored = []
     _stage5_start = time.time()
+    _stage5_timeout = max(0.0, float(getattr(config, "DISCOVERY_STAGE5B_SCORING_TIMEOUT", 0) or 0))
+    _stage5_min_scored = max(
+        0,
+        min(
+            len(candidates),
+            int(getattr(config, "DISCOVERY_STAGE5B_MIN_SCORED_FOR_TIMEOUT", max(top_n, 1)) or 0),
+        ),
+    )
+    _stage5_deadline = _stage5_start + _stage5_timeout if _stage5_timeout > 0 else None
     _fmp_errors = 0
     _factor_errors = 0
     _fmp_topup_calls = 0
     _fmp_topup_skipped = 0
+    _fmp_topup_elapsed = 0.0
     _fmp_topup_max = max(0, int(getattr(config, "DISCOVERY_STAGE5B_FMP_TOPUP_MAX_CALLS", 60)))
+    _fmp_topup_time_budget = max(
+        0.0,
+        float(getattr(config, "DISCOVERY_STAGE5B_FMP_TOPUP_TIME_BUDGET", 0) or 0),
+    )
+    _live_snapshots: dict[str, dict] = {}
     for i, c in enumerate(candidates):
+        if (
+            _stage5_deadline is not None
+            and i > 0
+            and len(scored) >= _stage5_min_scored
+            and time.time() >= _stage5_deadline
+        ):
+            logger.warning(
+                "Stage 5b scoring deadline hit after %.0fs; using %d/%d scored candidates",
+                time.time() - _stage5_start,
+                len(scored),
+                len(candidates),
+            )
+            break
+
         symbol = c.get("symbol", "")
         momentum = c.get("_momentum_score", 0.5)
         value_score = c.get("_value_score", 0.5)
@@ -3291,13 +4236,17 @@ def _stage_quick_rank(
 
         info = info_map.get(symbol, {})
         if info:
+            c["_stage5b_info"] = dict(info)
             # PIT history ingest: persist today's fundamentals so future
             # backtests / eval loops can retrieve values actually knowable at
             # a given as_of date (45-day filing lag enforced on reads).
-            try:
-                pit_store.record_live_snapshot(symbol, info)
-            except Exception:
-                pass
+            if getattr(config, "DISCOVERY_STAGE5B_PIT_BATCH_RECORD", True):
+                _live_snapshots[symbol] = info
+            else:
+                try:
+                    pit_store.record_live_snapshot(symbol, info)
+                except Exception:
+                    pass
             try:
                 qmj_score, qmj_details = _compute_qmj_quality(info)
             except Exception as _qe:
@@ -3400,10 +4349,16 @@ def _stage_quick_rank(
             if not (has_yf_peg and has_yf_rev_growth):
                 if _fmp_topup_calls >= _fmp_topup_max:
                     _fmp_topup_skipped += 1
+                elif _fmp_topup_time_budget > 0 and _fmp_topup_elapsed >= _fmp_topup_time_budget:
+                    _fmp_topup_skipped += 1
+                elif _stage5_deadline is not None and (time.time() + 20.0) >= _stage5_deadline:
+                    _fmp_topup_skipped += 1
                 else:
                     _fmp_topup_calls += 1
                     try:
+                        _fmp_call_start = time.time()
                         metrics = get_key_metrics(symbol, period="annual", limit=2)
+                        _fmp_topup_elapsed += time.time() - _fmp_call_start
                         if metrics and isinstance(metrics, list) and metrics:
                             m = metrics[0]
                             if not has_yf_rev_growth:
@@ -3427,6 +4382,7 @@ def _stage_quick_rank(
                                 elif peg_fmp is not None and peg_fmp > 0:
                                     c["_peg_ratio"] = peg_fmp
                     except Exception as _fmp_e:
+                        _fmp_topup_elapsed += time.time() - locals().get("_fmp_call_start", time.time())
                         _fmp_errors += 1
                         if _fmp_errors <= 5:
                             logger.debug("FMP metrics failed for %s: %s", symbol, _fmp_e)
@@ -3460,19 +4416,37 @@ def _stage_quick_rank(
 
         ready_score = _cheap_ready_score(c)
         c["_cheap_ready_score"] = ready_score
+        ready_lane_score = _gate_aware_ready_lane_score(c)
+        c["_ready_lane_score"] = ready_lane_score
+        c["_ready_lane_missing_fields"] = _ready_lane_missing_fields(c)
+        c["_cheap_quality_score"] = _cheap_quality_score(c)
         if getattr(config, "DISCOVERY_STAGE5_READY_BOOST_ENABLED", True):
             strength = float(getattr(config, "DISCOVERY_STAGE5_READY_BOOST_STRENGTH", 0.30))
             combined *= 1.0 + strength * (ready_score - 0.5)
+            combined *= 1.0 + 0.20 * (ready_lane_score - 0.5)
 
         c["_quick_score"] = combined
         c["_fundamental_bonus"] = fundamental_bonus
         scored.append(c)
 
+    if _live_snapshots:
+        try:
+            _pit_start = time.time()
+            updated = pit_store.record_live_snapshots(_live_snapshots)
+            logger.info(
+                "Stage 5b PIT live snapshots recorded: %d/%d in %.1fs",
+                updated,
+                len(_live_snapshots),
+                time.time() - _pit_start,
+            )
+        except Exception as _pit_e:
+            logger.debug("Stage 5b PIT batch snapshot failed: %s", _pit_e)
+
     scored.sort(key=lambda x: x.get("_quick_score", 0), reverse=True)
 
     _stage5_elapsed = time.time() - _stage5_start
-    logger.info("Stage 5b scoring complete: %d candidates in %.1fs (fmp_calls=%d, fmp_skipped=%d, fmp_err=%d, factor_err=%d)",
-                len(scored), _stage5_elapsed, _fmp_topup_calls, _fmp_topup_skipped, _fmp_errors, _factor_errors)
+    logger.info("Stage 5b scoring complete: %d candidates in %.1fs (fmp_calls=%d, fmp_skipped=%d, fmp_time=%.1fs, fmp_err=%d, factor_err=%d)",
+                len(scored), _stage5_elapsed, _fmp_topup_calls, _fmp_topup_skipped, _fmp_topup_elapsed, _fmp_errors, _factor_errors)
 
     # Record the full Stage 5b panel for ML training (fixes survivorship bias).
     # All candidates here have fundamentals fetched — marginal cost is SQLite INSERTs.
@@ -3495,6 +4469,16 @@ def _stage_quick_rank(
         lens_floor=int(getattr(config, "DISCOVERY_FULL_SCORE_LENS_FLOOR", 0)),
         lens_min_counts=getattr(config, "DISCOVERY_FULL_SCORE_LENS_MIN_COUNTS", None),
     )
+    if getattr(config, "DISCOVERY_FULL_SCORE_READY_LANE_ENABLED", True):
+        ready_lane_reserve = int(round(top_n * float(getattr(config, "DISCOVERY_FULL_SCORE_READY_LANE_PCT", 0.30))))
+        selected = _promote_ready_lane(
+            scored,
+            selected,
+            target_n=top_n,
+            reserve_n=ready_lane_reserve,
+            min_ready_score=float(getattr(config, "DISCOVERY_FULL_SCORE_READY_LANE_MIN_SCORE", 0.58)),
+            score_key="_quick_score",
+        )
     selected = _promote_ready_reserve(
         scored,
         selected,
@@ -3503,6 +4487,15 @@ def _stage_quick_rank(
         min_ready_score=float(getattr(config, "DISCOVERY_FULL_SCORE_READY_MIN_SCORE", 0.20)),
         score_key="_quick_score",
     )
+    if getattr(config, "DISCOVERY_FULL_SCORE_CHEAP_QUALITY_RESERVE_ENABLED", True):
+        selected = _promote_cheap_quality_reserve(
+            scored,
+            selected,
+            target_n=top_n,
+            reserve_n=int(getattr(config, "DISCOVERY_FULL_SCORE_CHEAP_QUALITY_RESERVE", 20)),
+            min_score=float(getattr(config, "DISCOVERY_FULL_SCORE_CHEAP_QUALITY_MIN_SCORE", 0.55)),
+            score_key="_quick_score",
+        )
     selected = _promote_challenge_reserve(
         scored,
         selected,
@@ -3637,6 +4630,8 @@ def _stage_full_scoring(
                 "avg_buy_price": price,
                 "quantity": 1,
                 "currency": currency,
+                "_yahoo_info": c.get("_stage5b_info") or {},
+                "_allow_yahoo_metadata_network": False,
             },
             "currency": currency,
             "exchange": exchange,
@@ -3644,7 +4639,7 @@ def _stage_full_scoring(
 
     def _attach_score_metadata(item: dict, result: dict) -> dict:
         c = item["candidate"]
-        result["_candidate"] = c
+        result["_candidate"] = {k: v for k, v in c.items() if k != "_stage5b_info"}
         result["_currency"] = item["currency"]
         result["_exchange"] = item["exchange"]
         result["_country"] = c.get("country", "")
@@ -3666,11 +4661,44 @@ def _stage_full_scoring(
         result["_correlation_penalty"] = c.get("_correlation_penalty", 0.0)
         result["_entry_lens"] = c.get("_entry_lens", "momentum")
         result["_quick_filter_penalty"] = c.get("_quick_filter_penalty", 0)
+        result["_ready_lane_score"] = c.get("_ready_lane_score")
+        result["_ready_lane_missing_fields"] = c.get("_ready_lane_missing_fields", [])
         result["_quality_score_fundamental"] = c.get("_quality_score_fundamental")
         result["_gross_profitability"] = c.get("_gross_profitability")
         result["_fcf_to_assets"] = c.get("_fcf_to_assets")
         result["_earnings_stability"] = c.get("_earnings_stability")
         result["_eps_growth_variance_5y"] = c.get("_eps_growth_variance_5y")
+        # Stage 5 carries PIT-safe quality/value evidence. Preserve it when
+        # the slower Stage 6 fundamental component times out or returns sparse
+        # data, otherwise the ready contract treats known values as missing.
+        pit_fallbacks = {
+            "f_score": "_f_score",
+            "f_score_coverage": "_f_score_coverage",
+            "gpa": "_gpa",
+            "gross_profitability": "_gross_profitability",
+            "fcf_to_assets": "_fcf_to_assets",
+            "fcf_yield": "_fcf_yield",
+            "ev_ebit": "_ev_ebit",
+            "ebit_yield": "_pit_ebit_yield",
+            "net_debt_ebitda": "_net_debt_ebitda",
+            "cash_to_debt": "_cash_to_debt",
+            "revenue_growth": "_revenue_growth",
+            "pe_ratio": "_pe_ratio",
+            "market_cap": "_market_cap",
+        }
+        for public_key, private_key in pit_fallbacks.items():
+            if result.get(public_key) in (None, "") and c.get(private_key) not in (None, ""):
+                result[public_key] = c.get(private_key)
+        pit_f_cov = safe_float(c.get("_f_score_coverage"), default=None)
+        res_f_cov = safe_float(result.get("f_score_coverage"), default=0.0)
+        if pit_f_cov is not None and pit_f_cov > max(res_f_cov or 0.0, 0.0):
+            result["f_score_coverage"] = pit_f_cov
+        if result.get("gpa_score") in (None, "") and result.get("gpa") not in (None, ""):
+            result["gpa_score"] = float(np.clip((safe_float(result.get("gpa"), default=0.0) - 0.25) / 0.20, -1.0, 1.0))
+        if result.get("f_score_score") in (None, "") and result.get("f_score") not in (None, ""):
+            result["f_score_score"] = float(np.clip((safe_float(result.get("f_score"), default=4.5) - 4.5) / 3.0, -1.0, 1.0))
+        if result.get("quality_score_fundamental") in (None, "") and c.get("_pit_quality_score") is not None:
+            result["quality_score_fundamental"] = c.get("_pit_quality_score")
         return result
 
     def _fallback_scored_item(item: dict, reason: str) -> dict:
@@ -4138,7 +5166,11 @@ def _stage_final_ranking(
         _risk_overlay_failed = False
         try:
             from engine.risk_overlay import apply_risk_overlay
-            overlay = apply_risk_overlay(r, ticker)
+            overlay = apply_risk_overlay(
+                r,
+                ticker,
+                allow_yahoo_earnings=bool(getattr(config, "DISCOVERY_RISK_OVERLAY_ALLOW_YAHOO_EARNINGS", False)),
+            )
         except Exception as e:
             logger.warning("Risk overlay failed for %s: %s", ticker, e)
             from engine.risk_overlay import RiskOverlay
@@ -4593,7 +5625,7 @@ def _stage_final_ranking(
 
         _effective_gate_status = _gate_v2_status if _v2_active else "PASS"
         _effective_gate_reasons = _gate_v2_reasons if _v2_active else []
-        _ready_contract_status, _ready_contract_reasons = _evaluate_ready_strong_buy_contract(
+        _ready_contract_status, _ready_contract_reasons, _ready_contract_details = _evaluate_ready_strong_buy_contract(
             gate_status=_effective_gate_status,
             trap_triggered=_trap_safeguard_triggered,
             prior=prior,
@@ -4605,8 +5637,12 @@ def _stage_final_ranking(
             position_weight=_size_data.get("position_weight"),
             data_confidence=effective_confidence,
             gate_reasons=_effective_gate_reasons,
+            return_details=True,
         )
+        _ready_contract_core_status = _ready_contract_status
+        _ready_contract_core_reasons = list(_ready_contract_reasons or [])
         _strong_buy_eligible = _ready_contract_status == "PASS"
+        _strong_buy_blockers = list(_ready_contract_reasons or [])
         if (
             _ml_meta_predict is not None
             and ml_meta_features is not None
@@ -4648,15 +5684,25 @@ def _stage_final_ranking(
                 })
                 if meta_success_prob is None:
                     meta_success_prob = _ml_meta_predict(meta_features)
-                min_meta_prob = float(getattr(config, "META_LABEL_STRONG_BUY_MIN_PROB", 0.60))
-                if meta_success_prob is not None and meta_success_prob < min_meta_prob:
+                if str(_ready_contract_core_status or "").upper() == "PASS":
+                    # Core-ready candidates need the current batch's core-ready
+                    # distribution, which is only complete in the percentile
+                    # action pass. Defer this gate to avoid stale-cache vetoes.
+                    min_meta_prob = None
+                else:
+                    try:
+                        from engine.auto_tune import get_meta_strong_buy_min_prob
+                        min_meta_prob = float(get_meta_strong_buy_min_prob())
+                    except Exception:
+                        min_meta_prob = float(getattr(config, "META_LABEL_STRONG_BUY_MIN_PROB", 0.60))
+                if min_meta_prob is not None and meta_success_prob is not None and meta_success_prob < min_meta_prob:
                     action = "BUY"
                     _strong_buy_eligible = False
                     _ready_contract_status = "FAIL"
                     _ready_contract_reasons = list(_ready_contract_reasons or [])
-                    _ready_contract_reasons.append(
-                        f"Meta-label confidence {meta_success_prob:.0%} below {min_meta_prob:.0%}"
-                    )
+                    meta_reason = f"Meta-label confidence {meta_success_prob:.0%} below {min_meta_prob:.0%}"
+                    _ready_contract_reasons.append(meta_reason)
+                    _strong_buy_blockers = list(_ready_contract_reasons)
                     meta_mult = float(getattr(config, "META_LABEL_RANK_MULTIPLIER_ON_FAIL", 0.90))
                     final_rank *= meta_mult
                     selection_rank *= meta_mult
@@ -4672,6 +5718,13 @@ def _stage_final_ranking(
 
         r["meta_prob"] = meta_success_prob
         r["meta_success_prob"] = meta_success_prob
+        r["strong_buy_blockers"] = list(_strong_buy_blockers or [])
+        r["ready_contract_core_status"] = _ready_contract_core_status
+        r["ready_contract_core_reasons"] = list(_ready_contract_core_reasons or [])
+        r["ready_contract_score"] = _ready_contract_details.get("score")
+        r["ready_contract_soft_passes"] = list(_ready_contract_details.get("soft_passes") or [])
+        r["gate_v2_status"] = _gate_v2_status
+        r["gate_v2_reasons"] = list(_gate_v2_reasons or [])
 
         candidates.append(ScoredCandidate(
             ticker=ticker,
@@ -4724,6 +5777,7 @@ def _stage_final_ranking(
             earnings_days=overlay.earnings_days,
             cap_tier=overlay.cap_tier,
             confidence_discount=overlay.confidence_discount,
+            effective_data_confidence=effective_confidence,
             max_weight_scale=overlay.max_weight_scale,
             post_earnings_recent=overlay.post_earnings_recent,
             post_earnings_days=overlay.post_earnings_days,
@@ -4836,11 +5890,19 @@ def _stage_final_ranking(
             institutional_prior_score=prior.score,
             institutional_prior_percentile=prior.percentile,
             institutional_prior_confidence=prior.confidence,
+            institutional_prior_coverage=prior.coverage,
             institutional_prior_components=prior.components,
             institutional_prior_rank=round(institutional_prior_rank, 3),
+            ready_contract_core_status=_ready_contract_core_status,
+            ready_contract_core_reasons=_ready_contract_core_reasons,
             ready_contract_status=_ready_contract_status,
             ready_contract_reasons=_ready_contract_reasons,
+            ready_contract_score=safe_float(_ready_contract_details.get("score"), default=None),
+            ready_contract_soft_passes=list(_ready_contract_details.get("soft_passes") or []),
+            strong_buy_blockers=_strong_buy_blockers,
             strong_buy_eligible=_strong_buy_eligible,
+            ready_lane_score=safe_float(r.get("_ready_lane_score"), default=None),
+            ready_lane_missing_fields=list(r.get("_ready_lane_missing_fields") or []),
             factor_momentum_tilt=factor_tilt_features,
             network_momentum=network_momentum,
             qa_sentiment_score=qa_sentiment_score,
@@ -4880,6 +5942,28 @@ def _stage_final_ranking(
             c.portfolio_fit_rank = round(c.portfolio_fit_rank - fit_adjustment, 3)
 
     _assign_percentile_actions(candidates, regime=run_regime_label)
+
+    # Conformal prediction overlay (Vovk-Gammerman-Shafer 2005; Angelopoulos &
+    # Bates 2021).  Computes a distribution-free p-value per candidate from the
+    # last 365 days of matured 90d outcomes — gives the UI a calibrated
+    # confidence reading even when the parametric meta-label is in cold-start.
+    if bool(getattr(config, "CONFORMAL_ENABLED", True)):
+        try:
+            from engine.conformal import compute_conformal_p, compute_k_ic
+            k_ic = compute_k_ic()
+            cp = compute_conformal_p(candidates, k_ic=k_ic)
+            n_sb = sum(
+                1 for c in candidates
+                if getattr(c, "action", "") == "STRONG BUY"
+                and getattr(c, "conformal_p", 1.0) is not None
+                and getattr(c, "conformal_p", 1.0) < 0.05
+            )
+            logger.info(
+                "Conformal overlay: n=%d candidates scored, k_ic=%.4f, %d STRONG BUY at p<0.05",
+                len(cp), k_ic, n_sb,
+            )
+        except Exception as e:
+            logger.warning("Conformal overlay failed (non-fatal): %s", e)
 
     candidates.sort(key=lambda x: x.final_rank, reverse=True)
 
@@ -4952,6 +6036,14 @@ def run_discovery(
     def _stage_elapsed():
         return f"[{time.time() - start_time:.0f}s total]"
 
+    def _mark_stage(name: str, stage_start: float, **metrics) -> None:
+        elapsed = round(time.time() - stage_start, 1)
+        total = round(time.time() - start_time, 1)
+        payload = {"seconds": elapsed, "total_seconds": total}
+        payload.update(metrics)
+        result.stage_timings[name] = payload
+        logger.info("Discovery timing: %s took %.1fs (total %.1fs) metrics=%s", name, elapsed, total, metrics)
+
     # Extract portfolio info
     existing_tickers = {h["ticker"] for h in holdings}
     existing_ticker_list = [h["ticker"] for h in holdings]
@@ -4973,6 +6065,7 @@ def run_discovery(
     if progress_callback:
         progress_callback("Stage 1: Assembling global universe...", 0, 7)
 
+    _stage_start = time.time()
     candidates = _stage_universe_assembly(existing_tickers, progress_callback)
     candidates = _filter_excluded_candidates(
         candidates,
@@ -4980,6 +6073,7 @@ def run_discovery(
         stage="universe_exclusion",
     )
     result.screened_count = len(candidates)
+    _mark_stage("stage1_universe", _stage_start, candidates=len(candidates), rejections=len(rejections))
     logger.info("Stage 1: Assembled %d candidates (FMP US + global universe) %s", len(candidates), _stage_elapsed())
 
     if not candidates:
@@ -4991,8 +6085,10 @@ def run_discovery(
     if progress_callback:
         progress_callback("Stage 2: Momentum screening...", 1, 7)
 
+    _stage_start = time.time()
     candidates, price_cache = _stage_momentum_screen(candidates, progress_callback)
     result.after_momentum_screen = len(candidates)
+    _mark_stage("stage2_momentum", _stage_start, candidates=len(candidates), price_cache=len(price_cache or {}))
     logger.info("Stage 2: %d candidates after momentum screen %s", len(candidates), _stage_elapsed())
 
     if not candidates:
@@ -5004,18 +6100,22 @@ def run_discovery(
     if progress_callback:
         progress_callback("Stage 3: Applying quick filters...", 2, 7)
 
+    _stage_start = time.time()
     candidates = _stage_quick_filter(candidates, portfolio_sectors, rejections)
     result.after_quick_filter = len(candidates)
+    _mark_stage("stage3_quick_filter", _stage_start, candidates=len(candidates), rejections=len(rejections))
     logger.info("Stage 3: %d candidates after quick filter %s", len(candidates), _stage_elapsed())
 
     # Stage 4: Correlation Filter
     if progress_callback:
         progress_callback("Stage 4: Computing correlations...", 3, 7)
 
+    _stage_start = time.time()
     candidates = _stage_correlation_filter(
         candidates, existing_ticker_list, rejections, price_cache, progress_callback,
     )
     result.after_corr_filter = len(candidates)
+    _mark_stage("stage4_correlation", _stage_start, candidates=len(candidates))
     logger.info("Stage 4: %d candidates with correlation penalties (soft filter, no rejections) %s", len(candidates), _stage_elapsed())
 
     if not candidates:
@@ -5029,14 +6129,17 @@ def run_discovery(
         progress_callback("Stage 5: Ranking candidates...", 4, 7)
 
     top_n = getattr(config, "DISCOVERY_TOP_N_FULL_SCORE", 30)
+    _stage_start = time.time()
     candidates = _stage_quick_rank(candidates, top_n, progress_callback)
     result.after_quick_rank = len(candidates)
+    _mark_stage("stage5_quick_rank", _stage_start, candidates=len(candidates), top_n=top_n)
     logger.info("Stage 5: Top %d candidates for full scoring %s", len(candidates), _stage_elapsed())
 
     # Stage 6: Full Scoring
     if progress_callback:
         progress_callback("Stage 6: Running full analysis...", 5, 7)
 
+    _stage_start = time.time()
     try:
         scored = _stage_full_scoring(candidates, progress_callback)
     except Exception as _s6_err:
@@ -5045,14 +6148,17 @@ def run_discovery(
         logger.error("Stage 6 traceback:\n%s", traceback.format_exc())
         result.error = f"Stage 6 failed: {_s6_err}"
         result.run_time_seconds = round(time.time() - start_time, 1)
+        _mark_stage("stage6_full_scoring", _stage_start, error=str(_s6_err))
         return result
     result.fully_scored = len(scored)
+    _mark_stage("stage6_full_scoring", _stage_start, candidates=len(scored))
     logger.info("Stage 6: %d candidates fully scored %s", len(scored), _stage_elapsed())
 
     # Stage 7: FX + Fit + Final Ranking
     if progress_callback:
         progress_callback("Stage 7: Computing final rankings...", 6, 7)
 
+    _stage_start = time.time()
     try:
         final_candidates = _stage_final_ranking(scored, portfolio_sectors, holdings)
     except Exception as _s7_err:
@@ -5061,12 +6167,14 @@ def run_discovery(
         logger.error("Stage 7 traceback:\n%s", traceback.format_exc())
         result.error = f"Stage 7 failed: {_s7_err}"
         result.run_time_seconds = round(time.time() - start_time, 1)
+        _mark_stage("stage7_final_ranking", _stage_start, error=str(_s7_err))
         return result
 
     result.candidates = final_candidates
     result.rejections = rejections
     result.fx_penalties_applied = sum(1 for c in final_candidates if c.fx_penalty_applied)
     result.run_time_seconds = round(time.time() - start_time, 1)
+    _mark_stage("stage7_final_ranking", _stage_start, candidates=len(final_candidates))
 
     logger.info("Discovery complete: %d candidates ranked in %.1fs",
                 len(final_candidates), result.run_time_seconds)

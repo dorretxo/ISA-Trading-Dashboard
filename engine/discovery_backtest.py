@@ -111,6 +111,7 @@ CREATE TABLE IF NOT EXISTS signal_backtest (
     institutional_prior_components TEXT,
     ready_contract_status TEXT,
     ready_contract_reasons TEXT,
+    strong_buy_blockers TEXT,
     strong_buy_eligible INTEGER,
 
     -- Forecast specifics
@@ -197,7 +198,8 @@ CREATE TABLE IF NOT EXISTS signal_backtest (
     evaluated_10d       INTEGER NOT NULL DEFAULT 0,
     evaluated_30d       INTEGER NOT NULL DEFAULT 0,
     evaluated_60d       INTEGER NOT NULL DEFAULT 0,
-    evaluated_90d       INTEGER NOT NULL DEFAULT 0
+    evaluated_90d       INTEGER NOT NULL DEFAULT 0,
+    tb_label_processed_for_threshold INTEGER NOT NULL DEFAULT 0
 );
 
 -- Aggregated pillar effectiveness (updated after evaluations)
@@ -302,6 +304,7 @@ _FEATURE_STORE_COLUMNS = [
     ("institutional_prior_components", "TEXT"),
     ("ready_contract_status", "TEXT"),
     ("ready_contract_reasons", "TEXT"),
+    ("strong_buy_blockers", "TEXT"),
     ("strong_buy_eligible", "INTEGER"),
     # Triple-barrier and meta-label fields (Lopez de Prado 2018)
     ("tb_label", "INTEGER"),
@@ -310,6 +313,7 @@ _FEATURE_STORE_COLUMNS = [
     ("tb_hit", "TEXT"),
     ("tb_horizon", "INTEGER"),
     ("tb_updated_at", "TEXT"),
+    ("tb_label_processed_for_threshold", "INTEGER NOT NULL DEFAULT 0"),
     ("meta_success", "INTEGER"),
     ("meta_prob", "REAL"),
     # Cache-only sleeve composites used by Stage 5a.
@@ -736,6 +740,298 @@ def record_stage5b_panel(candidates: list[dict]) -> int:
     return count
 
 
+def backfill_panel_actions(
+    *,
+    sources: tuple[str, ...] = ("replay_pit_v1",),
+    upgrade_only: tuple[str, ...] = ("replay_pit_v1",),
+    dry_run: bool = False,
+    batch_size: int = 500,
+) -> dict:
+    """Retroactively assign action labels using the current threshold function.
+
+    Recovery scenario (default, replay_pit_v1):
+      Replay rows were written with a labeller that capped at ``BUY``; rows
+      whose stored ``aggregate_score >= SCORE_STRONG_BUY_THRESHOLD`` should be
+      promoted to ``STRONG BUY`` (and through gates).  Their ``aggregate_score``
+      is the same Stage-6 pillar aggregate the live path uses — verified by the
+      clean break at 0.200 between NEUTRAL/BUY buckets — so re-labelling is
+      apples-to-apples for ``action_calibration``.
+
+    Upgrade-only semantics (default for replay_pit_v1):
+      We only WRITE when the new label is ``STRONG BUY``; we never demote an
+      existing ``BUY`` → ``NEUTRAL``.  This protects the existing 19k+ BUY
+      training rows from churn.
+
+    Optional: discovery_panel
+      Callers may pass ``sources=("discovery_panel", ...)`` but be aware that
+      ``discovery_panel.aggregate_score`` is Stage-5b ``_quick_score`` on a
+      different scale; do NOT use those rows in ``action_calibration``.
+
+    Labelling logic is shared with the live discovery path via
+    ``engine.discovery.apply_action_label`` so calibration data and live
+    decisions remain consistent.
+
+    Returns a summary dict suitable for logging.
+    """
+    # Lazy import to avoid any circular dependency with engine.discovery.
+    from engine.discovery import apply_action_label
+
+    init_backtest_db()
+    summary: dict = {
+        "sources": list(sources),
+        "scanned": 0,
+        "updated": 0,
+        "skipped_no_change": 0,
+        "skipped_no_data": 0,
+        "by_action": defaultdict(int),
+        "dry_run": bool(dry_run),
+    }
+
+    upgrade_only_set = set(upgrade_only)
+
+    with _connect() as conn:
+        for source in sources:
+            cur = conn.execute(
+                """
+                SELECT id, source, action, aggregate_score,
+                       technical_score, fundamental_score, sentiment_score, forecast_score,
+                       f_score, f_score_coverage, gpa,
+                       ev_ebit, fcf_yield, revenue_growth,
+                       price_vs_sma200_stretch, sector, name
+                FROM signal_backtest
+                WHERE source = ?
+                """,
+                (source,),
+            )
+            updates: list[tuple[str, int]] = []
+            for row in cur.fetchall():
+                summary["scanned"] += 1
+                (
+                    row_id, src, current_action, agg,
+                    tech, fund, sent, fcast,
+                    fs, fs_cov, gpa,
+                    ev_ebit, fcf_yield, rev_growth,
+                    stretch, sector, name,
+                ) = row
+
+                if agg is None:
+                    summary["skipped_no_data"] += 1
+                    continue
+
+                # Detect "all pillars zero" the same way the live path does.
+                pillar_vals = [tech, fund, sent, fcast]
+                pillars_all_zero = all(
+                    (v is None) or (abs(float(v)) < 1e-9) for v in pillar_vals
+                )
+
+                # Build a result dict in the shape apply_action_label expects.
+                result_dict = {
+                    "aggregate_score": agg,
+                    "f_score": fs,
+                    "f_score_coverage": fs_cov,
+                    "gpa": gpa,
+                    "ev_ebit": ev_ebit,
+                    "fcf_yield": fcf_yield,
+                    "revenue_growth": rev_growth,
+                    "price_vs_sma200_stretch": stretch,
+                    "name": name or "",
+                }
+
+                new_action, _gate_v2, _trap = apply_action_label(
+                    result_dict,
+                    pillars_all_zero=pillars_all_zero,
+                    adjusted_aggregate=float(agg),
+                    sector=sector or "",
+                    industry="",  # not stored on signal_backtest; trap-safeguard degrades to sector-only
+                )
+
+                # Decide whether to write.
+                current_action_norm = (current_action or "").strip()
+                if src in upgrade_only_set:
+                    # Only promote to STRONG BUY on existing labelled rows.
+                    if new_action == "STRONG BUY" and current_action_norm != "STRONG BUY":
+                        updates.append((new_action, row_id))
+                        summary["by_action"][new_action] += 1
+                    else:
+                        summary["skipped_no_change"] += 1
+                else:
+                    # Backfill empty labels (full apply).
+                    if not current_action_norm:
+                        updates.append((new_action, row_id))
+                        summary["by_action"][new_action] += 1
+                    elif current_action_norm != new_action:
+                        # Already labelled but disagrees — leave alone for safety.
+                        summary["skipped_no_change"] += 1
+                    else:
+                        summary["skipped_no_change"] += 1
+
+                # Flush in batches.
+                if len(updates) >= batch_size:
+                    if not dry_run:
+                        conn.executemany(
+                            "UPDATE signal_backtest SET action=? WHERE id=?",
+                            updates,
+                        )
+                    summary["updated"] += len(updates)
+                    updates = []
+
+            if updates:
+                if not dry_run:
+                    conn.executemany(
+                        "UPDATE signal_backtest SET action=? WHERE id=?",
+                        updates,
+                    )
+                summary["updated"] += len(updates)
+
+        if not dry_run:
+            conn.commit()
+
+    summary["by_action"] = dict(summary["by_action"])
+    logger.info(
+        "backfill_panel_actions: scanned=%d updated=%d skipped=%d (no-data=%d, no-change=%d) "
+        "by_action=%s dry_run=%s",
+        summary["scanned"],
+        summary["updated"],
+        summary["skipped_no_change"] + summary["skipped_no_data"],
+        summary["skipped_no_data"],
+        summary["skipped_no_change"],
+        summary["by_action"],
+        summary["dry_run"],
+    )
+    return summary
+
+
+def record_borderline_signals(candidates: list, *, max_records: int | None = None) -> int:
+    """Active labelling of borderline candidates (Settles 2010, Cohn-Atlas-Ladner 1994).
+
+    Records candidates whose ``sb_score`` lies in a configurable band BELOW
+    the STRONG BUY override threshold and whose action did NOT receive
+    STRONG BUY.  When their realised 90d returns mature, they become
+    high-information-gain training samples for the decision boundary —
+    uncertainty sampling near the boundary is 3-10× more label-efficient
+    than random sampling.
+
+    Stratified by sector so a single industry cannot dominate the sample.
+    Cap at ``max_records`` (config: ``ACTIVE_LABEL_MAX_RECORDS``, default 25).
+
+    Returns the count of new active-label rows written.  Skips silently when
+    ``ACTIVE_LABEL_ENABLED=False``.
+    """
+    if not bool(getattr(config, "ACTIVE_LABEL_ENABLED", True)):
+        return 0
+    if not candidates:
+        return 0
+
+    z_low = float(getattr(config, "ACTIVE_LABEL_SB_SCORE_LOW", 0.70))
+    z_high = float(getattr(config, "ACTIVE_LABEL_SB_SCORE_HIGH", 1.00))
+    if max_records is None:
+        max_records = int(getattr(config, "ACTIVE_LABEL_MAX_RECORDS", 25))
+
+    def _sb(c) -> float | None:
+        v = getattr(c, "sb_score", None)
+        try:
+            return float(v) if v is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    borderline: list = []
+    for c in candidates:
+        s = _sb(c)
+        if s is None:
+            continue
+        if not (z_low <= s < z_high):
+            continue
+        action = str(getattr(c, "action", "") or "")
+        if action in ("STRONG BUY", "INSUFFICIENT DATA", "MANUAL REVIEW"):
+            continue
+        borderline.append(c)
+
+    if not borderline:
+        return 0
+
+    # Stratified sampling: distribute slots across sectors.
+    sectors: dict[str, list] = {}
+    for c in borderline:
+        sectors.setdefault(getattr(c, "sector", None) or "Unknown", []).append(c)
+    per_sector = max(1, max_records // max(1, len(sectors)))
+    selected: list = []
+    for sec, sec_cands in sectors.items():
+        sec_cands.sort(key=lambda x: -(_sb(x) or 0.0))
+        selected.extend(sec_cands[:per_sector])
+    # If under cap, top-up by overall sb_score rank.
+    if len(selected) < max_records:
+        remaining = [c for c in borderline if c not in selected]
+        remaining.sort(key=lambda x: -(_sb(x) or 0.0))
+        selected.extend(remaining[: max_records - len(selected)])
+    selected = selected[:max_records]
+
+    init_backtest_db()
+    now = datetime.now().isoformat(timespec="seconds")
+    today = now[:10]
+    count = 0
+
+    with _connect() as conn:
+        for c in selected:
+            ticker = getattr(c, "ticker", None)
+            if not ticker:
+                continue
+            existing = conn.execute(
+                "SELECT id FROM signal_backtest WHERE ticker=? AND source='active_label' AND run_date LIKE ?",
+                (ticker, today + "%"),
+            ).fetchone()
+            if existing:
+                continue
+
+            sig_price = (
+                getattr(c, "current_price", None)
+                or getattr(c, "entry_price", None)
+                or getattr(c, "_last_price", None)
+                or 0
+            )
+            if not sig_price or sig_price <= 0:
+                continue
+
+            payload = {
+                "run_date": now,
+                "ticker": ticker,
+                "name": getattr(c, "name", "") or "",
+                "source": "active_label",
+                "signal_price": float(sig_price),
+                "action": "WOULD_HAVE_BEEN_SB",
+                "aggregate_score": getattr(c, "aggregate_score", None),
+                "technical_score": getattr(c, "technical_score", None),
+                "fundamental_score": getattr(c, "fundamental_score", None),
+                "sentiment_score": getattr(c, "sentiment_score", None),
+                "forecast_score": getattr(c, "forecast_score", None),
+                "momentum_score": getattr(c, "momentum_score", None),
+                "f_score": getattr(c, "f_score", None),
+                "f_score_coverage": getattr(c, "f_score_coverage", None),
+                "gpa": getattr(c, "gpa", None),
+                "gpa_score": getattr(c, "gpa_score", None),
+                "ev_ebit": getattr(c, "ev_ebit", None),
+                "ev_ebit_score": getattr(c, "ev_ebit_score", None),
+                "fcf_yield": getattr(c, "fcf_yield", None),
+                "revenue_growth": getattr(c, "revenue_growth", None),
+                "price_vs_sma200_stretch": getattr(c, "price_vs_sma200_stretch", None),
+                "sector": getattr(c, "sector", "") or "",
+                "exchange": getattr(c, "exchange", "") or "",
+            }
+            cols = ", ".join(payload.keys())
+            placeholders = ", ".join("?" for _ in payload)
+            conn.execute(
+                f"INSERT INTO signal_backtest ({cols}) VALUES ({placeholders})",
+                tuple(payload.values()),
+            )
+            count += 1
+
+    if count > 0:
+        logger.info(
+            "Active labelling: recorded %d borderline candidates (sb_score in [%.2f, %.2f), %d sectors)",
+            count, z_low, z_high, len(sectors),
+        )
+    return count
+
+
 def record_discovery_picks(candidates: list) -> int:
     """Record discovery candidates for backtesting."""
     init_backtest_db()
@@ -791,6 +1087,7 @@ def record_discovery_picks(candidates: list) -> int:
                 institutional_prior_components = getattr(c, "institutional_prior_components", None)
                 ready_contract_status = getattr(c, "ready_contract_status", None)
                 ready_contract_reasons = getattr(c, "ready_contract_reasons", None)
+                strong_buy_blockers = getattr(c, "strong_buy_blockers", None)
                 strong_buy_eligible = getattr(c, "strong_buy_eligible", None)
                 meta_prob = getattr(c, "meta_success_prob", getattr(c, "meta_prob", None))
                 regime_value = getattr(c, "regime", None)
@@ -853,6 +1150,7 @@ def record_discovery_picks(candidates: list) -> int:
                 institutional_prior_components = c.get("institutional_prior_components")
                 ready_contract_status = c.get("ready_contract_status")
                 ready_contract_reasons = c.get("ready_contract_reasons")
+                strong_buy_blockers = c.get("strong_buy_blockers")
                 strong_buy_eligible = c.get("strong_buy_eligible")
                 meta_prob = c.get("meta_success_prob", c.get("meta_prob"))
                 regime_value = c.get("regime")
@@ -912,6 +1210,12 @@ def record_discovery_picks(candidates: list) -> int:
                 ready_contract_reasons_payload = None
             else:
                 ready_contract_reasons_payload = str(ready_contract_reasons)
+            if isinstance(strong_buy_blockers, (list, tuple)):
+                strong_buy_blockers_payload = json.dumps(list(strong_buy_blockers))
+            elif strong_buy_blockers is None:
+                strong_buy_blockers_payload = ready_contract_reasons_payload
+            else:
+                strong_buy_blockers_payload = str(strong_buy_blockers)
             try:
                 meta_prob_value = float(meta_prob) if meta_prob is not None else None
             except (TypeError, ValueError):
@@ -947,8 +1251,7 @@ def record_discovery_picks(candidates: list) -> int:
                 "SELECT id FROM signal_backtest WHERE ticker=? AND source='discovery' AND run_date LIKE ?",
                 (ticker, today + "%"),
             ).fetchone()
-            if existing:
-                continue
+            existing_id = existing["id"] if existing else None
 
             factor_snapshot = {
                 "quality_score_fundamental": quality_factor_score,
@@ -1022,6 +1325,7 @@ def record_discovery_picks(candidates: list) -> int:
                 "institutional_prior_components": institutional_prior_components_payload,
                 "ready_contract_status": ready_contract_status,
                 "ready_contract_reasons": ready_contract_reasons_payload,
+                "strong_buy_blockers": strong_buy_blockers_payload,
                 "strong_buy_eligible": None if strong_buy_eligible is None else (1 if strong_buy_eligible else 0),
                 "meta_prob": meta_prob_value,
                 "meta_success": None if meta_prob_value is None else (1 if meta_prob_value >= getattr(config, "META_LABEL_STRONG_BUY_MIN_PROB", 0.60) else 0),
@@ -1100,13 +1404,20 @@ def record_discovery_picks(candidates: list) -> int:
             }
             columns = ", ".join(payload.keys())
             placeholders = ", ".join("?" for _ in payload)
-            conn.execute(
-                f"INSERT INTO signal_backtest ({columns}) VALUES ({placeholders})",
-                tuple(payload.values()),
-            )
+            if existing_id is not None:
+                assignments = ", ".join(f"{col}=?" for col in payload.keys())
+                conn.execute(
+                    f"UPDATE signal_backtest SET {assignments} WHERE id=?",
+                    tuple(payload.values()) + (existing_id,),
+                )
+            else:
+                conn.execute(
+                    f"INSERT INTO signal_backtest ({columns}) VALUES ({placeholders})",
+                    tuple(payload.values()),
+                )
             count += 1
 
-    logger.info("Recorded %d discovery picks for backtest.", count)
+    logger.info("Upserted %d discovery picks for backtest.", count)
     return count
 
 
@@ -1224,7 +1535,23 @@ def _download_price_frames(
     end: datetime,
 ) -> dict[str, pd.DataFrame]:
     """Download OHLC frames in one yfinance request, with per-ticker fallback."""
-    clean = sorted({str(t).upper() for t in tickers if t})
+    try:
+        from utils.global_universe import is_excluded_ticker, resolve_yahoo_ticker
+        excluded: list[str] = []
+        clean = []
+        for raw in tickers:
+            symbol = resolve_yahoo_ticker(str(raw or "").upper())
+            if not symbol:
+                continue
+            if is_excluded_ticker(symbol):
+                excluded.append(symbol)
+                continue
+            clean.append(symbol)
+        clean = sorted(set(clean))
+        if excluded:
+            logger.info("Batched evaluator skipped %d excluded/quarantined tickers before price download", len(set(excluded)))
+    except Exception:
+        clean = sorted({str(t).upper() for t in tickers if t})
     if not clean:
         return {}
     try:
@@ -1417,11 +1744,24 @@ def evaluate_matured_signals_batched(
             ).fetchall()
 
     assignments: dict[str, list[tuple[int, str, str, str, object]]] = defaultdict(list)
+    skipped_excluded = 0
+    try:
+        from utils.global_universe import is_excluded_ticker, resolve_yahoo_ticker
+    except Exception:
+        is_excluded_ticker = None
+        resolve_yahoo_ticker = None
     for horizon, col_price, col_return, col_flag in specs:
         for sig in pending_by_horizon.get(horizon, []):
             ticker = str(sig["ticker"] or "").upper()
             if ticker:
+                if resolve_yahoo_ticker is not None:
+                    ticker = resolve_yahoo_ticker(ticker)
+                if is_excluded_ticker is not None and is_excluded_ticker(ticker):
+                    skipped_excluded += 1
+                    continue
                 assignments[ticker].append((horizon, col_price, col_return, col_flag, sig))
+    if skipped_excluded:
+        logger.info("Batched evaluator skipped %d excluded/quarantined signal-horizon pairs.", skipped_excluded)
 
     pending_total = sum(len(v) for v in assignments.values())
     if dry_run:
@@ -1976,7 +2316,13 @@ def backfill_missing_regimes_from_vix(
 # ---------------------------------------------------------------------------
 
 def _query_pillar_ic(source: str, horizon: str) -> tuple[list, int]:
-    """Query pillar_effectiveness for a given source/horizon.
+    """Query pillar_effectiveness for a given source/horizon (pooled regime).
+
+    Filters to ``regime IS NULL`` to take the pooled-across-regimes row,
+    avoiding the silent overwrite that occurred when multiple regime rows
+    (BULL / NEUTRAL / BEAR) collided on the same (source, horizon, pillar)
+    key in downstream consumers.  Regime-conditional weight adjustments
+    are handled separately by ``engine.bayesian_learning``.
 
     Returns (rows, min_sample_size).
     """
@@ -1984,7 +2330,7 @@ def _query_pillar_ic(source: str, horizon: str) -> tuple[list, int]:
         rows = conn.execute(
             """SELECT pillar, information_coefficient, sample_size
                FROM pillar_effectiveness
-               WHERE source=? AND horizon=?""",
+               WHERE source=? AND horizon=? AND regime IS NULL""",
             (source, horizon),
         ).fetchall()
     min_samples = min((int(r["sample_size"] or 0) for r in rows), default=0)
@@ -2079,13 +2425,18 @@ def _ic_rows_to_weights(rows, source: str, horizon: str, min_samples: int) -> di
     pillars with longer half-lives receive a boost for the 30-90 day horizon.
     """
     pillars = ["technical", "fundamental", "sentiment", "forecast"]
-    raw = {pillar: 0.05 for pillar in pillars}
+    # Floor: prevents any pillar from fully zeroing out (single-pillar
+    # dependence is risky), but high enough to mask differentiation if
+    # ICs are realistically small (~0.01-0.03 in equity factor research,
+    # Grinold-Kahn 2000).  Default 0.01 matches the IC scale; legacy
+    # behaviour was 0.05.  Configurable so the change is reversible.
+    ic_floor = float(getattr(config, "ADAPTIVE_WEIGHTS_IC_FLOOR", 0.01))
+    raw = {pillar: ic_floor for pillar in pillars}
     for r in rows:
-        # Floor at 0.05 to never fully zero out a pillar
         pillar = r["pillar"]
         if pillar not in raw:
             continue
-        ic = max(r["information_coefficient"], 0.05)
+        ic = max(r["information_coefficient"], ic_floor)
         raw[pillar] = ic
 
     total = sum(raw.values())
@@ -2133,26 +2484,147 @@ def _ic_rows_to_weights(rows, source: str, horizon: str, min_samples: int) -> di
     return shrunk
 
 
+def _blend_multi_horizon_ic(source: str) -> tuple[list, int] | None:
+    """Combine pillar IC across multiple horizons via half-life weighting.
+
+    Lo & MacKinlay (1990) "When Are Contrarian Profits Due to Stock Market
+    Overreaction?" RFS — short-horizon return predicts long-horizon direction
+    with ρ ≈ 0.7.  Hou-Xue-Zhang (2017) "A Comparison of New Factor Models"
+    *RFS* — multi-horizon factor IC stabilises after ~6 weeks.
+
+    Default horizon weights reflect "information half-life": short horizons
+    refresh weekly (responsive to regime change) and long horizons anchor the
+    estimate (lower noise per cohort).
+
+      5d : 0.20    (refreshes within a week — fast regime adaptation)
+      10d: 0.30    (highest weight — sweet spot of signal vs. recency)
+      30d: 0.30    (1.5 trading months — typical factor decay window)
+      60d: 0.10    (anchor — long enough to smooth)
+      90d: 0.10    (anchor — original target horizon)
+
+    Returns rows in the same shape as ``_query_pillar_ic`` so it can be
+    consumed by ``_ic_rows_to_weights`` unchanged.  Returns None when
+    insufficient data exists at every horizon.
+    """
+    horizons = ["5d", "10d", "30d", "60d", "90d"]
+    default_weights = {"5d": 0.20, "10d": 0.30, "30d": 0.30, "60d": 0.10, "90d": 0.10}
+    cfg_weights = getattr(config, "MULTI_HORIZON_IC_WEIGHTS", default_weights) or default_weights
+    cfg_min_samples = int(getattr(config, "MULTI_HORIZON_IC_MIN_SAMPLES", 20))
+
+    # Collect IC at each horizon: pillar -> {horizon: (ic, n)}
+    pillar_data: dict[str, dict[str, tuple[float, int]]] = {}
+    horizon_total_n: dict[str, int] = {}
+    for hz in horizons:
+        rows, _ = _query_pillar_ic(source, hz)
+        if not rows:
+            continue
+        for r in rows:
+            pillar = r["pillar"]
+            ic = r["information_coefficient"]
+            n = int(r["sample_size"] or 0)
+            if pillar is None or ic is None:
+                continue
+            pillar_data.setdefault(pillar, {})[hz] = (float(ic), n)
+            horizon_total_n[hz] = horizon_total_n.get(hz, 0) + n
+
+    if not pillar_data:
+        return None
+
+    # Weighted-average IC per pillar.  Skip horizons with insufficient samples.
+    blended_rows = []
+    pillar_total_samples: list[int] = []
+    for pillar, hdata in pillar_data.items():
+        weighted_ic = 0.0
+        total_w = 0.0
+        total_n = 0
+        for hz, (ic, n) in hdata.items():
+            if n < cfg_min_samples:
+                continue
+            w = float(cfg_weights.get(hz, 0.0))
+            if w <= 0:
+                continue
+            weighted_ic += w * ic
+            total_w += w
+            total_n += n
+        if total_w <= 0:
+            continue
+        blended_ic = weighted_ic / total_w
+        blended_rows.append(_HorizonBlendRow(pillar, blended_ic, total_n))
+        pillar_total_samples.append(total_n)
+
+    if not blended_rows:
+        return None
+
+    min_samples = min(pillar_total_samples) if pillar_total_samples else 0
+    return blended_rows, min_samples
+
+
+class _HorizonBlendRow:
+    """Lightweight stand-in for sqlite Row, exposing dict-like access used by
+    `_ic_rows_to_weights`."""
+    __slots__ = ("_data",)
+
+    def __init__(self, pillar: str, information_coefficient: float, sample_size: int):
+        self._data = {
+            "pillar": pillar,
+            "information_coefficient": information_coefficient,
+            "sample_size": sample_size,
+        }
+
+    def __getitem__(self, key):
+        return self._data[key]
+
+
 def get_adaptive_weights(source: str = "all", horizon: str = "90d") -> dict[str, float] | None:
     """Return IC-adjusted weights for scoring pillars.
 
-    Used by both main scoring engine and discovery to adapt weights
-    based on what actually predicts returns.
+    Two modes (controlled by ``config.ADAPTIVE_WEIGHTS_MULTI_HORIZON_ENABLED``):
 
-    Horizon fallback chain: tries the requested horizon first, then
-    falls back to shorter horizons to reduce cold-start from ~3 months
-    (90d only) down to 5-10d timing labels. Also broadens source if the
-    requested source has too few samples.
+    1. Multi-horizon blend (default):
+       Combine 5d/10d/30d/60d/90d IC via half-life weighting (Lo & MacKinlay
+       1990) so the system responds to regime change in days, not quarters,
+       while still anchoring on the original 90d target.  This is a
+       structural "self-learn faster" mechanism — short horizons mature
+       within a week and re-weight weekly.
+
+    2. Single-horizon fallback chain (legacy):
+       Tries the requested horizon, then falls back to shorter horizons.
 
     Args:
         source: 'portfolio', 'discovery', or 'all'
-        horizon: '30d', '60d', or '90d' (preferred horizon)
+        horizon: '30d', '60d', or '90d' (preferred when single-horizon mode)
 
     Returns dict like {"technical": 0.35, "fundamental": 0.20, ...} or None.
     """
     init_backtest_db()
 
-    # Prefer longer horizons (more stable IC) but accept shorter during cold-start
+    # Prefer multi-horizon blending when enabled and the requested horizon is
+    # one of the standard targets.  Fall back to single-horizon for unusual
+    # horizon strings or when the blend has no data.
+    multi_enabled = bool(getattr(config, "ADAPTIVE_WEIGHTS_MULTI_HORIZON_ENABLED", True))
+    if multi_enabled and horizon in ("30d", "60d", "90d"):
+        source_chain = [source] if source == "all" else [source, "all"]
+        for src in source_chain:
+            blend = _blend_multi_horizon_ic(src)
+            if blend is None:
+                continue
+            rows, min_samples = blend
+            if min_samples < 20:
+                continue
+            result = _ic_rows_to_weights(rows, src, "multi", min_samples)
+            if result is not None:
+                if src != source:
+                    logger.info(
+                        "Adaptive weights (multi-horizon): fell back from %s to %s",
+                        source, src,
+                    )
+                else:
+                    logger.info("Adaptive weights: multi-horizon blend active (%s)", src)
+                return result
+        # If multi-horizon failed for every source, fall through to single.
+        logger.info("Adaptive weights: multi-horizon blend unavailable; falling back to single horizon")
+
+    # Legacy single-horizon fallback chain.
     horizons = {
         "90d": ["90d", "60d", "30d", "10d", "5d"],
         "60d": ["60d", "30d", "10d", "5d"],
