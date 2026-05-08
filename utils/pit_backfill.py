@@ -17,6 +17,7 @@ import logging
 import math
 import time
 from datetime import date, datetime, timedelta
+from pathlib import Path
 from typing import Iterable, Mapping
 
 import numpy as np
@@ -26,6 +27,7 @@ import yfinance as yf
 import config
 from engine.enterprise_factors import compute_piotroski_f_score
 from engine.paper_trading import _connect
+from utils.atomic_io import atomic_write_json
 from utils import fmp_client
 from utils.pit_store import _available_date, _coerce_date, _load_store, record_snapshot
 from utils.price_store import download_price_history, get_price_history
@@ -226,6 +228,91 @@ def backfill_tickers(tickers: Iterable[str], *, limit: int | None = None, sleep_
         if sleep_seconds > 0:
             time.sleep(sleep_seconds)
     return results
+
+
+def _is_fmp_statement_candidate(ticker: str) -> bool:
+    symbol = str(ticker or "").upper().strip()
+    return bool(symbol) and "." not in symbol
+
+
+def refresh_queue_tickers(
+    *,
+    queue_path: str | Path | None = None,
+    max_tickers: int | None = None,
+    limit: int | None = None,
+    sleep_seconds: float = 0.0,
+    yfinance_fallback: bool = True,
+    write_results: bool = True,
+) -> dict:
+    """Backfill PIT fundamentals for tickers in the finalist refresh queue.
+
+    FMP is tried for plain US-style tickers. yfinance quarterly statements are
+    used for non-US tickers and as a fallback when FMP writes no snapshots.
+    """
+    path = Path(queue_path or getattr(config, "DISCOVERY_FUNDAMENTAL_REFRESH_QUEUE_PATH", "feature_cache/fundamental_refresh_queue.json"))
+    if not path.exists():
+        return {"selected": 0, "refreshed": 0, "queue_path": str(path), "error": "queue_missing"}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return {"selected": 0, "refreshed": 0, "queue_path": str(path), "error": f"queue_read_failed: {exc}"}
+
+    rows = raw.get("items", raw if isinstance(raw, list) else [])
+    if not isinstance(rows, list):
+        rows = []
+    rows = sorted(
+        [row for row in rows if isinstance(row, dict) and row.get("ticker")],
+        key=lambda row: float(row.get("priority", 0) or 0),
+        reverse=True,
+    )
+    max_tickers = int(max_tickers or getattr(config, "DISCOVERY_FUNDAMENTAL_REFRESH_MAX_TICKERS", 40))
+    selected_rows = rows[:max(0, max_tickers)]
+    tickers = [str(row.get("ticker")).upper().strip() for row in selected_rows if row.get("ticker")]
+
+    fmp_results: dict[str, int] = {}
+    yf_results: dict[str, int] = {}
+    fallback_tickers: list[str] = []
+    for ticker in tickers:
+        written = 0
+        if _is_fmp_statement_candidate(ticker):
+            try:
+                written = backfill_ticker(ticker, limit=limit)
+            except Exception as exc:
+                logger.warning("Refresh queue FMP backfill failed for %s: %s", ticker, exc)
+                written = 0
+            fmp_results[ticker] = written
+        if yfinance_fallback and written <= 0:
+            fallback_tickers.append(ticker)
+        if sleep_seconds > 0:
+            time.sleep(sleep_seconds)
+
+    if yfinance_fallback and fallback_tickers:
+        yf_results = backfill_via_yfinance_quarterly(
+            fallback_tickers,
+            limit=limit or 16,
+            sleep_seconds=sleep_seconds,
+        )
+
+    refreshed = {
+        ticker: (fmp_results.get(ticker, 0) or 0) + (yf_results.get(ticker, 0) or 0)
+        for ticker in tickers
+    }
+    payload = {
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "queue_path": str(path),
+        "selected": len(tickers),
+        "refreshed": sum(1 for value in refreshed.values() if value > 0),
+        "snapshots_written": sum(refreshed.values()),
+        "fmp_results": fmp_results,
+        "yfinance_results": yf_results,
+        "refreshed_snapshots": refreshed,
+        "unrefreshed": [ticker for ticker, value in refreshed.items() if value <= 0],
+    }
+    if write_results:
+        out_path = Path(getattr(config, "DISCOVERY_FUNDAMENTAL_REFRESH_RESULTS_PATH", "feature_cache/fundamental_refresh_results.json"))
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_json(out_path, payload, indent=2)
+    return payload
 
 
 def signal_backtest_tickers(*, max_tickers: int | None = None) -> list[str]:
@@ -734,6 +821,9 @@ def _main() -> None:
     parser.add_argument("--yfinance-quarterly", action="store_true", help="Use yfinance quarterly statements and tag snapshots as yfinance_quarterly")
     parser.add_argument("--backfill-factor-snapshot", action="store_true", help="Backfill PIT-safe factor snapshots into signal_backtest")
     parser.add_argument("--backfill-replay-sleeves", action="store_true", help="Backfill sleeve scalar columns from signal-time factor rows")
+    parser.add_argument("--refresh-queue", action="store_true", help="Backfill PIT fundamentals for feature_cache/fundamental_refresh_queue.json")
+    parser.add_argument("--queue-path", default=None, help="Override fundamental refresh queue path")
+    parser.add_argument("--no-yfinance-fallback", action="store_true", help="Disable yfinance quarterly fallback for refresh queue")
     parser.add_argument("--source-like", default="replay%", help="SQL LIKE pattern for sleeve backfill source rows")
     parser.add_argument("--min-date", default=None)
     parser.add_argument("--max-date", default=None)
@@ -766,6 +856,18 @@ def _main() -> None:
             dry_run=not args.apply,
             limit=args.max_rows,
             recompute_stats=True,
+        )
+        print(json.dumps(stats, indent=2, sort_keys=True))
+        return
+
+    if args.refresh_queue:
+        stats = refresh_queue_tickers(
+            queue_path=args.queue_path,
+            max_tickers=args.max_tickers,
+            limit=args.limit,
+            sleep_seconds=args.sleep,
+            yfinance_fallback=not args.no_yfinance_fallback,
+            write_results=True,
         )
         print(json.dumps(stats, indent=2, sort_keys=True))
         return
