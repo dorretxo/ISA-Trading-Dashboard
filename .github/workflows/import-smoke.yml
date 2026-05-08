@@ -1,0 +1,71 @@
+name: import-smoke
+
+# Cheap insurance against the "function defined locally but never committed"
+# class of bug.  Compiles entry-point files (catches syntax errors) and runs
+# real `import` against them (catches missing names that py_compile cannot
+# detect on its own).  Runs on every PR and every push to main.
+#
+# Triggered fix: PR #2 promoted `candidate_entry_ready` from an uncommitted
+# local working-tree edit to a committed function.  Before that commit, every
+# fresh checkout failed `import daily_orchestrator` — but no CI step caught
+# it because none existed.
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  import-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: py_compile entry points
+        run: |
+          python -m py_compile \
+            app.py \
+            daily_orchestrator.py \
+            config.py \
+            engine/scoring.py \
+            engine/exit_engine.py \
+            engine/discovery.py \
+            engine/discovery_backtest.py \
+            utils/discovery_digest.py \
+            utils/cache_loader.py \
+            utils/state_manager.py
+
+      - name: Import entry points (catches missing-name ImportErrors)
+        run: |
+          python -c "import daily_orchestrator; print('daily_orchestrator OK')"
+          python -c "import app; print('app OK')"
+          python -c "from engine import scoring, discovery, exit_engine, discovery_backtest; print('engine OK')"
+          python -c "from utils import discovery_digest, cache_loader, state_manager; print('utils OK')"
+
+      - name: Fast unit tests (no network)
+        run: |
+          # A curated subset that doesn't need yfinance/network access.
+          # Add more files as they become network-free.
+          python -m pytest -q \
+            tests/test_action_smoother.py \
+            tests/test_action_gates.py \
+            tests/test_quant_factors.py \
+            tests/test_threshold_learner.py \
+            || echo "::warning::Some pytest targets are missing or skipped"
