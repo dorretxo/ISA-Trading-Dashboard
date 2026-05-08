@@ -29,6 +29,35 @@ from engine.discovery_backtest import init_backtest_db
 logger = logging.getLogger(__name__)
 
 
+def _return_pct(value, default: float = 0.0) -> float:
+    """Return a finite percentage return for scorecard math."""
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return default
+    return out if np.isfinite(out) else default
+
+
+def _return_array(signals: list, column: str) -> np.ndarray:
+    return np.array([_return_pct(s.get(column)) for s in signals], dtype=float)
+
+
+def _max_drawdown_from_returns_pct(returns_pct: np.ndarray) -> float | None:
+    """Compute max drawdown from periodic returns without cumprod overflow."""
+    if returns_pct.size == 0:
+        return None
+    returns = np.asarray(returns_pct, dtype=float) / 100.0
+    returns = np.nan_to_num(returns, nan=0.0, posinf=0.0, neginf=-0.999999)
+    returns = np.maximum(returns, -0.999999)
+    log_equity = np.cumsum(np.log1p(returns))
+    peak_log = np.maximum.accumulate(log_equity)
+    drawdowns = np.expm1(log_equity - peak_log)
+    finite = drawdowns[np.isfinite(drawdowns)]
+    if finite.size == 0:
+        return None
+    return float(np.min(finite))
+
+
 # ---------------------------------------------------------------------------
 # Data structures
 # ---------------------------------------------------------------------------
@@ -148,7 +177,7 @@ def compute_scorecard(source: str = "all", min_signals: int = 5) -> Scorecard | 
             beat_benchmark_rate=None,
         )
 
-    returns_90d = np.array([s["return_90d"] or 0 for s in evaluated])
+    returns_90d = _return_array(evaluated, "return_90d")
 
     # --- Sharpe (annualised from 90d returns) ---
     # Scale factor: 252/63 ≈ 4 periods per year
@@ -166,10 +195,7 @@ def compute_scorecard(source: str = "all", min_signals: int = 5) -> Scorecard | 
     # --- Max drawdown (sequential signal returns as a simulated equity curve) ---
     # Sort by run_date to simulate chronological entry
     sorted_eval = sorted(evaluated, key=lambda s: s["run_date"])
-    equity = np.cumprod([1 + (s["return_90d"] or 0) / 100 for s in sorted_eval])
-    peak = np.maximum.accumulate(equity)
-    drawdowns = (equity - peak) / peak
-    max_dd = float(np.min(drawdowns)) if len(drawdowns) > 0 else None
+    max_dd = _max_drawdown_from_returns_pct(_return_array(sorted_eval, "return_90d"))
 
     # --- Calmar ---
     annual_ret = mean_ret * periods_per_year
@@ -189,7 +215,7 @@ def compute_scorecard(source: str = "all", min_signals: int = 5) -> Scorecard | 
     for horizon, col_return in [("30d", "return_30d"), ("60d", "return_60d"), ("90d", "return_90d")]:
         col_flag = f"evaluated_{horizon}"
         h_sigs = [s for s in evaluated if s.get(col_flag) or s.get(col_return) is not None]
-        h_rets = np.array([s[col_return] or 0 for s in h_sigs])
+        h_rets = _return_array(h_sigs, col_return)
 
         if len(h_rets) < 3:
             continue
@@ -215,7 +241,7 @@ def compute_scorecard(source: str = "all", min_signals: int = 5) -> Scorecard | 
     regime_set = set(s["regime"] for s in evaluated if s["regime"])
     for regime in regime_set:
         r_sigs = [s for s in evaluated if s["regime"] == regime]
-        r_rets = np.array([s["return_90d"] or 0 for s in r_sigs])
+        r_rets = _return_array(r_sigs, "return_90d")
         if len(r_rets) < 3:
             continue
 
