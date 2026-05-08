@@ -159,9 +159,31 @@ def _get_next_open(ticker: str, signal_date: str) -> float | None:
     """Fetch the opening price on the first trading session after signal_date."""
     try:
         sig_dt = datetime.fromisoformat(signal_date)
-        # Look forward up to 5 calendar days to find next trading day
-        start = (sig_dt + timedelta(days=1)).strftime("%Y-%m-%d")
-        end = (sig_dt + timedelta(days=6)).strftime("%Y-%m-%d")
+        start_dt = (sig_dt + timedelta(days=1)).date()
+        end_dt = (sig_dt + timedelta(days=6)).date()
+        today = datetime.now().date()
+
+        first_weekday = start_dt
+        while first_weekday.weekday() >= 5 and first_weekday < end_dt:
+            first_weekday += timedelta(days=1)
+
+        if first_weekday > today:
+            logger.debug(
+                "Next open not yet available for signal %s (%s); first possible session is %s",
+                ticker,
+                signal_date,
+                first_weekday,
+            )
+            return None
+
+        # yfinance's end date is exclusive. Do not request future ranges; Yahoo
+        # reports those as "possibly delisted", which pollutes ticker-health logs.
+        query_end = min(end_dt, today + timedelta(days=1))
+        if query_end <= start_dt:
+            return None
+
+        start = start_dt.strftime("%Y-%m-%d")
+        end = query_end.strftime("%Y-%m-%d")
         df = yf.download(ticker, start=start, end=end, progress=False, auto_adjust=True)
         if df is not None and not df.empty:
             open_price = float(df["Open"].iloc[0])

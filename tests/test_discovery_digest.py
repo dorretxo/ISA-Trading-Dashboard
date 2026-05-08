@@ -94,6 +94,8 @@ class DiscoveryDigestTests(unittest.TestCase):
         packet = build_trade_packet(candidate)
 
         self.assertFalse(packet["top_pick"])
+        self.assertFalse(packet["entry_ready"])
+        self.assertFalse(packet["trade_ready"])
         self.assertEqual(packet["key_risk"], "institutional prior below bar")
 
 
