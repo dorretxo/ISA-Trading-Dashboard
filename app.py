@@ -1404,6 +1404,43 @@ def _exit_card_tags(exit_signal: dict) -> list[tuple[str, str]]:
     return chips[:6]
 
 
+def _smoothing_chip(r: dict) -> tuple[str, str, str] | None:
+    """Build the smoother diagnostic chip for a holding card.
+
+    Returns ``(label, bg_color, fg_color)`` or ``None`` when no chip applies
+    (legacy cached payload, smoother disabled, or BUY/STRONG BUY pass-through).
+    """
+    reason = r.get("smoothing_reason")
+    if not reason or reason in ("smoother_disabled", "passthrough_buy_side", "cold_start_legacy"):
+        return None
+
+    smoothed = r.get("smoothed_action") or r.get("final_action") or r.get("action") or "KEEP"
+    since = r.get("smoothing_since_date")
+    m = r.get("persistence_m")
+    n = r.get("persistence_n")
+    band_low = r.get("smoothing_band_low")
+    band_high = r.get("smoothing_band_high")
+
+    if reason == "cusum_override":
+        return ("CUSUM override -> structural break detected", "#3b1220", "#fca5a5")
+    if reason == "persistence_satisfied":
+        m_n = f" ({m} of {n} days)" if isinstance(m, int) and isinstance(n, int) and n > 0 else ""
+        since_txt = f" since {since}" if since else ""
+        return (f"{_plain_action(smoothed)}{since_txt}{m_n}", "#3b2f12", "#fcd34d")
+    if reason == "persistence_short":
+        return ("Held at KEEP — pending confirmation", "#0b3247", "#7dd3fc")
+    if reason == "band_held_keep":
+        if is_valid_number(band_low) and is_valid_number(band_high):
+            half = (safe_float(band_high) - safe_float(band_low)) / 2
+            return (f"Held at KEEP — score within ±{half:.2f} dead-zone", "#0b3247", "#7dd3fc")
+        return ("Held at KEEP — inside dead-zone", "#0b3247", "#7dd3fc")
+    if reason == "band_held_sell":
+        return (f"Held at {_plain_action(smoothed)} — band stable", "#0b3247", "#7dd3fc")
+    if reason == "recovered_to_keep":
+        return ("Recovered to KEEP", "#064e3b", "#6ee7b7")
+    return None
+
+
 def _exit_override_html(exit_signal: dict) -> str:
     prior = exit_signal.get("prior_score", exit_signal.get("aggregate_score"))
     exit_score = exit_signal.get("exit_score")
@@ -2304,6 +2341,18 @@ with tab_holdings:
                         f'<span style="display:inline-block;padding:2px 8px;border-radius:10px;'
                         f'background:{_cbg};color:{_cfg};font-size:11px;font-weight:600;'
                         f'margin-top:4px">{_clbl}</span>',
+                        unsafe_allow_html=True,
+                    )
+
+                # Smoother diagnostic chip — explains why the action stuck or
+                # flipped (Constantinides 1986 / Wald 1947 / Page 1954).
+                _sm_chip = _smoothing_chip(r)
+                if _sm_chip is not None:
+                    _sm_lbl, _sm_bg, _sm_fg = _sm_chip
+                    st.markdown(
+                        f'<span style="display:inline-block;padding:2px 8px;border-radius:10px;'
+                        f'background:{_sm_bg};color:{_sm_fg};font-size:11px;font-weight:600;'
+                        f'margin-top:4px;margin-left:6px">{_html.escape(_sm_lbl)}</span>',
                         unsafe_allow_html=True,
                     )
 

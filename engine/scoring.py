@@ -389,6 +389,83 @@ def analyse_holding(holding: dict) -> dict:
             _logger.info("F-score gate: %s F=%s cov=%.2f — action capped at KEEP", ticker, _fs, _fs_cov)
             action = "KEEP"
 
+    # Exit-action smoother: hysteresis + persistence on KEEP↔SELL↔STRONG SELL
+    # (Constantinides 1986; Davis-Norman 1990; Wald 1947; Kaminski-Lo 2014).
+    # BUY / STRONG BUY pass through unchanged.
+    smoother_payload: dict = {
+        "smoothed_action": action,
+        "smoothing_reason": "smoother_disabled",
+        "smoothing_since_date": None,
+        "score_vol_30d": None,
+        "persistence_m": 0,
+        "persistence_n": 0,
+        "smoothing_band_low": None,
+        "smoothing_band_high": None,
+    }
+    if getattr(config, "EXIT_SMOOTHER_ENABLED", True) and action in ("KEEP", "SELL", "STRONG SELL"):
+        try:
+            from engine import score_history, action_smoother
+            from engine.stops import _get_vix_percentile
+            history = score_history.get_score_series(
+                ticker,
+                n_days=max(getattr(config, "EXIT_SMOOTHER_VOL_LOOKBACK", 30),
+                           getattr(config, "EXIT_SMOOTHER_PERSISTENCE_N", 5)) + 5,
+                source="portfolio",
+            )
+            score_vol = score_history.compute_score_vol(
+                history,
+                lookback=getattr(config, "EXIT_SMOOTHER_VOL_LOOKBACK", 30),
+            )
+            n_window = int(getattr(config, "EXIT_SMOOTHER_PERSISTENCE_N", 5))
+            m_sell, since_sell = score_history.count_recent_action(
+                history, score_history.DOWN_ACTIONS, n=n_window
+            )
+            m_strong, _ = score_history.count_recent_action(
+                history, score_history.STRONG_DOWN_ACTIONS, n=n_window
+            )
+            prev_smoothed = score_history.get_prev_smoothed_action(history)
+
+            try:
+                vix_pct = float(_get_vix_percentile())
+            except Exception:
+                vix_pct = 50.0
+
+            smoothed = action_smoother.smooth_exit_action(
+                raw_score=aggregate_score,
+                base_action=action,
+                prev_smoothed_action=prev_smoothed,
+                score_vol=score_vol,
+                vix_pct=vix_pct,
+                persistence_m_sell=m_sell,
+                persistence_m_strong=m_strong,
+                persistence_n=n_window,
+                persistence_since=since_sell,
+                cusum_urgent=False,  # exit_engine reconciler applies CUSUM override later
+                cusum_score=0.0,
+            )
+            smoother_payload = {
+                "smoothed_action": smoothed.action,
+                "smoothing_reason": smoothed.reason,
+                "smoothing_since_date": smoothed.since_date,
+                "score_vol_30d": round(score_vol, 4) if score_vol is not None else None,
+                "persistence_m": smoothed.persistence_m,
+                "persistence_n": smoothed.persistence_n,
+                "smoothing_band_low": smoothed.band_low,
+                "smoothing_band_high": smoothed.band_high,
+            }
+            # Replace the action label only if the smoother changed it
+            if smoothed.action != action:
+                _logger.info(
+                    "Exit smoother: %s %s → %s (reason=%s, score=%.3f, σ=%s, vix_pct=%.0f)",
+                    ticker, action, smoothed.action, smoothed.reason,
+                    aggregate_score,
+                    f"{score_vol:.3f}" if score_vol is not None else "—",
+                    vix_pct,
+                )
+                action = smoothed.action
+        except Exception as _sm_e:
+            _logger.debug("[scoring] Exit smoother failed for %s: %s", ticker, _sm_e)
+
     # Build the "Why?" summary
     all_reasons = tech["reasons"] + fund["reasons"] + sent["reasons"] + forecast_reasons
     # Pick the most impactful reasons (up to 4)
@@ -406,6 +483,8 @@ def analyse_holding(holding: dict) -> dict:
         "base_action": action,
         "final_action": action,
         "aggregate_score": round(aggregate_score, 3),
+        # Exit-action smoother diagnostics (read by app.py + persisted to signal_backtest)
+        **smoother_payload,
         "stop_loss": stop["stop_loss"],
         "structural_stop_loss": stop["stop_loss"],
         "stop_method": stop["method"],

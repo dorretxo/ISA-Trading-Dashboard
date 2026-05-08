@@ -339,6 +339,15 @@ _FEATURE_STORE_COLUMNS = [
     ("action_gate_ceiling", "TEXT"),
     ("action_gate_flags_json", "TEXT"),
     ("threshold_profile", "TEXT"),
+    # Exit-action smoother fields (Constantinides 1986; Davis-Norman 1990; Wald 1947)
+    ("smoothed_action", "TEXT"),
+    ("smoothing_reason", "TEXT"),
+    ("smoothing_since_date", "TEXT"),
+    ("score_vol_30d", "REAL"),
+    ("persistence_m", "INTEGER"),
+    ("persistence_n", "INTEGER"),
+    ("smoothing_band_low", "REAL"),
+    ("smoothing_band_high", "REAL"),
 ]
 
 
@@ -562,6 +571,15 @@ def record_portfolio_signals(
                 "regime": regime_label,
                 "vix_level": vix,
                 "portfolio_weight": pw_map.get(ticker, 0),
+                # Exit-action smoother fields (None on legacy callers)
+                "smoothed_action": r.get("smoothed_action"),
+                "smoothing_reason": r.get("smoothing_reason"),
+                "smoothing_since_date": r.get("smoothing_since_date"),
+                "score_vol_30d": r.get("score_vol_30d"),
+                "persistence_m": r.get("persistence_m"),
+                "persistence_n": r.get("persistence_n"),
+                "smoothing_band_low": r.get("smoothing_band_low"),
+                "smoothing_band_high": r.get("smoothing_band_high"),
             }
             columns = ", ".join(payload.keys())
             placeholders = ", ".join("?" for _ in payload)

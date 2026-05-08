@@ -45,6 +45,26 @@ SCORE_BUY_THRESHOLD = 0.20         # Above this = BUY (top quartile)
 SCORE_KEEP_THRESHOLD = -0.25       # Above this = KEEP
 SCORE_SELL_THRESHOLD = -0.50       # Above this = SELL, below = STRONG SELL
 
+# --- Exit-action smoother: hysteresis bands + persistence gate (EXIT side only) ---
+# Replaces scalar threshold crossings on the KEEP↔SELL↔STRONG SELL axis with a
+# two-threshold no-trade region (Constantinides 1986 JPE; Davis-Norman 1990
+# SIAM J. Control), confirmed by a fixed-window persistence rule (Wald 1947
+# SPRT, simplified count form), with band width scaled by realised σ_score and
+# VIX percentile (Kaminski-Lo 2014).  CUSUM-confirmed urgent signals from
+# exit_engine override the band (Page 1954, Lorden 1971-optimal).  BUY /
+# STRONG BUY pass through untouched — STRONG BUY has its own scorecard above.
+EXIT_SMOOTHER_ENABLED = True                  # Master toggle (set False to bypass)
+EXIT_SMOOTHER_BAND_MIN = 0.05                 # δ_min — floor on dead-zone half-width
+EXIT_SMOOTHER_BAND_K_VOL = 1.5                # band = K_VOL · σ_score (capped by min)
+EXIT_SMOOTHER_VIX_SCALE = 0.50                # +50% widening at VIX_pct=100
+EXIT_SMOOTHER_VOL_LOOKBACK = 30               # Days of score history for σ_score
+EXIT_SMOOTHER_VOL_FALLBACK = 0.10             # σ_score default when <10 obs
+EXIT_SMOOTHER_PERSISTENCE_N = 5               # Window size for N-of-M test
+EXIT_SMOOTHER_PERSISTENCE_M = 3               # SELL needs ≥M of N down-days
+EXIT_SMOOTHER_STRONG_SELL_M = 4               # STRONG SELL needs ≥M_strong of N
+EXIT_SMOOTHER_RECOVERY_RATIO = 0.5            # δ_up = δ_down · ratio (recovery boundary)
+EXIT_SMOOTHER_CUSUM_OVERRIDE_MIN = 0.60       # exit_score floor for CUSUM override
+
 # Discovery action labels. Percentile mode turns the day's best risk-screened
 # names into BUY/STRONG BUY candidates while absolute floors prevent weak days
 # from being promoted.

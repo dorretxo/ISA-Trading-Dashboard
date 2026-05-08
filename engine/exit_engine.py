@@ -399,11 +399,23 @@ def reconcile_actions_with_exits(
     confidence_weight: float = 0.60,
     max_penalty: float = 2.0,
 ) -> list[dict]:
-    """Apply exit-signal penalties to holdings while preserving alpha priors."""
+    """Apply exit-signal penalties to holdings while preserving alpha priors.
+
+    The "base" action used as the floor here is the **smoothed** action
+    (Constantinides 1986 / Wald 1947) when available, so the exit-engine
+    penalty cannot revive a downgrade the smoother already filtered out as
+    noise.  CUSUM-confirmed urgent signals (Page 1954, Lorden 1971-optimal)
+    bypass the smoother — they are the only structural-break path allowed
+    to escalate past the dead-zone.
+    """
+    import config as _config
+    cusum_override_min = float(getattr(_config, "EXIT_SMOOTHER_CUSUM_OVERRIDE_MIN", 0.6))
+
     result_map = {r["ticker"]: r for r in results}
 
     for r in results:
-        base_action = r.get("base_action") or r.get("action", "KEEP")
+        smoothed = r.get("smoothed_action")
+        base_action = smoothed or r.get("base_action") or r.get("action", "KEEP")
         r["base_action"] = base_action
         r["final_action"] = r.get("final_action") or r.get("action", base_action)
         r["action"] = r["final_action"]
@@ -434,6 +446,28 @@ def reconcile_actions_with_exits(
         if trailing_stop is not None:
             r["trailing_exit_stop"] = trailing_stop
             r["trailing_exit_method"] = "Chandelier Exit"
+
+        # CUSUM structural-break override — bypass the smoother dead-zone.
+        # Direction labels emitted by _detect_cusum_changepoint() are
+        # "negative" / "positive" / "none" (see exit_engine.py:303).
+        cusum_alarmed = bool(
+            isinstance(es.detail, dict)
+            and isinstance(es.detail.get("cusum"), dict)
+            and es.detail["cusum"].get("alarm")
+            and es.detail["cusum"].get("direction") == "negative"
+        )
+        if (
+            es.severity == "urgent"
+            and cusum_alarmed
+            and es.exit_score >= cusum_override_min
+        ):
+            r["action"] = "STRONG SELL"
+            r["final_action"] = "STRONG SELL"
+            r["smoothed_action"] = "STRONG SELL"
+            r["smoothing_reason"] = "cusum_override"
+            r["_exit_override"] = True
+            r["_cusum_override"] = True
+            continue
 
         if _ACTION_RANK.get(new_action, 0) < _ACTION_RANK.get(base_action, 0):
             r["action"] = new_action
@@ -592,7 +626,9 @@ def assess_exits(results: list[dict], holdings: list[dict]) -> list[ExitSignal]:
         stop_loss = r.get("stop_loss")
         take_profit = r.get("take_profit")
         atr = r.get("atr") or (current_price * 0.02)
-        action = r.get("base_action", r.get("action", "KEEP"))
+        # Read the smoothed action when available (Constantinides 1986 / Wald 1947)
+        # so exit cards reflect the post-hysteresis decision, not the raw flip.
+        action = r.get("smoothed_action") or r.get("base_action") or r.get("action") or "KEEP"
 
         # Position weight for risk-adjusted urgency
         pos_weight = position_values.get(ticker, 0) / total_value if total_value > 0 else 0

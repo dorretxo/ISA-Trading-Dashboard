@@ -17,6 +17,7 @@ def render_exit_intelligence(dash, results, holdings) -> None:
             from engine.exit_engine import assess_exits
 
             exit_objs = assess_exits(results, holdings)
+            _result_by_ticker = {r.get("ticker"): r for r in (results or [])}
             exit_list = [
                 {
                     "ticker": e.ticker,
@@ -26,6 +27,9 @@ def render_exit_intelligence(dash, results, holdings) -> None:
                     "message": e.message,
                     "current_score": e.current_score,
                     "current_price": e.current_price,
+                    "smoothing_reason": _result_by_ticker.get(e.ticker, {}).get("smoothing_reason"),
+                    "smoothed_action": _result_by_ticker.get(e.ticker, {}).get("smoothed_action"),
+                    "cusum_override": _result_by_ticker.get(e.ticker, {}).get("_cusum_override", False),
                 }
                 for e in exit_objs
             ]
@@ -60,6 +64,34 @@ def render_exit_intelligence(dash, results, holdings) -> None:
             sev = card_exit.get("severity", "warning")
             card_cls = "urgent" if sev == "urgent" else "action" if sev == "action_needed" else "warning"
             sev_label = "Urgent" if sev == "urgent" else "Action Needed" if sev == "action_needed" else "Watch"
+
+            # Smoother diagnostic footer — auditability for why the action stuck
+            # (Constantinides 1986 / Wald 1947 / Page 1954 CUSUM).
+            sm_reason = card_exit.get("smoothing_reason") or ""
+            sm_action = card_exit.get("smoothed_action") or ""
+            sm_footer = ""
+            if card_exit.get("cusum_override") or sm_reason == "cusum_override":
+                sm_footer = (
+                    '<div style="margin-top:6px;padding:4px 8px;border-left:3px solid #ef4444;'
+                    'background:rgba(239,68,68,0.10);font-size:11px;color:#fca5a5;">'
+                    "CUSUM structural-break override — bypassed dead-zone."
+                    "</div>"
+                )
+            elif sm_reason == "persistence_satisfied":
+                sm_footer = (
+                    '<div style="margin-top:6px;padding:4px 8px;border-left:3px solid #f59e0b;'
+                    'background:rgba(245,158,11,0.10);font-size:11px;color:#fcd34d;">'
+                    f"Persistence confirmed — smoothed action {_html.escape(sm_action)}."
+                    "</div>"
+                )
+            elif sm_reason in ("band_held_keep", "persistence_short"):
+                sm_footer = (
+                    '<div style="margin-top:6px;padding:4px 8px;border-left:3px solid #38bdf8;'
+                    'background:rgba(56,189,248,0.10);font-size:11px;color:#7dd3fc;">'
+                    "Noise filtered — smoother held prior action."
+                    "</div>"
+                )
+
             st.markdown(
                 f"""
                 <div class="exit-card {card_cls}">
@@ -72,6 +104,7 @@ def render_exit_intelligence(dash, results, holdings) -> None:
                     </div>
                     <div class="exit-message">{_html.escape(card_exit.get("message", ""))}</div>
                     {render_html_chips(exit_card_tags(card_exit))}
+                    {sm_footer}
                 </div>
                 """,
                 unsafe_allow_html=True,
