@@ -97,6 +97,197 @@ def _read_log_events(
     return out
 
 
+def _read_cached_discovery() -> list[dict]:
+    path = _ROOT / getattr(config, "ORCHESTRATOR_STATE_FILE", "orchestrator_state.json")
+    try:
+        state = json.loads(path.read_text(encoding="utf-8"))
+        cached = state.get("cached_discovery") or []
+        return cached if isinstance(cached, list) else []
+    except Exception:
+        return []
+
+
+def _is_core_ready_candidate(candidate: Any) -> bool:
+    if isinstance(candidate, dict):
+        return str(
+            candidate.get("ready_contract_core_status")
+            or candidate.get("ready_contract_status")
+            or ""
+        ).upper() == "PASS"
+    return str(
+        getattr(candidate, "ready_contract_core_status", None)
+        or getattr(candidate, "ready_contract_status", "")
+        or ""
+    ).upper() == "PASS"
+
+
+def _candidate_meta_probs(candidates: list[Any], *, core_ready_only: bool = False) -> list[float]:
+    out: list[float] = []
+    for c in candidates:
+        if core_ready_only and not _is_core_ready_candidate(c):
+            continue
+        if isinstance(c, dict):
+            value = c.get("meta_label_proba", c.get("meta_success_prob", c.get("meta_prob")))
+        else:
+            value = getattr(c, "meta_success_prob", getattr(c, "meta_prob", None))
+        try:
+            prob = float(value)
+        except (TypeError, ValueError):
+            continue
+        if 0.0 <= prob <= 1.0:
+            out.append(prob)
+    return out
+
+
+def _percentile(values: list[float], pct: float) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    idx = min(len(ordered) - 1, max(0, round((len(ordered) - 1) * pct)))
+    return ordered[idx]
+
+
+def _meta_threshold_from_probs(values: list[float]) -> tuple[float, dict[str, Any]]:
+    static = float(getattr(config, "META_LABEL_STRONG_BUY_MIN_PROB", 0.60))
+    evidence: dict[str, Any] = {
+        "static_threshold": static,
+        "dynamic_enabled": bool(getattr(config, "META_LABEL_STRONG_BUY_DYNAMIC_THRESHOLD", False)),
+        "count": len(values),
+    }
+    if not getattr(config, "META_LABEL_STRONG_BUY_DYNAMIC_THRESHOLD", False):
+        evidence["threshold"] = static
+        return static, evidence
+    min_count = int(getattr(config, "META_LABEL_STRONG_BUY_DYNAMIC_MIN_CANDIDATES", 50))
+    if len(values) < min_count:
+        evidence["threshold"] = static
+        evidence["reason"] = f"insufficient live meta probabilities ({len(values)}<{min_count})"
+        return static, evidence
+
+    pct = float(getattr(config, "META_LABEL_STRONG_BUY_DYNAMIC_PCTILE", 0.90))
+    floor = float(getattr(config, "META_LABEL_STRONG_BUY_DYNAMIC_FLOOR", 0.55))
+    multiplier = float(getattr(config, "META_LABEL_STRONG_BUY_DYNAMIC_MULTIPLIER", 0.92))
+    pctl = _percentile(values, pct)
+    p50 = _percentile(values, 0.50)
+    p95 = _percentile(values, 0.95)
+    count_at_static = sum(1 for v in values if v >= static)
+    compressed = pctl is not None and pctl < floor and count_at_static == 0
+    mode = "percentile_floor"
+    effective_floor = floor
+    if compressed:
+        compressed_floor = float(getattr(config, "META_LABEL_STRONG_BUY_DYNAMIC_COMPRESSED_FLOOR", 0.45))
+        compressed_pct = float(getattr(config, "META_LABEL_STRONG_BUY_DYNAMIC_COMPRESSED_PCTILE", 0.95))
+        compressed_tail = _percentile(values, compressed_pct)
+        suggested = max(compressed_floor, compressed_tail or pctl or static)
+        effective_floor = compressed_floor
+        mode = "compressed_tail"
+    else:
+        suggested = max(floor, (pctl or static) * multiplier)
+    threshold = round(min(0.95, max(0.01, suggested)), 4)
+    evidence.update({
+        "threshold": threshold,
+        "floor": floor,
+        "effective_floor": effective_floor,
+        "mode": mode,
+        "percentile": pct,
+        "percentile_value": pctl,
+        "multiplier": multiplier,
+        "min": min(values),
+        "p50": p50,
+        "p90": _percentile(values, 0.90),
+        "p95": p95,
+        "max": max(values),
+        "count_at_static_threshold": count_at_static,
+        "count_at_dynamic_threshold": sum(1 for v in values if v >= threshold),
+    })
+    return threshold, evidence
+
+
+def get_meta_strong_buy_min_prob(candidates: list[Any] | None = None) -> float:
+    """Return the active meta-label gate without mutating config."""
+    values = _candidate_meta_probs(candidates or _read_cached_discovery())
+    threshold, _ = _meta_threshold_from_probs(values)
+    return threshold
+
+
+def _core_ready_meta_threshold_from_probs(values: list[float], fallback_threshold: float) -> tuple[float, dict[str, Any]]:
+    evidence: dict[str, Any] = {
+        "fallback_threshold": fallback_threshold,
+        "dynamic_enabled": bool(getattr(config, "META_LABEL_CORE_READY_DYNAMIC_THRESHOLD", True)),
+        "count": len(values),
+    }
+    if not getattr(config, "META_LABEL_CORE_READY_DYNAMIC_THRESHOLD", True):
+        evidence["threshold"] = fallback_threshold
+        return fallback_threshold, evidence
+
+    min_count = int(getattr(config, "META_LABEL_CORE_READY_DYNAMIC_MIN_CANDIDATES", 2))
+    if len(values) < min_count:
+        evidence["threshold"] = fallback_threshold
+        evidence["reason"] = f"insufficient core-ready meta probabilities ({len(values)}<{min_count})"
+        return fallback_threshold, evidence
+
+    pct = float(getattr(config, "META_LABEL_CORE_READY_DYNAMIC_PCTILE", 0.50))
+    floor = float(getattr(config, "META_LABEL_CORE_READY_DYNAMIC_FLOOR", 0.45))
+    multiplier = float(getattr(config, "META_LABEL_CORE_READY_DYNAMIC_MULTIPLIER", 0.98))
+    max_threshold = float(getattr(config, "META_LABEL_CORE_READY_DYNAMIC_MAX_THRESHOLD", fallback_threshold))
+    pctl = _percentile(values, pct)
+    suggested = max(floor, (pctl or fallback_threshold) * multiplier)
+    threshold = round(min(max_threshold, max(0.01, suggested)), 4)
+    evidence.update({
+        "threshold": threshold,
+        "floor": floor,
+        "max_threshold": max_threshold,
+        "percentile": pct,
+        "percentile_value": pctl,
+        "multiplier": multiplier,
+        "min": min(values),
+        "p50": _percentile(values, 0.50),
+        "p90": _percentile(values, 0.90),
+        "max": max(values),
+        "count_at_threshold": sum(1 for v in values if v >= threshold),
+    })
+    return threshold, evidence
+
+
+def get_core_ready_meta_strong_buy_min_prob(candidates: list[Any] | None = None) -> float:
+    """Return a meta gate calibrated only on candidates that pass core readiness."""
+    pool = candidates or _read_cached_discovery()
+    fallback = get_meta_strong_buy_min_prob(pool)
+    values = _candidate_meta_probs(pool, core_ready_only=True)
+    threshold, _ = _core_ready_meta_threshold_from_probs(values, fallback)
+    return threshold
+
+
+def analyze_meta_threshold(events: list[dict]) -> tuple[dict, list[Recommendation]]:
+    """Recommend the active STRONG BUY meta gate from the live probability distribution."""
+    cached = _read_cached_discovery()
+    values = _candidate_meta_probs(cached)
+    threshold, evidence = _meta_threshold_from_probs(values)
+    core_threshold, core_evidence = _core_ready_meta_threshold_from_probs(
+        _candidate_meta_probs(cached, core_ready_only=True),
+        threshold,
+    )
+    evidence["core_ready_threshold"] = core_threshold
+    evidence["core_ready_evidence"] = core_evidence
+    current = float(getattr(config, "META_LABEL_STRONG_BUY_MIN_PROB", 0.60))
+    recs: list[Recommendation] = []
+    if evidence.get("dynamic_enabled") and evidence.get("count", 0) >= int(getattr(config, "META_LABEL_STRONG_BUY_DYNAMIC_MIN_CANDIDATES", 50)):
+        if abs(threshold - current) >= 0.01:
+            recs.append(Recommendation(
+                param="META_LABEL_STRONG_BUY_MIN_PROB_ACTIVE",
+                current_value=current,
+                suggested_value=threshold,
+                severity="info",
+                rationale=(
+                    "Live meta-label probabilities are compressed relative to the static gate. "
+                    "Use the dynamic percentile gate for serving while keeping config as the "
+                    "fallback reference."
+                ),
+                evidence=evidence,
+                confidence="medium",
+            ))
+    return evidence, recs
+
+
 # ---------------------------------------------------------------------------
 # Analyzers — each returns (metrics_dict, [Recommendation])
 # ---------------------------------------------------------------------------
@@ -311,16 +502,14 @@ def run(window_days: int = 30, write_report: bool = True) -> TuningReport:
     if not events:
         report.notes.append(
             "No relevant telemetry events in the observation window. "
-            "Auto-tune will become useful after a few days of daily discovery runs."
+            "Log-based auto-tune will become useful after a few days of daily discovery runs."
         )
-        if write_report:
-            _write_report(report)
-        return report
 
     for name, fn in (
         ("cooldown", analyze_cooldown_pressure),
         ("hurdle", analyze_hurdle_pressure),
         ("funnel", analyze_funnel_health),
+        ("meta_threshold", analyze_meta_threshold),
     ):
         try:
             metrics, recs = fn(events)
