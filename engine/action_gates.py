@@ -48,6 +48,63 @@ def _f(value: Any) -> float | None:
     return num if math.isfinite(num) else None
 
 
+def _core_ready_stretch_override_allowed(candidate: Any, stretch: float | None, rsi: float | None, cfg) -> bool:
+    """Allow modest trend stretch when the entry contract is otherwise excellent."""
+    if not getattr(cfg, "ACTION_GATES_CORE_READY_STRETCH_OVERRIDE_ENABLED", True):
+        return False
+    if str(getattr(candidate, "ready_contract_core_status", "") or "").upper() != "PASS":
+        return False
+    if str(getattr(candidate, "entry_stance", "") or "").strip().lower() != "ready":
+        return False
+    if bool(getattr(candidate, "is_parabolic", False)):
+        return False
+
+    stretch_v = _f(stretch)
+    if stretch_v is None:
+        return False
+    max_stretch = float(getattr(cfg, "ACTION_GATES_CORE_READY_STRETCH_MAX", 0.40))
+    if stretch_v > max_stretch:
+        return False
+
+    min_rr = float(getattr(cfg, "ACTION_GATES_CORE_READY_STRETCH_MIN_RR", 2.0))
+    if (_f(getattr(candidate, "r_r_ratio", None)) or 0.0) < min_rr:
+        return False
+
+    min_score = float(getattr(cfg, "ACTION_GATES_CORE_READY_STRETCH_MIN_SCORE", 0.95))
+    if (_f(getattr(candidate, "ready_contract_score", None)) or 0.0) < min_score:
+        return False
+
+    rsi_v = _f(rsi)
+    rsi_cap = float(getattr(cfg, "RSI_STRONG_BUY_MAX", 75))
+    if rsi_v is not None and rsi_v > rsi_cap:
+        return False
+    return True
+
+
+def _apply_core_ready_stretch_override(candidate: Any, result, *, stretch: float | None, rsi: float | None, cfg):
+    if result.flags.get("stretch_200dma") != "fail":
+        return result
+    if not _core_ready_stretch_override_allowed(candidate, stretch, rsi, cfg):
+        return result
+
+    result.reasons = [
+        reason for reason in result.reasons
+        if "200-DMA exceeds cap" not in str(reason)
+    ]
+    result.flags["stretch_200dma"] = "soft_pass"
+    result.flags["core_ready_stretch_override"] = "pass"
+    other_blocks = {
+        key: value
+        for key, value in result.flags.items()
+        if key not in {"stretch_200dma", "core_ready_stretch_override"}
+        and value in {"fail", "borderline"}
+    }
+    if not other_blocks:
+        result.action_ceiling = "STRONG BUY"
+        result.needs_pullback = False
+    return result
+
+
 @dataclass
 class GateContext:
     """Pre-computed batch-level context shared across candidates."""
@@ -56,12 +113,46 @@ class GateContext:
     gpa_percentiles: dict = field(default_factory=dict)
 
 
-def build_context(candidates: Iterable[Any]) -> GateContext:
+def _sector_aware_percentiles(
+    *,
+    tickers: list[str],
+    sectors: list[str],
+    values: list[float | None],
+    config_module=None,
+) -> dict[str, float | None]:
+    """Return ticker -> percentile, using sector buckets when they are broad enough."""
+    cfg = config_module
+    if cfg is None:
+        import config as cfg    # type: ignore[no-redef]
+
+    global_pcts = cross_sectional_percentile(values)
+    out: dict[str, float | None] = {t: p for t, p in zip(tickers, global_pcts)}
+    if not getattr(cfg, "ACTION_GATES_SECTOR_RELATIVE_QUALITY_PCTILES", True):
+        return out
+
+    min_n = int(getattr(cfg, "ACTION_GATES_SECTOR_RELATIVE_MIN_N", 8))
+    by_sector: dict[str, list[int]] = {}
+    for idx, sector in enumerate(sectors):
+        by_sector.setdefault(sector or "Unknown", []).append(idx)
+
+    for idxs in by_sector.values():
+        non_null = [values[i] for i in idxs if values[i] is not None]
+        if len(non_null) < min_n:
+            continue
+        sector_values = [values[i] for i in idxs]
+        sector_pcts = cross_sectional_percentile(sector_values)
+        for local_idx, pct in zip(idxs, sector_pcts):
+            out[tickers[local_idx]] = pct
+    return out
+
+
+def build_context(candidates: Iterable[Any], *, config_module=None) -> GateContext:
     """One-shot scan over the batch to build sector medians and percentiles."""
     rows: list[dict] = []
     qmj_values: list[float | None] = []
     gpa_values: list[float | None] = []
     tickers: list[str] = []
+    sectors: list[str] = []
 
     for c in candidates:
         ticker = str(getattr(c, "ticker", "") or "")
@@ -70,17 +161,23 @@ def build_context(candidates: Iterable[Any]) -> GateContext:
         rows.append({"ticker": ticker, "sector": sector, "ev_ebit": ev_ebit})
         qmj_values.append(_f(getattr(c, "qmj_factor_score", None)))
         # Use gpa as proxy when gpa_score isn't present
-        gpa_values.append(_f(getattr(c, "gpa_score", None)) or _f(getattr(c, "gpa", None)))
+        gpa_score = _f(getattr(c, "gpa_score", None))
+        gpa_values.append(gpa_score if gpa_score is not None else _f(getattr(c, "gpa", None)))
         tickers.append(ticker)
+        sectors.append(sector)
 
     sec_med = compute_sector_medians(rows, key="ev_ebit", sector_key="sector")
-    qmj_pcts = cross_sectional_percentile(qmj_values)
-    gpa_pcts = cross_sectional_percentile(gpa_values)
+    qmj_pcts = _sector_aware_percentiles(
+        tickers=tickers, sectors=sectors, values=qmj_values, config_module=config_module,
+    )
+    gpa_pcts = _sector_aware_percentiles(
+        tickers=tickers, sectors=sectors, values=gpa_values, config_module=config_module,
+    )
 
     return GateContext(
         sector_median_ev_ebit=sec_med,
-        qmj_percentiles={t: p for t, p in zip(tickers, qmj_pcts)},
-        gpa_percentiles={t: p for t, p in zip(tickers, gpa_pcts)},
+        qmj_percentiles=qmj_pcts,
+        gpa_percentiles=gpa_pcts,
     )
 
 
@@ -147,6 +244,13 @@ def evaluate_candidate(candidate: Any, *, context: GateContext, config_module=No
         realized_vol_pctile=_f(getattr(candidate, "realized_vol_pctile", None)),
         config_module=cfg,
     )
+    t4 = _apply_core_ready_stretch_override(
+        candidate,
+        t4,
+        stretch=_f(getattr(candidate, "price_vs_sma200_stretch", None)),
+        rsi=_f(getattr(candidate, "rsi", None)),
+        cfg=cfg,
+    )
 
     ceiling = _strictest(t1.action_ceiling, t2.action_ceiling, t3.action_ceiling, t4.action_ceiling)
     reasons: list = []
@@ -207,7 +311,7 @@ def apply_action_gates(candidates: list, *, config_module=None) -> dict:
     if not candidates or not getattr(cfg, "ACTION_GATES_ENABLED", True):
         return {"applied": 0, "downgrades": 0, "limits": 0}
 
-    ctx = build_context(candidates)
+    ctx = build_context(candidates, config_module=cfg)
     summary = {"applied": 0, "downgrades": 0, "limits": 0,
                "tier_fail_counts": {}}
 

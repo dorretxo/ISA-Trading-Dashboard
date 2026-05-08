@@ -60,6 +60,10 @@ class _Cand:
     current_price: float | None = None
     atr: float | None = None
     support_levels: dict = field(default_factory=dict)
+    is_parabolic: bool = False
+    r_r_ratio: float | None = None
+    ready_contract_core_status: str = "FAIL"
+    ready_contract_score: float | None = None
     # State that gate may mutate
     action_gate_ceiling: str = "STRONG BUY"
     action_gate_reasons: list = field(default_factory=list)
@@ -158,6 +162,64 @@ def test_clean_candidate_unaffected():
     assert c.action == "STRONG BUY"    # was set as default; stays put
 
 
+def test_core_ready_candidate_can_soft_pass_moderate_stretch():
+    c = _Cand(
+        ticker="READY", sector="Technology",
+        altman_z=4.5, f_score=8, f_score_coverage=1.0,
+        net_debt_ebitda=0.5,
+        ev_ebit=18.0, pe_ratio=24.0, pe_forward=24.0,
+        qmj_factor_score=0.90, gpa=0.6, roic=0.20, wacc=0.10,
+        rsi=62, price_vs_sma200_stretch=0.33, entry_stance="Ready",
+        r_r_ratio=2.5, ready_contract_core_status="PASS", ready_contract_score=1.0,
+    )
+
+    class _Cfg:
+        ACTION_GATES_ENABLED = True
+        ACTION_GATES_CORE_READY_STRETCH_OVERRIDE_ENABLED = True
+        ACTION_GATES_CORE_READY_STRETCH_MAX = 0.40
+        ACTION_GATES_CORE_READY_STRETCH_MIN_RR = 2.0
+        ACTION_GATES_CORE_READY_STRETCH_MIN_SCORE = 0.95
+        STRETCH_200DMA_STRONG_BUY_MAX = 0.25
+        RSI_STRONG_BUY_MAX = 70
+        RSI_NEUTRAL_CAP = 80
+        ENTRY_STANCE_BLOCKS_STRONG_BUY = True
+        MOMENTUM_VOL_SCALING_ENABLED = True
+
+    apply_action_gates([c], config_module=_Cfg)
+
+    assert c.action_gate_ceiling == "STRONG BUY"
+    assert c.action_gate_flags["stretch_200dma"] == "soft_pass"
+    assert not any("200-DMA exceeds cap" in reason for reason in c.action_gate_reasons)
+
+
+def test_core_ready_stretch_override_respects_rsi_warning():
+    c = _Cand(
+        ticker="HOT", sector="Technology",
+        altman_z=4.5, f_score=8, f_score_coverage=1.0,
+        ev_ebit=18.0, pe_ratio=24.0, pe_forward=24.0,
+        qmj_factor_score=0.90, gpa=0.6,
+        rsi=76, price_vs_sma200_stretch=0.33, entry_stance="Ready",
+        r_r_ratio=2.5, ready_contract_core_status="PASS", ready_contract_score=1.0,
+    )
+
+    class _Cfg:
+        ACTION_GATES_ENABLED = True
+        ACTION_GATES_CORE_READY_STRETCH_OVERRIDE_ENABLED = True
+        ACTION_GATES_CORE_READY_STRETCH_MAX = 0.40
+        ACTION_GATES_CORE_READY_STRETCH_MIN_RR = 2.0
+        ACTION_GATES_CORE_READY_STRETCH_MIN_SCORE = 0.95
+        STRETCH_200DMA_STRONG_BUY_MAX = 0.25
+        RSI_STRONG_BUY_MAX = 70
+        RSI_NEUTRAL_CAP = 80
+        ENTRY_STANCE_BLOCKS_STRONG_BUY = True
+        MOMENTUM_VOL_SCALING_ENABLED = True
+
+    apply_action_gates([c], config_module=_Cfg)
+
+    assert c.action_gate_ceiling == "BUY"
+    assert c.action_gate_flags["rsi"] == "borderline"
+
+
 # ---------------------------------------------------------------------------
 # Cap-action helper
 # ---------------------------------------------------------------------------
@@ -179,6 +241,46 @@ def test_build_context_handles_small_batch():
     # All percentile dicts have entries but values are None for tiny batches
     assert "A" in ctx.qmj_percentiles
     assert ctx.qmj_percentiles["A"] is None    # too few non-null QMJs
+
+
+def test_quality_percentiles_use_sector_bucket_when_available():
+    industrials = [
+        _Cand(
+            ticker=f"IND{i}",
+            sector="Industrials",
+            qmj_factor_score=0.10 + i * 0.10,
+            gpa_score=0.10 + i * 0.10,
+            altman_z=4.0,
+            f_score=7,
+            f_score_coverage=1.0,
+            ev_ebit=14.0,
+            pe_forward=18.0,
+            entry_stance="Ready",
+        )
+        for i in range(8)
+    ]
+    technology = [
+        _Cand(
+            ticker=f"TECH{i}",
+            sector="Technology",
+            qmj_factor_score=0.90 + i * 0.10,
+            gpa_score=0.90 + i * 0.10,
+            altman_z=4.0,
+            f_score=7,
+            f_score_coverage=1.0,
+            ev_ebit=14.0,
+            pe_forward=18.0,
+            entry_stance="Ready",
+        )
+        for i in range(8)
+    ]
+
+    apply_action_gates(industrials + technology)
+    target = industrials[-1]
+
+    assert target.action_gate_ceiling == "STRONG BUY"
+    assert target.action_gate_flags["qmj_pctile"] == "pass"
+    assert target.action_gate_flags["gpa_pctile"] == "pass"
 
 
 # ---------------------------------------------------------------------------
