@@ -150,6 +150,41 @@ def candidate_ready_reasons(candidate, limit: int = 3) -> list[str]:
     return cleaned
 
 
+def candidate_entry_ready(candidate) -> bool:
+    """True when a discovery BUY/STRONG BUY is executable now.
+
+    This is deliberately separate from alpha direction.  A candidate may be a
+    good watchlist BUY while still failing the entry contract because the
+    pullback, reward/risk, confidence, or gate checks have not cleared.
+    """
+    action = str(candidate_value(candidate, "action", "") or "").upper()
+    if action not in {"BUY", "STRONG BUY"}:
+        return False
+    if candidate_value(candidate, "ticker_identity_warning", None):
+        return False
+    if candidate_value(candidate, "trap_safeguard_triggered", False):
+        return False
+    if str(candidate_value(candidate, "gate_v2_status", "") or "").upper() == "REJECT":
+        return False
+    if str(candidate_value(candidate, "ready_contract_status", "") or "").upper() == "FAIL":
+        return False
+    if candidate_entry_stance(candidate) != "Ready":
+        return False
+
+    entry_price = safe_float(candidate_value(candidate, "entry_price", None), default=0.0)
+    stop_loss = safe_float(candidate_value(candidate, "stop_loss", None), default=0.0)
+    take_profit = safe_float(candidate_value(candidate, "take_profit", None), default=0.0)
+    rr_ratio = safe_float(candidate_value(candidate, "r_r_ratio", None), default=0.0)
+    position_weight = safe_float(candidate_value(candidate, "position_weight", None), default=0.0)
+    if not (entry_price > 0 and stop_loss > 0 and take_profit > 0):
+        return False
+    if rr_ratio and rr_ratio < 1.5:
+        return False
+    if position_weight <= 0:
+        return False
+    return True
+
+
 def candidate_entry_trigger(candidate) -> str:
     """Explain the practical trigger that would make a buy candidate actionable."""
     stance = candidate_entry_stance(candidate)
@@ -183,7 +218,7 @@ def candidate_readiness_summary(candidate) -> str:
     stance = candidate_entry_stance(candidate)
     reasons = candidate_ready_reasons(candidate, limit=2)
 
-    if action == "STRONG BUY" and ready_status != "FAIL":
+    if candidate_entry_ready(candidate):
         return "Ready to consider now if the suggested size and risk limit fit your plan."
     if action != "BUY":
         if reasons:
@@ -237,13 +272,15 @@ def build_trade_packet(candidate) -> dict:
     ready_status = str(candidate_value(candidate, "ready_contract_status", "") or "")
     plan_complete = entry_price > 0 and stop_loss > 0 and take_profit > 0
     buy_eligible = action in {"BUY", "STRONG BUY"}
+    entry_ready = candidate_entry_ready(candidate)
     clean_entry = (
         buy_eligible
         and not identity_warning
         and stance in {"Ready", "Pullback Preferred"}
         and confidence_label != "Data Gap"
+        and ready_status != "FAIL"
     )
-    trade_ready = clean_entry and stance == "Ready" and plan_complete
+    trade_ready = entry_ready
     top_pick = is_top_pick(candidate) and plan_complete
 
     status_rank = 0
@@ -287,6 +324,7 @@ def build_trade_packet(candidate) -> dict:
         "top_pick": top_pick,
         "plan_complete": plan_complete,
         "buy_eligible": buy_eligible,
+        "entry_ready": entry_ready,
         "clean_entry": clean_entry,
         "trade_ready": trade_ready,
         "status_rank": status_rank,
