@@ -41,7 +41,7 @@ import logging
 import os
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Mapping
+from typing import Iterable, Mapping
 
 from utils.atomic_io import atomic_write_json
 
@@ -236,6 +236,19 @@ def record_live_snapshot(
     if rd is None:
         rd = date.today()
 
+    payload = _live_snapshot_payload(info)
+    if not payload:
+        return False
+    try:
+        record_snapshot(ticker, rd, payload, source="yfinance_info", path=path)
+        return True
+    except Exception as e:
+        logger.debug("pit_store live snapshot failed for %s: %s", ticker, e)
+        return False
+
+
+def _live_snapshot_payload(info: Mapping) -> dict:
+    """Extract the PIT-safe numeric fields from a live info payload."""
     payload: dict = {}
     for pit_key, src_keys in _INFO_FIELDS_FOR_PIT:
         val = None
@@ -250,14 +263,52 @@ def record_live_snapshot(
                 break
         if val is not None:
             payload[pit_key] = val
-    if not payload:
-        return False
-    try:
-        record_snapshot(ticker, rd, payload, source="yfinance_info", path=path)
-        return True
-    except Exception as e:
-        logger.debug("pit_store live snapshot failed for %s: %s", ticker, e)
-        return False
+    return payload
+
+
+def record_live_snapshots(
+    items: Mapping[str, Mapping] | Iterable[tuple[str, Mapping]],
+    *,
+    report_date: str | date | datetime | None = None,
+    path: Path = _DEFAULT_PATH,
+) -> int:
+    """Persist many live PIT snapshots with one load/write cycle.
+
+    ``record_live_snapshot`` is intentionally simple for isolated callers, but
+    discovery Stage 5b may touch hundreds of candidates. Rewriting the whole
+    PIT JSON for every ticker is extremely slow on synced drives, so batch
+    ingestion keeps the ranking loop bounded.
+    """
+    if not items:
+        return 0
+    rd = _coerce_date(report_date) if report_date is not None else date.today()
+    if rd is None:
+        rd = date.today()
+    rd_key = rd.isoformat()
+
+    iterable = items.items() if isinstance(items, Mapping) else items
+    store = _load_store(path)
+    tickers = store.setdefault("tickers", {})
+    updated = 0
+    for ticker, info in iterable:
+        if not ticker or not isinstance(info, Mapping):
+            continue
+        payload = _live_snapshot_payload(info)
+        if not payload:
+            continue
+        payload["_report_date"] = rd_key
+        payload["_source"] = "yfinance_info"
+        ticker_key = str(ticker).upper()
+        tickers.setdefault(ticker_key, {})[rd_key] = payload
+        updated += 1
+
+    if updated:
+        try:
+            _save_store(store, path)
+        except Exception as e:
+            logger.debug("pit_store batch live snapshot failed: %s", e)
+            return 0
+    return updated
 
 
 def as_of_info(
