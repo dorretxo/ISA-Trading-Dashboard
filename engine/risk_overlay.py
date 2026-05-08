@@ -20,6 +20,7 @@ Public API:
 import logging
 import time
 from dataclasses import dataclass
+from datetime import datetime
 
 import config
 from utils.data_fetch import get_cached_ticker_info, get_price_history, get_ticker_info
@@ -191,7 +192,12 @@ def _check_earnings_proximity(result: dict) -> tuple[bool, bool, int | None]:
 # Post-earnings recency + earnings miss detection
 # ---------------------------------------------------------------------------
 
-def _check_post_earnings(ticker: str) -> tuple[bool, int | None, bool, float | None]:
+def _check_post_earnings(
+    ticker: str,
+    result: dict | None = None,
+    *,
+    allow_yahoo: bool = True,
+) -> tuple[bool, int | None, bool, float | None]:
     """Check if earnings were reported recently and whether they missed.
 
     Uses yfinance earnings data to detect:
@@ -206,9 +212,53 @@ def _check_post_earnings(ticker: str) -> tuple[bool, int | None, bool, float | N
     if cached and now - cached[1] < ttl:
         return cached[0]
 
+    result = result or {}
+    surprises = result.get("_earnings_surprises")
+    if isinstance(surprises, list) and surprises:
+        today = datetime.now().date()
+        recent_date = None
+        recent_row = None
+        for row in surprises:
+            if not isinstance(row, dict):
+                continue
+            raw_date = row.get("date") or row.get("reportedDate") or row.get("fiscalDateEnding")
+            if not raw_date:
+                continue
+            try:
+                dt = datetime.fromisoformat(str(raw_date)[:10]).date()
+            except ValueError:
+                continue
+            if dt <= today and (recent_date is None or dt > recent_date):
+                recent_date = dt
+                recent_row = row
+        if recent_date is not None:
+            days_since = (today - recent_date).days
+            post_recent = days_since <= POST_EARNINGS_RECENCY_DAYS
+            actual = recent_row.get("actualEarningResult") if recent_row else None
+            estimate = recent_row.get("estimatedEarning") if recent_row else None
+            is_miss = False
+            miss_pct = None
+            try:
+                actual_f = float(actual)
+                estimate_f = float(estimate)
+                if abs(estimate_f) > 0.001:
+                    miss_pct = (actual_f - estimate_f) / abs(estimate_f) * 100
+                    is_miss = actual_f < estimate_f
+                elif actual_f < estimate_f:
+                    miss_pct = -100.0
+                    is_miss = True
+            except (TypeError, ValueError):
+                pass
+            output = (post_recent, days_since, is_miss, miss_pct)
+            _post_earnings_cache[ticker] = (output, now)
+            return output
+
+    if not allow_yahoo:
+        output = (False, None, False, None)
+        return output
+
     try:
         import yfinance as yf
-        from datetime import datetime, timedelta
 
         t = yf.Ticker(ticker)
         today = datetime.now().date()
@@ -290,11 +340,8 @@ def _check_52w_high_proximity(ticker: str, df=None) -> tuple[bool, float | None]
     Returns (near_high, pct_from_high).
     """
     try:
-        import yfinance as yf
-
         if df is None or df.empty:
-            t = yf.Ticker(ticker)
-            df = t.history(period="1y")
+            df = get_price_history(ticker)
 
         if df is None or df.empty or len(df) < 20:
             return False, None
@@ -351,7 +398,13 @@ def _classify_market_cap(market_cap: float | None) -> tuple[str, float, float]:
 # Public API
 # ---------------------------------------------------------------------------
 
-def apply_risk_overlay(result: dict, ticker: str, df=None) -> RiskOverlay:
+def apply_risk_overlay(
+    result: dict,
+    ticker: str,
+    df=None,
+    *,
+    allow_yahoo_earnings: bool = True,
+) -> RiskOverlay:
     """Apply the full risk overlay to a scored result.
 
     Args:
@@ -366,8 +419,12 @@ def apply_risk_overlay(result: dict, ticker: str, df=None) -> RiskOverlay:
     """
     overlay = RiskOverlay()
 
+    price_df = df
+    if price_df is None:
+        price_df = get_price_history(ticker)
+
     # 1. Parabolic move
-    penalty, ret_90d, ret_30d, is_parabolic = _compute_parabolic_penalty(ticker, df=df)
+    penalty, ret_90d, ret_30d, is_parabolic = _compute_parabolic_penalty(ticker, df=price_df)
     overlay.parabolic_penalty = round(penalty, 4)
     overlay.return_90d = round(ret_90d, 4) if ret_90d is not None else None
     overlay.return_30d = round(ret_30d, 4) if ret_30d is not None else None
@@ -388,14 +445,18 @@ def apply_risk_overlay(result: dict, ticker: str, df=None) -> RiskOverlay:
     overlay.max_weight_scale = weight_scale
 
     # 4. Post-earnings recency + earnings miss
-    post_recent, days_since, is_miss, miss_pct = _check_post_earnings(ticker)
+    post_recent, days_since, is_miss, miss_pct = _check_post_earnings(
+        ticker,
+        result,
+        allow_yahoo=allow_yahoo_earnings,
+    )
     overlay.post_earnings_recent = post_recent
     overlay.post_earnings_days = days_since
     overlay.earnings_miss = is_miss
     overlay.earnings_miss_pct = round(miss_pct, 1) if miss_pct is not None else None
 
     # 5. 52-week high proximity
-    near_high, pct_from_high = _check_52w_high_proximity(ticker, df=df)
+    near_high, pct_from_high = _check_52w_high_proximity(ticker, df=price_df)
     overlay.near_52w_high = near_high
     overlay.pct_from_52w_high = pct_from_high
 

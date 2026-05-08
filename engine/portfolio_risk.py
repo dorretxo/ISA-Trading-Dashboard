@@ -14,6 +14,7 @@ Adds institutional-grade risk metrics (2026-04 upgrade):
 """
 
 import logging
+from contextlib import contextmanager
 from datetime import date
 
 import numpy as np
@@ -23,6 +24,18 @@ import config
 from utils.data_fetch import get_price_history, get_ticker_info
 
 logger = logging.getLogger(__name__)
+
+
+@contextmanager
+def _quiet_yfinance_errors():
+    """Suppress expected missing-history noise during historical stress replay."""
+    yf_logger = logging.getLogger("yfinance")
+    previous_level = yf_logger.level
+    yf_logger.setLevel(logging.CRITICAL)
+    try:
+        yield
+    finally:
+        yf_logger.setLevel(previous_level)
 
 # ---------------------------------------------------------------------------
 # Thresholds
@@ -317,10 +330,11 @@ def run_stress_scenarios(
     for scen in STRESS_SCENARIOS:
         try:
             start = scen["start"]; end = scen["end"]
-            px = _yf.download(
-                tickers, start=start, end=end,
-                progress=False, auto_adjust=True, group_by="ticker",
-            )
+            with _quiet_yfinance_errors():
+                px = _yf.download(
+                    tickers, start=start, end=end,
+                    progress=False, auto_adjust=True, group_by="ticker",
+                )
         except Exception as e:
             logger.debug("stress scenario fetch failed for %s: %s", scen["name"], e)
             continue

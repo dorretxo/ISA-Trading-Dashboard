@@ -15,9 +15,16 @@ from utils.safe_numeric import safe_float
 _logger = logging.getLogger(__name__)
 
 # Per-component timeout (seconds) — prevents any single sub-analysis from blocking
-_COMPONENT_TIMEOUT = getattr(config, "SCORING_COMPONENT_TIMEOUT", 45)
 _WEIGHT_CACHE_LOCK = threading.Lock()
 _WEIGHT_CACHE: dict[tuple[str, str], tuple[dict[str, float] | None, float]] = {}
+
+
+def _component_timeout() -> int:
+    """Return the current per-component scoring timeout in seconds."""
+    try:
+        return max(1, int(getattr(config, "SCORING_COMPONENT_TIMEOUT", 45)))
+    except Exception:
+        return 45
 
 
 def _get_scoring_weights(source: str = "portfolio", horizon: str = "90d") -> dict[str, float]:
@@ -72,7 +79,7 @@ def _run_component(func, *args, component_name: str = "", timeout: int = 0, **kw
     falling back to ThreadPoolExecutor if process-based execution fails (e.g. pickling issues).
     Returns (result, elapsed_seconds, error_string_or_None).
     """
-    timeout = timeout or _COMPONENT_TIMEOUT
+    timeout = timeout or _component_timeout()
     t0 = time.time()
 
     # Strategy 1: Thread-based (fast, but GIL can block timeout)
@@ -107,11 +114,19 @@ def analyse_holding(holding: dict) -> dict:
     _hold_start = time.time()
     _component_timings: dict[str, float] = {}
     _component_errors: list[str] = []
+    component_timeout = _component_timeout()
+    yahoo_info = holding.get("_yahoo_info") or holding.get("_stage5b_info") or None
+    allow_yahoo_metadata = bool(holding.get("_allow_yahoo_metadata_network", True))
 
     if getattr(config, "SCORING_PARALLEL_COMPONENTS", True):
         component_jobs = {
             "technical": (technical.analyse, (ticker,), {}, {"score": 0.0, "reasons": [], "current_price": None, "rsi": None, "atr": None}),
-            "fundamental": (fundamental.analyse, (ticker,), {}, {"score": 0.0, "reasons": []}),
+            "fundamental": (
+                fundamental.analyse,
+                (ticker,),
+                {"info": yahoo_info, "allow_yahoo_network": allow_yahoo_metadata},
+                {"score": 0.0, "reasons": []},
+            ),
             "sentiment": (
                 sentiment.analyse,
                 (ticker,),
@@ -128,15 +143,15 @@ def analyse_holding(holding: dict) -> dict:
 
             for future, (comp_name, started, fallback) in list(futures.items()):
                 try:
-                    remaining = max(0.1, _COMPONENT_TIMEOUT - (time.time() - started))
+                    remaining = max(0.1, component_timeout - (time.time() - started))
                     value = future.result(timeout=remaining)
                     _component_timings[comp_name] = time.time() - started
                     component_results[comp_name] = value or fallback
                 except concurrent.futures.TimeoutError:
                     _component_timings[comp_name] = time.time() - started
-                    _component_errors.append(f"{comp_name}: timeout after {_COMPONENT_TIMEOUT}s")
+                    _component_errors.append(f"{comp_name}: timeout after {component_timeout}s")
                     _logger.warning("[scoring] %s(%s) timed out after %.1fs (limit %ds)",
-                                    comp_name, ticker, _component_timings[comp_name], _COMPONENT_TIMEOUT)
+                                    comp_name, ticker, _component_timings[comp_name], component_timeout)
                     component_results[comp_name] = fallback
                 except Exception as e:
                     _component_timings[comp_name] = time.time() - started
@@ -158,7 +173,13 @@ def analyse_holding(holding: dict) -> dict:
             _component_errors.append(f"technical: {_e}")
             tech = {"score": 0.0, "reasons": [], "current_price": None, "rsi": None, "atr": None}
 
-        fund, _t, _e = _run_component(fundamental.analyse, ticker, component_name=f"fundamental({ticker})")
+        fund, _t, _e = _run_component(
+            fundamental.analyse,
+            ticker,
+            component_name=f"fundamental({ticker})",
+            info=yahoo_info,
+            allow_yahoo_network=allow_yahoo_metadata,
+        )
         _component_timings["fundamental"] = _t
         if fund is None:
             _component_errors.append(f"fundamental: {_e}")
@@ -313,7 +334,11 @@ def analyse_holding(holding: dict) -> dict:
     risk_overlay = None
     try:
         from engine.risk_overlay import apply_risk_overlay
-        risk_overlay = apply_risk_overlay(fund, ticker)
+        risk_overlay = apply_risk_overlay(
+            fund,
+            ticker,
+            allow_yahoo_earnings=allow_yahoo_metadata,
+        )
         aggregate_score -= risk_overlay.parabolic_penalty
     except Exception as _ro_e:
         _logger.debug("[scoring] Risk overlay failed for %s: %s", ticker, _ro_e)

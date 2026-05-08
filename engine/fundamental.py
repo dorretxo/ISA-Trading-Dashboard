@@ -616,7 +616,12 @@ def _compute_governance_flag(
 # Main analysis
 # ---------------------------------------------------------------------------
 
-def analyse(ticker: str) -> dict:
+def analyse(
+    ticker: str,
+    *,
+    info: dict | None = None,
+    allow_yahoo_network: bool = True,
+) -> dict:
     """Run fundamental analysis. Returns dict of metrics + a score from -1 to 1.
 
     FMP is tried FIRST as primary data source; yfinance fills any gaps.
@@ -625,12 +630,13 @@ def analyse(ticker: str) -> dict:
     # Ensure sector PE cache is loaded (once per process)
     _load_sector_pe_cache()
 
-    info = get_ticker_info(ticker)
+    fmp = _get_fmp_fundamentals(ticker)
+
+    info = dict(info or {})
+    if not info:
+        info = get_ticker_info(ticker, allow_network=allow_yahoo_network)
     if not info:
         info = {}  # FMP can still provide data even if yfinance fails
-
-    # Fetch FMP data first (primary source — Starter plan: 300 calls/min)
-    fmp = _get_fmp_fundamentals(ticker)
 
     # Use FMP profile to supplement/override yfinance when available
     fmp_profile = fmp.get("profile") if fmp else None
@@ -815,7 +821,10 @@ def analyse(ticker: str) -> dict:
     # Analyst consensus, insider activity, inst. ownership, analyst target
     inst_score = 0.0
 
-    insider_txns = get_insider_transactions(ticker)
+    if allow_yahoo_network:
+        insider_txns = get_insider_transactions(ticker)
+    else:
+        insider_txns = {"buys": 0, "sells": 0, "net_label": "N/A", "recent": []}
     insider_buys = insider_txns.get("buys", 0)
     insider_sells = insider_txns.get("sells", 0)
     insider_net = insider_txns.get("net_label", "")
