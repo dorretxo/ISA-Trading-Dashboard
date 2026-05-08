@@ -1,9 +1,11 @@
 """Shared data fetching utilities with session-level caching."""
 
 import json
+import logging
 import socket
 import time
 from pathlib import Path
+from threading import Lock
 
 import pandas as pd
 import yfinance as yf
@@ -22,6 +24,15 @@ _price_cache: dict[str, pd.DataFrame] = {}
 _info_cache: dict[str, dict] = {}
 _macro_cache: dict[str, pd.DataFrame] = {}
 _reddit_cache: dict[str, tuple[list, float]] = {}  # {ticker: (posts, timestamp)}
+_info_stats_lock = Lock()
+_info_stats: dict[str, int] = {
+    "cache": 0,
+    "network": 0,
+    "empty": 0,
+    "error": 0,
+    "timeout": 0,
+    "skipped_cache_only": 0,
+}
 
 
 def _portfolio_path() -> Path:
@@ -116,14 +127,13 @@ def get_price_history(ticker: str) -> pd.DataFrame:
         if df.empty:
             _price_cache[ticker] = pd.DataFrame()
             return pd.DataFrame()
-        # Flatten multi-level columns if present (yfinance sometimes returns them)
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
+        df = _normalise_price_frame(df, ticker)
         # Drop trailing rows with NaN Close (yfinance returns today's row with
         # NaN when the market is still open or data isn't available yet).
         # This prevents downstream ZeroDivisionError / NaN propagation.
         if "Close" in df.columns:
-            _last_valid = df["Close"].last_valid_index()
+            close = _close_series(df)
+            _last_valid = close.last_valid_index()
             if _last_valid is not None:
                 df = df.loc[:_last_valid]
             else:
@@ -135,47 +145,152 @@ def get_price_history(ticker: str) -> pd.DataFrame:
     return _price_cache[ticker]
 
 
-def get_ticker_info(ticker: str, timeout: int = 30) -> dict:
+def reset_ticker_info_stats() -> None:
+    """Reset process-local Yahoo metadata counters."""
+    with _info_stats_lock:
+        for key in _info_stats:
+            _info_stats[key] = 0
+
+
+def get_ticker_info_stats() -> dict[str, int]:
+    """Return process-local Yahoo metadata counters."""
+    with _info_stats_lock:
+        return dict(_info_stats)
+
+
+def _record_info_stat(key: str) -> None:
+    with _info_stats_lock:
+        _info_stats[key] = int(_info_stats.get(key, 0)) + 1
+
+
+def set_cached_ticker_info(ticker: str, info: dict | None) -> None:
+    """Seed the session metadata cache without making a Yahoo request."""
+    if not ticker or not isinstance(info, dict):
+        return
+    _info_cache[str(ticker).upper()] = dict(info)
+
+
+def get_ticker_info(ticker: str, timeout: int = 30, *, allow_network: bool | None = None) -> dict:
     """Fetch ticker info (fundamentals, name, etc.) with caching and timeout.
 
     Uses a thread pool to enforce a hard timeout on yfinance .info calls,
     which can hang indefinitely on delisted or problematic tickers.
     """
-    if ticker in _info_cache:
-        return _info_cache[ticker]
+    ticker_key = str(ticker or "").upper()
+    if ticker_key in _info_cache:
+        _record_info_stat("cache")
+        return _info_cache[ticker_key]
+
+    if allow_network is False:
+        _record_info_stat("skipped_cache_only")
+        return {}
 
     import concurrent.futures
 
     def _fetch():
-        return yf.Ticker(ticker).info or {}
+        return yf.Ticker(ticker_key).info or {}
 
     pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
     try:
         info = pool.submit(_fetch).result(timeout=timeout)
         pool.shutdown(wait=False)
+        if info:
+            _record_info_stat("network")
+        else:
+            _record_info_stat("empty")
     except concurrent.futures.TimeoutError:
         pool.shutdown(wait=False)
-        import logging
-        logging.getLogger(__name__).debug("Ticker info timeout for %s after %ds", ticker, timeout)
+        _record_info_stat("timeout")
+        logging.getLogger(__name__).debug("Ticker info timeout for %s after %ds", ticker_key, timeout)
         info = {}
-    except Exception:
+    except Exception as exc:
         pool.shutdown(wait=False)
+        _record_info_stat("error")
+        logging.getLogger(__name__).debug("Ticker info failed for %s: %s", ticker_key, exc)
         info = {}
 
-    _info_cache[ticker] = info
+    _info_cache[ticker_key] = info
     return info
 
 
 def get_cached_ticker_info(ticker: str) -> dict:
     """Return cached ticker info without making a network call."""
-    return _info_cache.get(ticker, {})
+    return _info_cache.get(str(ticker or "").upper(), {})
+
+
+def _normalise_price_frame(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
+    """Return a single-ticker OHLCV frame from yfinance's possible shapes."""
+    if df.empty:
+        return df
+
+    out = df.copy()
+    if isinstance(out.columns, pd.MultiIndex):
+        symbol = str(ticker or "").upper().strip()
+        for level in range(out.columns.nlevels):
+            raw_values = list(out.columns.get_level_values(level))
+            upper_values = [str(v).upper().strip() for v in raw_values]
+            if symbol and symbol in upper_values:
+                matched = raw_values[upper_values.index(symbol)]
+                out = out.xs(matched, axis=1, level=level, drop_level=True)
+                break
+
+        if isinstance(out.columns, pd.MultiIndex):
+            field_names = {"OPEN", "HIGH", "LOW", "CLOSE", "ADJ CLOSE", "VOLUME"}
+            for level in range(out.columns.nlevels):
+                values = {str(v).upper().strip() for v in out.columns.get_level_values(level)}
+                if values & field_names:
+                    out.columns = out.columns.get_level_values(level)
+                    break
+            else:
+                out.columns = out.columns.get_level_values(0)
+
+    # If flattening still leaves duplicate OHLCV columns, keep the first
+    # non-null value per row for each field. This avoids pandas returning a
+    # Series/DataFrame when callers ask for df["Close"].
+    if out.columns.has_duplicates:
+        collapsed = {}
+        for col in dict.fromkeys(out.columns):
+            subset = out.loc[:, out.columns == col]
+            if isinstance(subset, pd.DataFrame) and subset.shape[1] > 1:
+                collapsed[col] = subset.bfill(axis=1).iloc[:, 0]
+            else:
+                collapsed[col] = subset.iloc[:, 0] if isinstance(subset, pd.DataFrame) else subset
+        out = pd.DataFrame(collapsed, index=out.index)
+
+    return out
 
 
 def _scalar(val) -> float:
     """Extract a scalar float from a value that may be a pandas Series or scalar."""
+    if isinstance(val, pd.DataFrame):
+        values = pd.to_numeric(pd.Series(val.to_numpy().ravel()), errors="coerce").dropna()
+        if values.empty:
+            raise ValueError("no numeric scalar available")
+        return float(values.iloc[0])
+    if isinstance(val, pd.Series):
+        values = pd.to_numeric(val, errors="coerce").dropna()
+        if values.empty:
+            raise ValueError("no numeric scalar available")
+        return float(values.iloc[0])
     if hasattr(val, "item"):
-        return float(val.item())
+        try:
+            return float(val.item())
+        except ValueError:
+            values = pd.to_numeric(pd.Series(list(val)), errors="coerce").dropna()
+            if values.empty:
+                raise
+            return float(values.iloc[0])
     return float(val)
+
+
+def _close_series(df: pd.DataFrame) -> pd.Series:
+    """Return a numeric Close series, tolerating duplicate Close columns."""
+    if df.empty or "Close" not in df.columns:
+        return pd.Series(dtype="float64")
+    close = df["Close"]
+    if isinstance(close, pd.DataFrame):
+        close = close.apply(_scalar, axis=1)
+    return pd.to_numeric(close, errors="coerce").dropna()
 
 
 def get_current_price(ticker: str) -> float | None:
@@ -183,7 +298,10 @@ def get_current_price(ticker: str) -> float | None:
     df = get_price_history(ticker)
     if df.empty:
         return None
-    return _scalar(df["Close"].iloc[-1])
+    close = _close_series(df)
+    if close.empty:
+        return None
+    return _scalar(close.iloc[-1])
 
 
 def get_daily_change(ticker: str) -> float | None:
@@ -191,8 +309,11 @@ def get_daily_change(ticker: str) -> float | None:
     df = get_price_history(ticker)
     if df.empty or len(df) < 2:
         return None
-    latest = _scalar(df["Close"].iloc[-1])
-    previous = _scalar(df["Close"].iloc[-2])
+    close = _close_series(df)
+    if len(close) < 2:
+        return None
+    latest = _scalar(close.iloc[-1])
+    previous = _scalar(close.iloc[-2])
     if previous == 0:
         return None
     return ((latest - previous) / previous) * 100

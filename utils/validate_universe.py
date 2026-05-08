@@ -86,24 +86,45 @@ def validate(verbose: bool = True) -> dict:
             continue
 
         for ticker in batch:
+            closes = pd.Series(dtype=float)
             try:
                 if len(batch) == 1:
                     closes = data["Close"]
                 else:
                     closes = data[ticker]["Close"] if ticker in data.columns.get_level_values(0) else pd.Series(dtype=float)
-
-                if closes.dropna().empty:
-                    dead.append(ticker)
-                else:
-                    last_date = closes.dropna().index[-1]
-                    if hasattr(last_date, 'tz') and last_date.tz is not None:
-                        last_date = last_date.tz_localize(None)
-                    if last_date < pd.Timestamp(cutoff):
-                        stale.append(ticker)
-                    else:
-                        ok.append(ticker)
             except Exception:
+                try:
+                    single = yf.download(
+                        ticker,
+                        period="5d",
+                        progress=False,
+                        threads=False,
+                        auto_adjust=True,
+                    )
+                    if isinstance(single, pd.DataFrame) and not single.empty:
+                        if isinstance(single.columns, pd.MultiIndex):
+                            for level in range(single.columns.nlevels):
+                                values = {str(v).upper().strip() for v in single.columns.get_level_values(level)}
+                                if "CLOSE" in values:
+                                    single.columns = single.columns.get_level_values(level)
+                                    break
+                        if "Close" in single.columns:
+                            closes = single["Close"]
+                            if isinstance(closes, pd.DataFrame):
+                                closes = closes.bfill(axis=1).iloc[:, 0]
+                except Exception:
+                    closes = pd.Series(dtype=float)
+
+            if closes.dropna().empty:
                 dead.append(ticker)
+            else:
+                last_date = closes.dropna().index[-1]
+                if hasattr(last_date, 'tz') and last_date.tz is not None:
+                    last_date = last_date.tz_localize(None)
+                if last_date < pd.Timestamp(cutoff):
+                    stale.append(ticker)
+                else:
+                    ok.append(ticker)
 
         # Brief pause to avoid rate-limiting
         time.sleep(0.5)
@@ -111,10 +132,10 @@ def validate(verbose: bool = True) -> dict:
     if verbose:
         print(f"\n\n{'='*60}")
         print(f"RESULTS:")
-        print(f"  ✓ OK:    {len(ok)}")
-        print(f"  ⚠ STALE: {len(stale)} (no trade in 30 days)")
-        print(f"  ✗ DEAD:  {len(dead)} (no data returned)")
-        print(f"  ⊘ DUPS:  {len(duplicates)}")
+        print(f"  OK:    {len(ok)}")
+        print(f"  STALE: {len(stale)} (no trade in 30 days)")
+        print(f"  DEAD:  {len(dead)} (no data returned)")
+        print(f"  DUPS:  {len(duplicates)}")
 
         if stale:
             print(f"\nSTALE tickers (review needed):")
