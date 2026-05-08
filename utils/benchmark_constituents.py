@@ -65,6 +65,13 @@ _SPECS: tuple[BenchmarkSpec, ...] = (
         country="US",
     ),
     BenchmarkSpec(
+        index="SPMIDCAP400",
+        wiki_url="https://en.wikipedia.org/wiki/List_of_S%26P_400_companies",
+        symbol_columns=("Symbol", "Ticker symbol", "Ticker"),
+        yf_suffix="",
+        country="US",
+    ),
+    BenchmarkSpec(
         index="FTSE100",
         wiki_url="https://en.wikipedia.org/wiki/FTSE_100_Index",
         symbol_columns=("EPIC", "Ticker", "Symbol"),
@@ -304,6 +311,39 @@ def get_benchmark_tickers(
                 seen.add(t)
                 out.append(t)
     return out
+
+
+def get_supported_benchmark_keys() -> list[str]:
+    """Return the benchmark keys the current code expects in the cache."""
+    return [spec.index for spec in _SPECS]
+
+
+def get_benchmark_cache_metadata() -> dict:
+    """Return cache freshness metadata used by orchestrator rebuild gating."""
+    cache = _load_cache()
+    benchmarks = cache.get("benchmarks", {}) or {}
+    missing = [
+        spec.index
+        for spec in _SPECS
+        if not (benchmarks.get(spec.index) or {}).get("tickers")
+    ]
+    latest_refreshed_at = None
+    for entry in benchmarks.values():
+        refreshed_at = entry.get("refreshed_at")
+        if not refreshed_at:
+            continue
+        try:
+            parsed = datetime.fromisoformat(refreshed_at)
+        except ValueError:
+            continue
+        if latest_refreshed_at is None or parsed > latest_refreshed_at:
+            latest_refreshed_at = parsed
+    return {
+        "path": str(_CACHE_PATH),
+        "supported": get_supported_benchmark_keys(),
+        "missing": missing,
+        "latest_refreshed_at": latest_refreshed_at.isoformat() if latest_refreshed_at else None,
+    }
 
 
 def get_benchmark_summary() -> dict:

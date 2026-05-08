@@ -38,17 +38,49 @@ def _excluded_country_tokens() -> set[str]:
     }
 
 
+def _ticker_aliases() -> dict[str, str]:
+    return {
+        str(src).upper().strip(): str(dst).upper().strip()
+        for src, dst in getattr(config, "DISCOVERY_TICKER_ALIASES", {}).items()
+        if str(src).strip() and str(dst).strip()
+    }
+
+
+def resolve_yahoo_ticker(ticker: str) -> str:
+    """Return the Yahoo-compatible symbol for a configured universe ticker."""
+    symbol = str(ticker or "").upper().strip()
+    return _ticker_aliases().get(symbol, symbol)
+
+
+def _quarantined_tickers() -> set[str]:
+    return {
+        str(value).upper().strip()
+        for value in getattr(config, "DISCOVERY_TICKER_QUARANTINE", set())
+        if str(value).strip()
+    }
+
+
+def is_quarantined_ticker(ticker: str) -> bool:
+    """Return True when a symbol is known to be unpriceable in Yahoo Finance."""
+    symbol = resolve_yahoo_ticker(ticker)
+    return symbol in _quarantined_tickers()
+
+
 def is_excluded_ticker(ticker: str, country: str | None = None, region: str | None = None) -> bool:
     """Return True when a ticker is outside the configured investable universe."""
-    symbol = str(ticker or "").upper().strip()
-    if not symbol:
+    raw_symbol = str(ticker or "").upper().strip()
+    if not raw_symbol:
         return False
+    symbol = resolve_yahoo_ticker(raw_symbol)
 
     excluded_tickers = {
         str(value).upper().strip()
         for value in getattr(config, "DISCOVERY_EXCLUDED_TICKERS", set())
     }
     if symbol in excluded_tickers:
+        return True
+
+    if symbol in _quarantined_tickers():
         return True
 
     excluded_suffixes = tuple(
@@ -798,6 +830,13 @@ _TICKER_TO_REGION = {
     for region_name, region_entries in _ALL_REGIONS.items()
     for entry in region_entries
 }
+_RESOLVED_TICKER_TO_REGION: dict[str, str] = {}
+for _region_name, _region_entries in _ALL_REGIONS.items():
+    for _entry in _region_entries:
+        _resolved = resolve_yahoo_ticker(_entry[0])
+        if _resolved and not is_quarantined_ticker(_resolved):
+            _RESOLVED_TICKER_TO_REGION.setdefault(_resolved.upper(), _region_name)
+del _region_name, _region_entries, _entry, _resolved
 
 
 def _iter_filtered_entries(
@@ -809,12 +848,20 @@ def _iter_filtered_entries(
     include_tier2: bool = True,
 ):
     """Yield universe entries that satisfy the requested filters."""
-    exclude = {t.upper() for t in (exclude_tickers or set())}
+    exclude: set[str] = set()
+    for t in exclude_tickers or set():
+        raw = str(t or "").upper().strip()
+        if raw:
+            exclude.add(raw)
+            exclude.add(resolve_yahoo_ticker(raw))
     allowed_countries = set(countries or [])
     allowed_regions = set(regions or [])
+    seen: set[str] = set()
 
     for entry in _UNIVERSE:
-        if entry.ticker.upper() in exclude:
+        raw_ticker = entry.ticker.upper()
+        resolved_ticker = resolve_yahoo_ticker(raw_ticker)
+        if raw_ticker in exclude or resolved_ticker in exclude:
             continue
         if entry.tier > max_tier:
             continue
@@ -822,18 +869,23 @@ def _iter_filtered_entries(
             continue
         if allowed_countries and entry.country not in allowed_countries:
             continue
-        region = _TICKER_TO_REGION.get(entry.ticker.upper(), "")
-        if is_excluded_ticker(entry.ticker, country=entry.country, region=region):
+        region = _TICKER_TO_REGION.get(raw_ticker, "")
+        if is_excluded_ticker(raw_ticker, country=entry.country, region=region):
             continue
         if allowed_regions and region not in allowed_regions:
             continue
-        yield entry
+        if resolved_ticker in seen:
+            continue
+        seen.add(resolved_ticker)
+        yield entry._replace(ticker=resolved_ticker)
 
 
 def get_region_for_ticker(ticker: str) -> str:
     """Return the configured universe region for a ticker, if known."""
-    region = _TICKER_TO_REGION.get((ticker or "").upper(), "")
-    return "" if is_excluded_ticker(ticker, region=region) else region
+    raw = str(ticker or "").upper().strip()
+    resolved = resolve_yahoo_ticker(raw)
+    region = _RESOLVED_TICKER_TO_REGION.get(resolved, _TICKER_TO_REGION.get(raw, ""))
+    return "" if is_excluded_ticker(resolved, region=region) else region
 
 
 def build_daily_universe_snapshot(
@@ -862,7 +914,7 @@ def build_daily_universe_snapshot(
         regions=regions,
         include_tier2=include_tier2,
     ):
-        region = _TICKER_TO_REGION.get(entry.ticker.upper(), "Unknown")
+        region = _RESOLVED_TICKER_TO_REGION.get(entry.ticker.upper(), "Unknown")
         cap = per_region_caps.get(region)
         if cap is not None and region_counts.get(region, 0) >= cap:
             continue
@@ -878,14 +930,7 @@ def build_daily_universe_snapshot(
 
 def get_full_universe() -> list[UniverseEntry]:
     """Return the active structured universe with metadata."""
-    return [
-        entry for entry in _UNIVERSE
-        if not is_excluded_ticker(
-            entry.ticker,
-            country=entry.country,
-            region=_TICKER_TO_REGION.get(entry.ticker.upper(), ""),
-        )
-    ]
+    return list(_iter_filtered_entries(max_tier=99, include_tier2=True))
 
 
 def get_global_universe(
@@ -919,12 +964,19 @@ def get_global_universe(
 
     # Merge dynamic supplement (non-stale, non-excluded, non-duplicate)
     seen = {t.upper() for t in static}
-    excluded = {t.upper() for t in (exclude_tickers or set())}
+    excluded: set[str] = set()
+    for t in exclude_tickers or set():
+        raw = str(t or "").upper().strip()
+        if raw:
+            excluded.add(raw)
+            excluded.add(resolve_yahoo_ticker(raw))
     dynamic = get_dynamic_tickers()
     for t in dynamic:
-        t_upper = t.upper()
+        t_upper = resolve_yahoo_ticker(t).upper()
+        if is_excluded_ticker(t_upper):
+            continue
         if t_upper not in seen and t_upper not in excluded:
-            static.append(t)
+            static.append(t_upper)
             seen.add(t_upper)
     return static
 
@@ -981,7 +1033,7 @@ def get_universe_stats() -> dict:
     by_region: dict[str, int] = {}
     for e in active_universe:
         by_country[e.country] = by_country.get(e.country, 0) + 1
-        region = _TICKER_TO_REGION.get(e.ticker.upper(), "Unknown")
+        region = _RESOLVED_TICKER_TO_REGION.get(e.ticker.upper(), "Unknown")
         by_region[region] = by_region.get(region, 0) + 1
 
     # Include dynamic supplement stats if available
@@ -1084,7 +1136,7 @@ def reconstitute_universe(
 
     existing = load_dynamic_supplement()
     current_tickers = {
-        str(t.get("ticker", "")).upper()
+        resolve_yahoo_ticker(t.get("ticker", ""))
         for t in existing.get("tickers", [])
         if not is_excluded_ticker(
             t.get("ticker", ""),
@@ -1102,7 +1154,7 @@ def reconstitute_universe(
     candidates = list(current_tickers)
     if extra_tickers:
         for t in extra_tickers:
-            t_upper = str(t or "").upper().strip()
+            t_upper = resolve_yahoo_ticker(t)
             if not t_upper or is_excluded_ticker(t_upper):
                 continue
             if t_upper not in static_tickers and t_upper not in current_tickers:
@@ -1112,7 +1164,7 @@ def reconstitute_universe(
     removed = 0
 
     for ticker in candidates:
-        ticker = str(ticker or "").upper().strip()
+        ticker = resolve_yahoo_ticker(ticker)
         if not ticker or is_excluded_ticker(ticker):
             stale_counts.pop(ticker, None)
             removed += 1
@@ -1187,15 +1239,20 @@ def reconstitute_universe(
 def get_dynamic_tickers() -> list[str]:
     """Return validated dynamic ticker symbols (non-stale only)."""
     data = load_dynamic_supplement()
-    return [
-        t["ticker"] for t in data.get("tickers", [])
-        if not t.get("stale")
-        and not is_excluded_ticker(
-            t.get("ticker", ""),
-            country=t.get("country"),
-            region=t.get("country"),
-        )
-    ]
+    result: list[str] = []
+    seen: set[str] = set()
+    for t in data.get("tickers", []):
+        ticker = resolve_yahoo_ticker(t.get("ticker", ""))
+        if (
+            t.get("stale")
+            or not ticker
+            or ticker in seen
+            or is_excluded_ticker(ticker, country=t.get("country"), region=t.get("country"))
+        ):
+            continue
+        result.append(ticker)
+        seen.add(ticker)
+    return result
 
 
 def get_dynamic_entries() -> list[dict]:
@@ -1206,15 +1263,22 @@ def get_dynamic_entries() -> list[dict]:
     not lose the metadata that reconstitute_universe() already fetched.
     """
     data = load_dynamic_supplement()
-    return [
-        t for t in data.get("tickers", [])
-        if not t.get("stale")
-        and not is_excluded_ticker(
-            t.get("ticker", ""),
-            country=t.get("country"),
-            region=t.get("country"),
-        )
-    ]
+    result: list[dict] = []
+    seen: set[str] = set()
+    for t in data.get("tickers", []):
+        ticker = resolve_yahoo_ticker(t.get("ticker", ""))
+        if (
+            t.get("stale")
+            or not ticker
+            or ticker in seen
+            or is_excluded_ticker(ticker, country=t.get("country"), region=t.get("country"))
+        ):
+            continue
+        entry = dict(t)
+        entry["ticker"] = ticker
+        result.append(entry)
+        seen.add(ticker)
+    return result
 
 
 def get_dynamic_rejected() -> set[str]:
@@ -1232,6 +1296,7 @@ def get_dynamic_rejected() -> set[str]:
             sym = t.get("ticker")
             if sym:
                 rejected.add(sym)
+                rejected.add(resolve_yahoo_ticker(sym))
     return rejected
 
 
@@ -1270,7 +1335,12 @@ def decompose_etf_holdings(
     import yfinance as yf
 
     cache_ttl = getattr(config, "ETF_HOLDINGS_CACHE_TTL", 604800)  # 7 days
-    excluded = {str(t or "").upper().strip() for t in (exclude_tickers or set())}
+    excluded: set[str] = set()
+    for t in exclude_tickers or set():
+        raw = str(t or "").upper().strip()
+        if raw:
+            excluded.add(raw)
+            excluded.add(resolve_yahoo_ticker(raw))
     static_tickers = {e.ticker.upper() for e in get_full_universe()}
 
     # Check cache freshness
@@ -1284,9 +1354,9 @@ def decompose_etf_holdings(
                 age_secs = (datetime.now() - saved_dt).total_seconds()
                 if age_secs < cache_ttl:
                     tickers = [
-                        t for t in cached.get("tickers", [])
-                        if t.upper() not in excluded
-                        and not is_excluded_ticker(t)
+                        resolve_yahoo_ticker(t) for t in cached.get("tickers", [])
+                        if resolve_yahoo_ticker(t).upper() not in excluded
+                        and not is_excluded_ticker(resolve_yahoo_ticker(t))
                     ]
                     _logger.info("ETF decomposition: %d cached tickers (age %.1fh)",
                                  len(tickers), age_secs / 3600)
@@ -1327,7 +1397,7 @@ def decompose_etf_holdings(
                     )
 
                 for sym in symbols:
-                    s_upper = sym.upper().strip()
+                    s_upper = resolve_yahoo_ticker(sym)
                     if (
                         s_upper
                         and s_upper not in static_tickers
