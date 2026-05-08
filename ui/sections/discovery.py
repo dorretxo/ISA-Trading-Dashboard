@@ -133,7 +133,7 @@ def render_discovery_section(dash, holdings, risk_data) -> None:
 
     disc_col1, disc_col2 = st.columns([1, 3])
     with disc_col1:
-        run_discovery_clicked = st.button("?? Re-run Screener", type="primary", use_container_width=True)
+        run_discovery_clicked = st.button("?? Re-run Screener", type="primary", width="stretch")
     with disc_col2:
         cached_ts = st.session_state.get("discovery_cached_from")
         if cached_ts and "discovery_results" in st.session_state:
@@ -370,7 +370,7 @@ def render_discovery_section(dash, holdings, risk_data) -> None:
                     }
                 )
             if disc_rows:
-                st.dataframe(pd.DataFrame(disc_rows), hide_index=True, use_container_width=True)
+                st.dataframe(pd.DataFrame(disc_rows), hide_index=True, width="stretch")
 
         if disc.rejections:
             with st.expander(f"?? Rejected Candidates ({len(disc.rejections)})"):
@@ -378,7 +378,7 @@ def render_discovery_section(dash, holdings, risk_data) -> None:
                     {"Ticker": r.ticker, "Name": r.name, "Exchange": r.exchange, "Stage": r.stage, "Reason": r.reason}
                     for r in disc.rejections[:100]
                 ]
-                st.dataframe(pd.DataFrame(rej_rows), hide_index=True, use_container_width=True)
+                st.dataframe(pd.DataFrame(rej_rows), hide_index=True, width="stretch")
     elif not disc.error:
         st.info("No candidates found meeting the criteria. Try adjusting discovery parameters in config.py.")
 
@@ -404,17 +404,17 @@ def render_discovery_section(dash, holdings, risk_data) -> None:
                 if pstats:
                     ps_rows = [{"Pillar": s["pillar"].title(), "IC": f"{s['information_coefficient']:+.3f}", "Hit Rate": f"{s['hit_rate']:.0%}", "Avg Return (High)": f"{s['avg_return_high']:+.1f}%", "Avg Return (Low)": f"{s['avg_return_low']:+.1f}%", "Samples": s["sample_size"]} for s in pstats]
                     st.markdown("**Pillar Effectiveness (which signals predict 90-day returns)**")
-                    st.dataframe(pd.DataFrame(ps_rows), hide_index=True, use_container_width=True)
+                    st.dataframe(pd.DataFrame(ps_rows), hide_index=True, width="stretch")
 
                 if acal:
                     ac_rows = [{"Action": a["action"], "Avg 90d Return": f"{a['avg_return_90d']:+.1f}%", "Accuracy": f"{a['hit_rate']:.0%}", "Samples": a["sample_size"]} for a in acal]
                     st.markdown("**Action Calibration (are action labels accurate?)**")
-                    st.dataframe(pd.DataFrame(ac_rows), hide_index=True, use_container_width=True)
+                    st.dataframe(pd.DataFrame(ac_rows), hide_index=True, width="stretch")
 
                 if rstats:
                     re_rows = [{"Regime": r["regime"], "Avg 90d Return": f"{r['avg_return_90d']:+.1f}%", "Best Pillar": (r["best_pillar"] or "-").title(), "Samples": r["sample_size"]} for r in rstats]
                     st.markdown("**Regime Effectiveness (which regime works best?)**")
-                    st.dataframe(pd.DataFrame(re_rows), hide_index=True, use_container_width=True)
+                    st.dataframe(pd.DataFrame(re_rows), hide_index=True, width="stretch")
 
                 st_col, fc_col = st.columns(2)
                 with st_col:
@@ -435,7 +435,7 @@ def render_discovery_section(dash, holdings, risk_data) -> None:
                 if perf:
                     perf_rows = [{"Date": p["run_date"][:10], "Ticker": p["ticker"], "Source": p.get("source", "-"), "Action": p.get("action", "-"), "Score": f"{p['aggregate_score']:.3f}", "30d": f"{p['return_30d']:+.1f}%" if p.get("return_30d") is not None else "-", "60d": f"{p['return_60d']:+.1f}%" if p.get("return_60d") is not None else "-", "90d": f"{p['return_90d']:+.1f}%" if p.get("return_90d") is not None else "-", "Beat SPY": "Yes" if p.get("beat_market") else "No", "Action OK": "Yes" if p.get("action_correct") else "No"} for p in perf]
                     st.markdown("**Signal Performance - Multi-Horizon Returns**")
-                    st.dataframe(pd.DataFrame(perf_rows), hide_index=True, use_container_width=True)
+                    st.dataframe(pd.DataFrame(perf_rows), hide_index=True, width="stretch")
                     returns = [p["return_90d"] for p in perf if p.get("return_90d") is not None]
                     if returns:
                         bc1, bc2, bc3, bc4 = st.columns(4)
@@ -471,12 +471,12 @@ def render_discovery_section(dash, holdings, risk_data) -> None:
                 if sc.horizons:
                     h_rows = pd.DataFrame([{"Horizon": h.horizon, "Avg Return": f"{h.avg_return:+.1f}%", "Median": f"{h.median_return:+.1f}%", "Std Dev": f"{h.std_return:.1f}%", "Hit Rate": f"{h.hit_rate:.0%}", "Alpha vs SPY": f"{h.alpha:+.1f}%" if h.horizon == "90d" else "-", "Best": f"{h.best:+.1f}%", "Worst": f"{h.worst:+.1f}%", "N": h.sample_size} for h in sc.horizons])
                     st.markdown("**Returns by Horizon**")
-                    st.dataframe(h_rows, hide_index=True, use_container_width=True)
+                    st.dataframe(h_rows, hide_index=True, width="stretch")
 
                 if sc.regimes:
                     r_rows = pd.DataFrame([{"Regime": r.regime, "Avg 90d Return": f"{r.avg_return_90d:+.1f}%", "Hit Rate": f"{r.hit_rate:.0%}", "Best Pillar": (r.best_pillar or "-").title(), "N": r.sample_size} for r in sc.regimes])
                     st.markdown("**Performance by Market Regime**")
-                    st.dataframe(r_rows, hide_index=True, use_container_width=True)
+                    st.dataframe(r_rows, hide_index=True, width="stretch")
 
                 st_c, fc_c = st.columns(2)
                 with st_c:

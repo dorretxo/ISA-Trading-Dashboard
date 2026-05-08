@@ -283,6 +283,24 @@ def compute_batch_factors(
 
     now_iso = datetime.now(timezone.utc).isoformat()
     results = {}
+    original_count = len(tickers)
+    try:
+        from utils.global_universe import is_excluded_ticker, resolve_yahoo_ticker
+        filtered = []
+        skipped_excluded = 0
+        for raw in tickers:
+            symbol = resolve_yahoo_ticker(str(raw or "").upper())
+            if not symbol:
+                continue
+            if is_excluded_ticker(symbol):
+                skipped_excluded += 1
+                continue
+            filtered.append(symbol)
+        tickers = sorted(set(filtered))
+        if skipped_excluded:
+            logger.info("Feature store skipped %d excluded/quarantined tickers before price download", skipped_excluded)
+    except Exception:
+        tickers = [str(t).upper() for t in tickers if t]
 
     # Download SPY for beta computation if not provided
     if spy_returns is None:
@@ -332,7 +350,7 @@ def compute_batch_factors(
     if sector_map:
         _compute_sector_relative_strength(results, sector_map)
 
-    logger.info("Computed batch factors for %d / %d tickers", len(results), len(tickers))
+    logger.info("Computed batch factors for %d / %d tickers", len(results), original_count)
     return results
 
 
