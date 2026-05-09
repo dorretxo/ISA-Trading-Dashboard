@@ -11,8 +11,10 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
+import json
 import logging
 import math
+from types import SimpleNamespace
 from typing import Iterable
 
 import numpy as np
@@ -22,6 +24,7 @@ import config
 from engine.discovery_backtest import _connect, init_backtest_db
 from engine.enterprise_factors import compute_piotroski_f_score
 from engine.factors import compute_factor_scores_from_result, compute_fundamental_quality_metrics
+from engine.institutional_prior import neutral_prior, score_universe
 from engine.labeling import triple_barrier_from_frame
 from engine.technical import analyse_from_df
 from utils.pit_store import _available_date, _coerce_date, _load_store
@@ -65,6 +68,12 @@ def _pit_store_cached() -> dict:
     if _PIT_STORE_CACHE is None:
         _PIT_STORE_CACHE = _load_store()
     return _PIT_STORE_CACHE
+
+
+def reset_pit_cache() -> None:
+    """Clear cached PIT fundamentals after an in-process backfill."""
+    global _PIT_STORE_CACHE
+    _PIT_STORE_CACHE = None
 
 
 def _latest_as_of_cached(ticker: str, as_of, *, lag_days: int) -> tuple[dict | None, str | None]:
@@ -631,6 +640,165 @@ def _replay_factor_payload(ticker: str, as_of: pd.Timestamp, base_values: dict) 
     return {**ffeat, **factor_scores}
 
 
+def _json_or_none(value) -> str | None:
+    if value is None:
+        return None
+    try:
+        return json.dumps(value, default=str, sort_keys=True)
+    except Exception:
+        return None
+
+
+def _replay_entry_stance(row: dict) -> str:
+    """PIT-safe entry stance from as-of price/technical state only."""
+    rsi = _finite(row.get("rsi"))
+    stretch = _finite(row.get("price_vs_sma200_stretch"))
+    if (
+        (rsi is not None and rsi > float(getattr(config, "RSI_NEUTRAL_CAP", 80)))
+        or (stretch is not None and stretch > 0.60)
+    ):
+        return "Watch Only"
+    if (
+        (rsi is not None and rsi > float(getattr(config, "RSI_STRONG_BUY_MAX", 75)))
+        or (
+            stretch is not None
+            and stretch > float(getattr(config, "STRETCH_200DMA_STRONG_BUY_MAX", 0.35))
+        )
+    ):
+        return "Pullback Preferred"
+    return "Ready"
+
+
+def _replay_data_confidence(row: dict) -> float:
+    critical = [
+        "technical_score", "momentum_score", "f_score", "gpa", "ev_ebit",
+        "quality_factor_score", "value_factor_score", "momentum_factor_score",
+        "sma_200", "rsi", "atr",
+    ]
+    present = sum(1 for key in critical if _finite(row.get(key)) is not None)
+    return float(present / max(1, len(critical)))
+
+
+def _apply_replay_readiness_fields(rows: dict[str, dict]) -> None:
+    """Populate PIT-safe action-gate and ready-contract fields on replay rows.
+
+    Deliberately excludes live-only sentiment and current holdings. The
+    institutional prior is recomputed from the historical replay cohort for the
+    same as-of date, so percentile inputs are point-in-time cross-sectional.
+    """
+    if not rows:
+        return
+
+    for ticker, row in rows.items():
+        row["ticker"] = ticker
+    priors = score_universe(list(rows.values()))
+    candidates: list[SimpleNamespace] = []
+    for ticker, row in rows.items():
+        signal_price = _finite(row.get("signal_price"))
+        stop_loss = _finite(row.get("stop_loss"))
+        take_profit = _finite(row.get("take_profit"))
+        rr_ratio = None
+        if signal_price is not None and stop_loss is not None and take_profit is not None:
+            risk = signal_price - stop_loss
+            reward = take_profit - signal_price
+            if risk > 0 and reward > 0:
+                rr_ratio = reward / risk
+        prior = priors.get(str(ticker).upper(), neutral_prior())
+        row.update({
+            "entry_lens": row.get("entry_lens") or "replay_close",
+            "entry_price": signal_price,
+            "entry_method": "replay_close",
+            "entry_stance": _replay_entry_stance(row),
+            "fill_probability": 1.0 if signal_price is not None else None,
+            "planned_position_weight": float(getattr(config, "READY_STRONG_BUY_MIN_POSITION_WEIGHT", 0.005)) * 2.0,
+            "planned_risk_amount": None,
+            "position_sizing_method": "replay_fixed_fraction",
+            "r_r_ratio": rr_ratio,
+            "current_price": signal_price,
+            "institutional_prior_score": prior.score,
+            "institutional_prior_percentile": prior.percentile,
+            "institutional_prior_confidence": prior.confidence,
+            "institutional_prior_components": _json_or_none(prior.components),
+        })
+        payload = dict(row)
+        payload.update({
+            "ticker": ticker,
+            "sector": row.get("sector") or "Unknown",
+            "action": row.get("action") or "NEUTRAL",
+            "ready_contract_core_status": "FAIL",
+            "ready_contract_score": None,
+        })
+        candidates.append(SimpleNamespace(**payload))
+
+    try:
+        from engine.action_gates import apply_action_gates, cap_action
+
+        apply_action_gates(candidates)
+        for candidate in candidates:
+            row = rows[str(candidate.ticker)]
+            ceiling = getattr(candidate, "action_gate_ceiling", "STRONG BUY")
+            action = str(row.get("action") or "NEUTRAL")
+            row["action_gate_ceiling"] = ceiling
+            row["action_gate_reasons"] = _json_or_none(getattr(candidate, "action_gate_reasons", []))
+            row["action_gate_flags_json"] = _json_or_none(getattr(candidate, "action_gate_flags", {}))
+            row["limit_price"] = getattr(candidate, "limit_price", None)
+            row["limit_price_method"] = getattr(candidate, "limit_price_method", None)
+            row["limit_price_rationale"] = getattr(candidate, "limit_price_rationale", None)
+            row["action"] = cap_action(action, ceiling)
+    except Exception as exc:
+        logger.debug("Replay action-gate backfill failed: %s", exc)
+
+    try:
+        from engine.discovery import (
+            _evaluate_discovery_gates_v2,
+            _evaluate_ready_strong_buy_contract,
+            _evaluate_trap_safeguard,
+        )
+    except Exception as exc:
+        logger.debug("Replay ready-contract helpers unavailable: %s", exc)
+        return
+
+    for ticker, row in rows.items():
+        sector = str(row.get("sector") or "Unknown")
+        industry = str(row.get("industry") or "")
+        stretch = _finite(row.get("price_vs_sma200_stretch"))
+        gate_v2_status, gate_v2_reasons = _evaluate_discovery_gates_v2(
+            row, sector=sector, industry=industry, stretch=stretch
+        )
+        trap_triggered, trap_reason = _evaluate_trap_safeguard(
+            row, sector=sector, industry=industry, stretch=stretch
+        )
+        row["gate_v2_status"] = gate_v2_status
+        row["gate_v2_reasons"] = _json_or_none(gate_v2_reasons)
+        row["trap_safeguard_triggered"] = 1 if trap_triggered else 0
+        row["trap_safeguard_reason"] = trap_reason
+
+        prior = priors.get(str(ticker).upper(), neutral_prior())
+        status, reasons, details = _evaluate_ready_strong_buy_contract(
+            gate_status=gate_v2_status,
+            trap_triggered=trap_triggered,
+            prior=prior,
+            entry_stance=str(row.get("entry_stance") or ""),
+            entry_price=row.get("entry_price"),
+            stop_loss=row.get("stop_loss"),
+            take_profit=row.get("take_profit"),
+            rr_ratio=row.get("r_r_ratio"),
+            position_weight=row.get("planned_position_weight"),
+            data_confidence=_replay_data_confidence(row),
+            gate_reasons=gate_v2_reasons,
+            return_details=True,
+        )
+        ceiling = str(row.get("action_gate_ceiling") or "STRONG BUY")
+        if ceiling != "STRONG BUY":
+            status = "FAIL"
+            reasons = list(reasons) + [f"action gate ceiling {ceiling}"]
+        row["ready_contract_status"] = status
+        row["ready_contract_reasons"] = _json_or_none(reasons)
+        row["ready_contract_score"] = details.get("score")
+        row["strong_buy_eligible"] = 1 if status == "PASS" else 0
+        row["strong_buy_blockers"] = _json_or_none([] if status == "PASS" else reasons)
+
+
 def _insert_replay_row(
     ticker: str,
     as_of: pd.Timestamp,
@@ -828,30 +996,47 @@ def run_replay(
                 price_features_by_ticker[ticker] = pfeat
         if bool(getattr(config, "HISTORICAL_REPLAY_CROSS_SECTIONAL_MOMENTUM", False)):
             _apply_cross_sectional_momentum_scores(price_features_by_ticker)
+        replay_rows: dict[str, dict] = {}
+        frames_for_rows: dict[str, pd.DataFrame] = {}
+        for ticker in universe:
+            attempted += 1
+            frame = frames.get(ticker)
+            pfeat = price_features_by_ticker.get(ticker)
+            if not pfeat:
+                skipped_no_price += 1
+                continue
+            enriched = _replay_factor_payload(ticker, as_of, pfeat)
+            fund_score = enriched.get("fundamental_score")
+            tech_score = pfeat.get("technical_score") or 0.0
+            aggregate = 0.65 * tech_score + 0.35 * (fund_score if fund_score is not None else 0.0)
+            action = (
+                "STRONG BUY" if aggregate >= float(getattr(config, "SCORE_STRONG_BUY_THRESHOLD", 0.40))
+                else "BUY" if aggregate >= float(getattr(config, "SCORE_BUY_THRESHOLD", 0.20))
+                else "NEUTRAL" if aggregate >= float(getattr(config, "SCORE_KEEP_THRESHOLD", -0.25))
+                else "AVOID"
+            )
+            row = {
+                **pfeat,
+                **enriched,
+                "aggregate_score": round(float(aggregate), 4),
+                "final_rank": round(float(aggregate), 4),
+                "action": action,
+                "sentiment_score": None,
+                "forecast_score": None,
+                "take_profit": pfeat["signal_price"] + 2.0 * (pfeat.get("atr") or pfeat["signal_price"] * 0.08),
+                "stop_loss": pfeat["signal_price"] - 1.0 * (pfeat.get("atr") or pfeat["signal_price"] * 0.08),
+            }
+            replay_rows[ticker] = row
+            if frame is not None:
+                frames_for_rows[ticker] = frame
+
+        _apply_replay_readiness_fields(replay_rows)
+
         with _connect() as conn:
-            for ticker in universe:
-                attempted += 1
-                frame = frames.get(ticker)
-                pfeat = price_features_by_ticker.get(ticker)
-                if not pfeat:
-                    skipped_no_price += 1
-                    continue
-                enriched = _replay_factor_payload(ticker, as_of, pfeat)
-                fund_score = enriched.get("fundamental_score")
-                tech_score = pfeat.get("technical_score") or 0.0
-                aggregate = 0.65 * tech_score + 0.35 * (fund_score if fund_score is not None else 0.0)
-                row = {
-                    **pfeat,
-                    **enriched,
-                    "aggregate_score": round(float(aggregate), 4),
-                    "final_rank": round(float(aggregate), 4),
-                    "sentiment_score": None,
-                    "forecast_score": None,
-                    "take_profit": pfeat["signal_price"] + 2.0 * (pfeat.get("atr") or pfeat["signal_price"] * 0.08),
-                    "stop_loss": pfeat["signal_price"] - 1.0 * (pfeat.get("atr") or pfeat["signal_price"] * 0.08),
-                }
-                if include_forward_labels:
-                    row.update(_forward_labels(frame, as_of, pfeat["signal_price"], pfeat.get("atr")))
+            for ticker, row in replay_rows.items():
+                frame = frames_for_rows.get(ticker)
+                if include_forward_labels and frame is not None:
+                    row.update(_forward_labels(frame, as_of, row["signal_price"], row.get("atr")))
                 status = _insert_replay_row(
                     ticker,
                     as_of,

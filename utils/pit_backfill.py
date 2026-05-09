@@ -242,6 +242,7 @@ def refresh_queue_tickers(
     limit: int | None = None,
     sleep_seconds: float = 0.0,
     yfinance_fallback: bool = True,
+    fmp_only: bool = False,
     write_results: bool = True,
 ) -> dict:
     """Backfill PIT fundamentals for tickers in the finalist refresh queue.
@@ -265,6 +266,11 @@ def refresh_queue_tickers(
         key=lambda row: float(row.get("priority", 0) or 0),
         reverse=True,
     )
+    if fmp_only:
+        rows = [
+            row for row in rows
+            if _is_fmp_statement_candidate(str(row.get("ticker") or ""))
+        ]
     max_tickers = int(max_tickers or getattr(config, "DISCOVERY_FUNDAMENTAL_REFRESH_MAX_TICKERS", 40))
     selected_rows = rows[:max(0, max_tickers)]
     tickers = [str(row.get("ticker")).upper().strip() for row in selected_rows if row.get("ticker")]
@@ -300,6 +306,8 @@ def refresh_queue_tickers(
     payload = {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "queue_path": str(path),
+        "fmp_only": bool(fmp_only),
+        "yfinance_fallback": bool(yfinance_fallback),
         "selected": len(tickers),
         "refreshed": sum(1 for value in refreshed.values() if value > 0),
         "snapshots_written": sum(refreshed.values()),
@@ -867,6 +875,7 @@ def _main() -> None:
             limit=args.limit,
             sleep_seconds=args.sleep,
             yfinance_fallback=not args.no_yfinance_fallback,
+            fmp_only=args.no_yfinance_fallback,
             write_results=True,
         )
         print(json.dumps(stats, indent=2, sort_keys=True))

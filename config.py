@@ -621,6 +621,14 @@ DISCOVERY_FUNDAMENTAL_REFRESH_QUEUE_MIN_PRIORITY = 1.0
 DISCOVERY_FUNDAMENTAL_REFRESH_QUEUE_PATH = "feature_cache/fundamental_refresh_queue.json"
 DISCOVERY_FUNDAMENTAL_REFRESH_RESULTS_PATH = "feature_cache/fundamental_refresh_results.json"
 DISCOVERY_FUNDAMENTAL_REFRESH_MAX_TICKERS = 40
+HISTORICAL_REPLAY_FUNDAMENTAL_REFRESH_QUEUE_PATH = "feature_cache/replay_fundamental_refresh_queue.json"
+HISTORICAL_REPLAY_FUNDAMENTAL_REFRESH_MAX_TICKERS = 40
+HISTORICAL_REPLAY_FUNDAMENTAL_REFRESH_FIELDS = [
+    "quality_factor_score", "value_factor_score", "qmj_factor_score",
+    "quality_score_fundamental", "gross_profitability", "fcf_to_assets",
+    "fundamental_score", "pe_ratio", "revenue_growth",
+    "f_score", "f_score_coverage", "gpa", "gpa_score",
+]
 DISCOVERY_CHALLENGE_RESERVE_ENABLED = True
 DISCOVERY_CHALLENGE_RESERVE_N = 30
 DISCOVERY_CHALLENGE_AUTO_ENABLED = True

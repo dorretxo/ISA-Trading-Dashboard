@@ -627,6 +627,8 @@ def _write_replay_live_parity_report(candidates: list[dict]) -> None:
                     })
                     continue
                 comparisons = []
+                live_missing_fields = []
+                replay_missing_fields = []
                 for field in compare_fields:
                     live_val = _finite_float(live_d.get(field))
                     replay_val = _finite_float(replay_d.get(field))
@@ -636,8 +638,10 @@ def _write_replay_live_parity_report(candidates: list[dict]) -> None:
                         missing_counts[field] += 1
                         if live_val is None:
                             live_missing_counts[field] += 1
+                            live_missing_fields.append(field)
                         if replay_val is None:
                             replay_missing_counts[field] += 1
+                            replay_missing_fields.append(field)
                     else:
                         delta = live_val - replay_val
                         status = "drift" if abs(delta) > tolerance else "ok"
@@ -658,6 +662,8 @@ def _write_replay_live_parity_report(candidates: list[dict]) -> None:
                     "latest_replay_run": replay_d.get("run_date"),
                     "date_gap_days": date_gap_days,
                     "drift_fields": drift_fields,
+                    "live_missing_fields": live_missing_fields,
+                    "replay_missing_fields": replay_missing_fields,
                     "comparisons": comparisons,
                 })
     except Exception as exc:
@@ -694,6 +700,11 @@ def _write_replay_live_parity_report(candidates: list[dict]) -> None:
             key=lambda row: len(row.get("drift_fields") or []),
             reverse=True,
         )[:40],
+        "top_replay_missing": sorted(
+            [row for row in available_rows if row.get("replay_missing_fields")],
+            key=lambda row: len(row.get("replay_missing_fields") or []),
+            reverse=True,
+        )[:80],
     }
     atomic_write_json(_REPLAY_LIVE_PARITY_REPORT, payload, indent=2)
 

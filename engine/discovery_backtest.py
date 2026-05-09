@@ -281,6 +281,7 @@ _FEATURE_STORE_COLUMNS = [
     ("vix_percentile", "REAL"), ("tnx_level", "REAL"),
     ("optimal_weight", "REAL"), ("pillar_weights_json", "TEXT"),
     ("entry_lens", "TEXT"), ("entry_price", "REAL"), ("entry_method", "TEXT"),
+    ("entry_stance", "TEXT"),
     ("fill_probability", "REAL"), ("planned_position_weight", "REAL"),
     ("planned_risk_amount", "REAL"), ("position_sizing_method", "TEXT"),
     ("kelly_cap_fraction", "REAL"), ("r_r_ratio", "REAL"),
@@ -337,6 +338,7 @@ _FEATURE_STORE_COLUMNS = [
     ("altman_zone", "TEXT"),
     ("beneish_m", "REAL"),
     ("action_gate_ceiling", "TEXT"),
+    ("action_gate_reasons", "TEXT"),
     ("action_gate_flags_json", "TEXT"),
     ("threshold_profile", "TEXT"),
     # Exit-action smoother fields (Constantinides 1986; Davis-Norman 1990; Wald 1947)

@@ -220,6 +220,29 @@ def test_core_ready_stretch_override_respects_rsi_warning():
     assert c.action_gate_flags["rsi"] == "borderline"
 
 
+def test_clean_candidate_remains_strong_buy_under_conservative_profile():
+    from engine.threshold_learner import apply_overlay
+    import config
+
+    c = _Cand(
+        ticker="CLEANCON", sector="Technology",
+        altman_z=5.0, f_score=9, f_score_coverage=1.0,
+        accruals_factor_score=0.50, investment_factor_score=0.30,
+        net_debt_ebitda=0.2,
+        ev_ebit=16.0, ev_sales=3.5, pe_ratio=20.0, pe_forward=20.0,
+        eps_growth_3y_cagr=0.18,
+        qmj_factor_score=0.95, gpa=0.85, gpa_score=0.90,
+        roic=0.28, wacc=0.10, op_margin_yoy_delta=0.04,
+        rsi=58, price_vs_sma200_stretch=0.12, entry_stance="Ready",
+        r_r_ratio=2.5, ready_contract_core_status="PASS", ready_contract_score=1.0,
+    )
+
+    apply_action_gates([c], config_module=apply_overlay(config, "conservative"))
+
+    assert c.action_gate_ceiling == "STRONG BUY"
+    assert c.action_gate_reasons == []
+
+
 # ---------------------------------------------------------------------------
 # Cap-action helper
 # ---------------------------------------------------------------------------

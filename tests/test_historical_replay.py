@@ -247,6 +247,96 @@ def test_cross_sectional_momentum_scores_rank_replay_cohort():
     assert 0 <= features["AAA"]["momentum_score"] <= 1
 
 
+def _ready_replay_row(**overrides):
+    row = {
+        "signal_price": 100.0,
+        "technical_score": 0.8,
+        "momentum_score": 0.75,
+        "aggregate_score": 0.55,
+        "action": "STRONG BUY",
+        "sector": "Technology",
+        "industry": "Software",
+        "atr": 2.0,
+        "rsi": 55.0,
+        "sma_200": 90.0,
+        "price_vs_sma200_stretch": 0.11,
+        "return_10d_prior": 0.02,
+        "return_30d_prior": 0.06,
+        "return_90d_prior": 0.18,
+        "vol_20d": 0.20,
+        "quality_factor_score": 0.9,
+        "quality_score_fundamental": 0.85,
+        "value_factor_score": 0.7,
+        "momentum_factor_score": 0.8,
+        "volatility_factor_score": 0.6,
+        "qmj_factor_score": 0.9,
+        "gpa": 0.8,
+        "gpa_score": 0.9,
+        "gross_profitability": 0.8,
+        "fcf_to_assets": 0.12,
+        "fcf_yield": 0.10,
+        "revenue_growth": 0.20,
+        "f_score": 9,
+        "f_score_coverage": 1.0,
+        "ev_ebit": 16.0,
+        "ev_ebit_score": 0.7,
+        "pe_ratio": 20.0,
+        "roe": 0.25,
+        "net_debt_ebitda": 0.2,
+        "current_ratio": 2.0,
+        "cash_to_debt": 2.0,
+        "market_cap": 10_000_000_000.0,
+        "avg_dollar_volume": 50_000_000.0,
+        "stop_loss": 95.0,
+        "take_profit": 112.0,
+    }
+    row.update(overrides)
+    return row
+
+
+def test_replay_readiness_backfill_populates_pit_safe_contract_fields():
+    rows = {
+        "GOOD": _ready_replay_row(),
+        "MID": _ready_replay_row(
+            quality_factor_score=0.1, qmj_factor_score=0.1, gpa=0.2,
+            gpa_score=0.1, f_score=5, ev_ebit=28.0, ev_ebit_score=0.0,
+            fcf_yield=0.02, revenue_growth=0.01, aggregate_score=0.25, action="BUY",
+        ),
+        "WEAK": _ready_replay_row(
+            quality_factor_score=-0.5, qmj_factor_score=-0.5, gpa=0.05,
+            gpa_score=-0.5, f_score=3, ev_ebit=60.0, ev_ebit_score=-1.0,
+            fcf_yield=-0.05, revenue_growth=-0.20, aggregate_score=-0.1, action="NEUTRAL",
+        ),
+    }
+
+    replay._apply_replay_readiness_fields(rows)
+
+    good = rows["GOOD"]
+    assert good["entry_stance"] == "Ready"
+    assert good["r_r_ratio"] > 2.0
+    assert good["action_gate_ceiling"] == "STRONG BUY"
+    assert good["ready_contract_status"] == "PASS"
+    assert good["strong_buy_eligible"] == 1
+    assert good["institutional_prior_percentile"] >= 0.9
+    assert good["institutional_prior_components"] is not None
+
+
+def test_replay_readiness_backfill_blocks_overbought_rows():
+    rows = {
+        "HOT": _ready_replay_row(rsi=82.0, price_vs_sma200_stretch=0.70),
+        "GOOD": _ready_replay_row(quality_factor_score=0.7, qmj_factor_score=0.7),
+        "WEAK": _ready_replay_row(quality_factor_score=-0.5, qmj_factor_score=-0.5, f_score=3),
+    }
+
+    replay._apply_replay_readiness_fields(rows)
+
+    hot = rows["HOT"]
+    assert hot["entry_stance"] == "Watch Only"
+    assert hot["ready_contract_status"] == "FAIL"
+    assert hot["strong_buy_eligible"] == 0
+    assert "action gate ceiling" in (hot["strong_buy_blockers"] or "")
+
+
 def test_insert_replay_row_can_refresh_existing_row():
     conn = sqlite3.connect(":memory:")
     conn.execute(
