@@ -55,6 +55,82 @@ def test_build_fundamental_refresh_queue_prioritizes_replay_missing_fields():
     assert payload["items"][1]["fmp_statement_candidate"] is False
 
 
+def test_build_fundamental_refresh_queue_skips_recent_unresolved_fmp_attempts():
+    candidates = [
+        {"ticker": "AAPL", "action": "BUY", "final_rank": 0.9},
+        {"ticker": "MSFT", "action": "BUY", "final_rank": 0.8},
+        {"ticker": "TCAP.L", "action": "BUY", "final_rank": 0.7},
+    ]
+    missing = {
+        "AAPL": {"available": True, "missing_fields": ["f_score"], "replay_run_date": "2026-05-09"},
+        "MSFT": {"available": True, "missing_fields": ["f_score"], "replay_run_date": "2026-05-09"},
+        "TCAP.L": {"available": True, "missing_fields": ["f_score"], "replay_run_date": "2026-05-09"},
+    }
+    ledger = {
+        "tickers": {
+            "AAPL": {
+                "last_attempted_at": "2026-05-09T08:00:00",
+                "last_resolved": False,
+                "last_missing_fields": ["f_score"],
+            }
+        }
+    }
+
+    payload = refresh.build_fundamental_refresh_queue(
+        candidates,
+        missing_by_ticker=missing,
+        attempt_ledger=ledger,
+        skip_recent_attempts=True,
+        attempt_cooldown_hours=24,
+        generated_at="2026-05-09T10:00:00",
+        max_items=10,
+    )
+
+    assert [item["ticker"] for item in payload["items"]] == ["MSFT", "TCAP.L"]
+    assert payload["skipped_recent_count"] == 1
+    assert payload["skipped_recent_attempts"][0]["ticker"] == "AAPL"
+
+
+def test_attempt_ledger_records_and_finalizes_attempts(tmp_path, monkeypatch):
+    ledger_path = tmp_path / "ledger.json"
+    queue_payload = {
+        "items": [
+            {"ticker": "AAPL", "priority": 3.2, "missing_fields": ["f_score"], "fmp_statement_candidate": True}
+        ]
+    }
+    refresh_payload = {"fmp_results": {"AAPL": 16}, "yfinance_results": {}}
+
+    attempted = refresh._record_fundamental_attempts(
+        queue_payload=queue_payload,
+        refresh_payload=refresh_payload,
+        ledger_path=ledger_path,
+    )
+
+    assert attempted == ["AAPL"]
+    first = json.loads(ledger_path.read_text(encoding="utf-8"))
+    assert first["tickers"]["AAPL"]["last_snapshots_written"] == 16
+    assert first["tickers"]["AAPL"]["attempt_count"] == 1
+
+    monkeypatch.setattr(
+        refresh,
+        "_latest_replay_fundamental_missing",
+        lambda tickers: {
+            "AAPL": {
+                "available": True,
+                "missing_fields": ["gpa"],
+                "replay_run_date": "2026-05-09",
+            }
+        },
+    )
+
+    refresh._finalize_fundamental_attempts(["AAPL"], ledger_path=ledger_path)
+
+    final = json.loads(ledger_path.read_text(encoding="utf-8"))
+    assert final["tickers"]["AAPL"]["last_resolved"] is False
+    assert final["tickers"]["AAPL"]["last_missing_fields"] == ["gpa"]
+    assert final["tickers"]["AAPL"]["unresolved_attempt_count"] == 1
+
+
 def test_refresh_fundamentals_for_parity_writes_fmp_only_queue(tmp_path, monkeypatch):
     queue_path = tmp_path / "replay_queue.json"
     captured = {}
@@ -78,6 +154,7 @@ def test_refresh_fundamentals_for_parity_writes_fmp_only_queue(tmp_path, monkeyp
     result = refresh._refresh_fundamentals_for_parity(
         [{"ticker": "AAPL"}, {"ticker": "TCAP.L"}],
         queue_path=queue_path,
+        attempt_ledger_path=tmp_path / "ledger.json",
         max_tickers=5,
         limit=12,
         allow_yfinance_fallback=False,

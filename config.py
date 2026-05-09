@@ -622,7 +622,9 @@ DISCOVERY_FUNDAMENTAL_REFRESH_QUEUE_PATH = "feature_cache/fundamental_refresh_qu
 DISCOVERY_FUNDAMENTAL_REFRESH_RESULTS_PATH = "feature_cache/fundamental_refresh_results.json"
 DISCOVERY_FUNDAMENTAL_REFRESH_MAX_TICKERS = 40
 HISTORICAL_REPLAY_FUNDAMENTAL_REFRESH_QUEUE_PATH = "feature_cache/replay_fundamental_refresh_queue.json"
+HISTORICAL_REPLAY_FUNDAMENTAL_ATTEMPT_LEDGER_PATH = "feature_cache/replay_fundamental_attempt_ledger.json"
 HISTORICAL_REPLAY_FUNDAMENTAL_REFRESH_MAX_TICKERS = 40
+HISTORICAL_REPLAY_FUNDAMENTAL_ATTEMPT_COOLDOWN_HOURS = 168
 HISTORICAL_REPLAY_FUNDAMENTAL_REFRESH_FIELDS = [
     "quality_factor_score", "value_factor_score", "qmj_factor_score",
     "quality_score_fundamental", "gross_profitability", "fcf_to_assets",

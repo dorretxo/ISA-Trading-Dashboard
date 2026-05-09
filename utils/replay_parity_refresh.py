@@ -43,6 +43,11 @@ _FUNDAMENTAL_QUEUE = ROOT / getattr(
     "HISTORICAL_REPLAY_FUNDAMENTAL_REFRESH_QUEUE_PATH",
     "feature_cache/replay_fundamental_refresh_queue.json",
 )
+_FUNDAMENTAL_ATTEMPT_LEDGER = ROOT / getattr(
+    config,
+    "HISTORICAL_REPLAY_FUNDAMENTAL_ATTEMPT_LEDGER_PATH",
+    "feature_cache/replay_fundamental_attempt_ledger.json",
+)
 _FUNDAMENTAL_REFRESH_FIELDS = tuple(getattr(
     config,
     "HISTORICAL_REPLAY_FUNDAMENTAL_REFRESH_FIELDS",
@@ -86,6 +91,60 @@ def _safe_priority(value) -> float:
 def _is_fmp_statement_candidate(ticker: str) -> bool:
     symbol = str(ticker or "").upper().strip()
     return bool(symbol) and "." not in symbol
+
+
+def _load_attempt_ledger(path: str | Path | None = None) -> dict:
+    ledger_path = Path(path or _FUNDAMENTAL_ATTEMPT_LEDGER)
+    if not ledger_path.exists():
+        return {"version": 1, "tickers": {}}
+    try:
+        payload = json.loads(ledger_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {"version": 1, "tickers": {}}
+    if not isinstance(payload, dict):
+        return {"version": 1, "tickers": {}}
+    payload.setdefault("version", 1)
+    if not isinstance(payload.get("tickers"), dict):
+        payload["tickers"] = {}
+    return payload
+
+
+def _write_attempt_ledger(payload: dict, path: str | Path | None = None) -> None:
+    ledger_path = Path(path or _FUNDAMENTAL_ATTEMPT_LEDGER)
+    ledger_path.parent.mkdir(parents=True, exist_ok=True)
+    payload["generated_at"] = datetime.now().isoformat(timespec="seconds")
+    atomic_write_json(ledger_path, payload, indent=2)
+
+
+def _recent_unresolved_attempt(
+    ticker: str,
+    ledger: Mapping[str, Mapping] | None,
+    *,
+    now: datetime,
+    cooldown_hours: float,
+) -> dict | None:
+    if not ledger:
+        return None
+    tickers = ledger.get("tickers") if isinstance(ledger, Mapping) else None
+    record = (tickers or {}).get(str(ticker).upper()) if isinstance(tickers, Mapping) else None
+    if not isinstance(record, Mapping) or bool(record.get("last_resolved")):
+        return None
+    last = record.get("last_checked_at") or record.get("last_attempted_at")
+    if not last:
+        return None
+    try:
+        attempted = datetime.fromisoformat(str(last).replace("Z", "+00:00"))
+        if attempted.tzinfo is None and now.tzinfo is not None:
+            now_cmp = now.replace(tzinfo=None)
+        elif attempted.tzinfo is None:
+            now_cmp = now
+        else:
+            now_cmp = now.astimezone(attempted.tzinfo) if now.tzinfo else now.replace(tzinfo=attempted.tzinfo)
+    except Exception:
+        return None
+    if (now_cmp - attempted).total_seconds() <= float(cooldown_hours) * 3600.0:
+        return dict(record)
+    return None
 
 
 def _normalise_candidates(candidates: list[dict], *, limit: int | None = None) -> list[dict]:
@@ -210,6 +269,9 @@ def build_fundamental_refresh_queue(
     candidates: list[dict],
     *,
     missing_by_ticker: Mapping[str, Mapping] | None = None,
+    attempt_ledger: Mapping[str, Mapping] | None = None,
+    skip_recent_attempts: bool = False,
+    attempt_cooldown_hours: float | None = None,
     max_items: int | None = None,
     generated_at: str | None = None,
 ) -> dict:
@@ -219,8 +281,20 @@ def build_fundamental_refresh_queue(
     if missing_by_ticker is None:
         missing_by_ticker = _latest_replay_fundamental_missing(tickers)
 
-    now = generated_at or datetime.now().isoformat(timespec="seconds")
+    now_dt = datetime.now()
+    now = generated_at or now_dt.isoformat(timespec="seconds")
+    if generated_at:
+        try:
+            now_dt = datetime.fromisoformat(str(generated_at).replace("Z", "+00:00"))
+        except Exception:
+            now_dt = datetime.now()
+    cooldown_hours = float(
+        attempt_cooldown_hours
+        if attempt_cooldown_hours is not None
+        else getattr(config, "HISTORICAL_REPLAY_FUNDAMENTAL_ATTEMPT_COOLDOWN_HOURS", 168)
+    )
     items: list[dict] = []
+    skipped_recent: list[dict] = []
     seen: set[str] = set()
     for index, candidate in enumerate(normalised):
         ticker = candidate["ticker"]
@@ -240,6 +314,25 @@ def build_fundamental_refresh_queue(
         final_rank = _safe_priority(candidate.get("final_rank"))
         aggregate = _safe_priority(candidate.get("aggregate_score"))
         fmp_candidate = _is_fmp_statement_candidate(ticker)
+        recent_attempt = (
+            _recent_unresolved_attempt(
+                ticker,
+                attempt_ledger,
+                now=now_dt,
+                cooldown_hours=cooldown_hours,
+            )
+            if skip_recent_attempts and fmp_candidate
+            else None
+        )
+        if recent_attempt is not None:
+            skipped_recent.append({
+                "ticker": ticker,
+                "last_attempted_at": recent_attempt.get("last_attempted_at"),
+                "last_checked_at": recent_attempt.get("last_checked_at"),
+                "last_snapshots_written": recent_attempt.get("last_snapshots_written"),
+                "last_missing_fields": recent_attempt.get("last_missing_fields", []),
+            })
+            continue
         critical_hits = sum(1 for field in missing if field in {"quality_factor_score", "value_factor_score", "f_score", "gpa"})
         priority = len(missing) + 0.75 * critical_hits + final_rank + 0.25 * aggregate
         if action == "STRONG BUY":
@@ -274,21 +367,104 @@ def build_fundamental_refresh_queue(
         "source": "replay_live_parity",
         "count": len(items),
         "fields": list(_FUNDAMENTAL_REFRESH_FIELDS),
+        "skip_recent_attempts": bool(skip_recent_attempts),
+        "attempt_cooldown_hours": cooldown_hours,
+        "skipped_recent_attempts": skipped_recent[:80],
+        "skipped_recent_count": len(skipped_recent),
         "items": items,
     }
+
+
+def _record_fundamental_attempts(
+    *,
+    queue_payload: Mapping,
+    refresh_payload: Mapping,
+    ledger_path: str | Path | None = None,
+) -> list[str]:
+    ledger = _load_attempt_ledger(ledger_path)
+    records = ledger.setdefault("tickers", {})
+    now = datetime.now().isoformat(timespec="seconds")
+    queue_by_ticker = {
+        str(item.get("ticker") or "").upper(): item
+        for item in queue_payload.get("items", [])
+        if isinstance(item, Mapping) and item.get("ticker")
+    }
+    results = {}
+    results.update(refresh_payload.get("fmp_results") or {})
+    results.update(refresh_payload.get("yfinance_results") or {})
+    attempted: list[str] = []
+    for ticker, written in results.items():
+        symbol = str(ticker or "").upper().strip()
+        if not symbol:
+            continue
+        attempted.append(symbol)
+        previous = records.get(symbol, {}) if isinstance(records.get(symbol), dict) else {}
+        queue_item = queue_by_ticker.get(symbol, {})
+        record = dict(previous)
+        record.update({
+            "ticker": symbol,
+            "attempt_count": int(previous.get("attempt_count", 0) or 0) + 1,
+            "last_attempted_at": now,
+            "last_snapshots_written": int(written or 0),
+            "last_queue_priority": queue_item.get("priority"),
+            "last_queue_missing_fields": queue_item.get("missing_fields", []),
+            "fmp_statement_candidate": bool(queue_item.get("fmp_statement_candidate")),
+        })
+        records[symbol] = record
+    _write_attempt_ledger(ledger, ledger_path)
+    return attempted
+
+
+def _finalize_fundamental_attempts(
+    tickers: list[str],
+    *,
+    ledger_path: str | Path | None = None,
+) -> None:
+    if not tickers:
+        return
+    ledger = _load_attempt_ledger(ledger_path)
+    records = ledger.setdefault("tickers", {})
+    now = datetime.now().isoformat(timespec="seconds")
+    missing = _latest_replay_fundamental_missing([str(t).upper() for t in tickers])
+    for ticker in tickers:
+        symbol = str(ticker or "").upper().strip()
+        if not symbol:
+            continue
+        record = records.get(symbol, {}) if isinstance(records.get(symbol), dict) else {"ticker": symbol}
+        fields = list((missing.get(symbol) or {}).get("missing_fields") or [])
+        record.update({
+            "ticker": symbol,
+            "last_checked_at": now,
+            "last_missing_fields": fields,
+            "last_resolved": not bool(fields),
+            "last_replay_run_date": (missing.get(symbol) or {}).get("replay_run_date"),
+        })
+        if fields:
+            record["unresolved_attempt_count"] = int(record.get("unresolved_attempt_count", 0) or 0) + 1
+        else:
+            record["unresolved_attempt_count"] = 0
+        records[symbol] = record
+    _write_attempt_ledger(ledger, ledger_path)
 
 
 def _refresh_fundamentals_for_parity(
     candidates: list[dict],
     *,
     queue_path: str | Path | None = None,
+    attempt_ledger_path: str | Path | None = None,
     max_tickers: int | None = None,
     limit: int | None = None,
     sleep_seconds: float = 0.0,
     allow_yfinance_fallback: bool = False,
+    skip_recent_attempts: bool = True,
 ) -> dict:
     queue_target = Path(queue_path or _FUNDAMENTAL_QUEUE)
-    queue_payload = build_fundamental_refresh_queue(candidates)
+    ledger = _load_attempt_ledger(attempt_ledger_path)
+    queue_payload = build_fundamental_refresh_queue(
+        candidates,
+        attempt_ledger=ledger,
+        skip_recent_attempts=skip_recent_attempts,
+    )
     queue_target.parent.mkdir(parents=True, exist_ok=True)
     atomic_write_json(queue_target, queue_payload, indent=2)
 
@@ -303,11 +479,19 @@ def _refresh_fundamentals_for_parity(
         fmp_only=not allow_yfinance_fallback,
         write_results=True,
     )
+    attempted = _record_fundamental_attempts(
+        queue_payload=queue_payload,
+        refresh_payload=refresh_payload,
+        ledger_path=attempt_ledger_path,
+    )
     reset_pit_cache()
     return {
         "queue_path": str(queue_target),
+        "attempt_ledger_path": str(Path(attempt_ledger_path or _FUNDAMENTAL_ATTEMPT_LEDGER)),
         "queue_count": queue_payload.get("count", 0),
         "queue_fmp_candidates": sum(1 for row in queue_payload.get("items", []) if row.get("fmp_statement_candidate")),
+        "skipped_recent_count": queue_payload.get("skipped_recent_count", 0),
+        "attempted_tickers": attempted,
         "refresh": refresh_payload,
     }
 
@@ -326,6 +510,8 @@ def refresh_replay_parity(
     fundamental_sleep_seconds: float = 0.0,
     allow_yfinance_fallback: bool = False,
     fundamental_queue_path: str | Path | None = None,
+    fundamental_attempt_ledger_path: str | Path | None = None,
+    skip_recent_fundamental_attempts: bool = True,
 ) -> dict:
     """Run fresh offline replay for the latest discovery cohort and write parity."""
     if days is None:
@@ -338,10 +524,12 @@ def refresh_replay_parity(
         fundamental_refresh_payload = _refresh_fundamentals_for_parity(
             candidates,
             queue_path=fundamental_queue_path,
+            attempt_ledger_path=fundamental_attempt_ledger_path,
             max_tickers=fundamental_max_tickers,
             limit=fundamental_limit,
             sleep_seconds=fundamental_sleep_seconds,
             allow_yfinance_fallback=allow_yfinance_fallback,
+            skip_recent_attempts=skip_recent_fundamental_attempts,
         )
     stats = run_replay(
         start=start,
@@ -352,6 +540,12 @@ def refresh_replay_parity(
         include_forward_labels=include_forward_labels,
         refresh_existing=refresh_existing,
     )
+    if fundamental_refresh_payload:
+        attempted = list(fundamental_refresh_payload.get("attempted_tickers") or [])
+        _finalize_fundamental_attempts(
+            attempted,
+            ledger_path=fundamental_attempt_ledger_path,
+        )
 
     parity_payload: dict | None = None
     try:
@@ -447,6 +641,16 @@ def main() -> None:
         help="Override the replay fundamental refresh queue path.",
     )
     parser.add_argument(
+        "--fundamental-attempt-ledger-path",
+        default=None,
+        help="Override the replay fundamental attempt ledger path.",
+    )
+    parser.add_argument(
+        "--include-recent-fundamental-attempts",
+        action="store_true",
+        help="Do not skip recently attempted unresolved FMP tickers.",
+    )
+    parser.add_argument(
         "--allow-yfinance-fallback",
         action="store_true",
         help="Allow yfinance quarterly fallback for the pre-replay PIT refresh. Off by default.",
@@ -467,6 +671,8 @@ def main() -> None:
         fundamental_sleep_seconds=args.fundamental_sleep,
         allow_yfinance_fallback=args.allow_yfinance_fallback,
         fundamental_queue_path=args.fundamental_queue_path,
+        fundamental_attempt_ledger_path=args.fundamental_attempt_ledger_path,
+        skip_recent_fundamental_attempts=not args.include_recent_fundamental_attempts,
     )
     print(json.dumps({
         "requested_tickers": payload["requested_tickers"],
