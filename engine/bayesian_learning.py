@@ -15,6 +15,7 @@ import numpy as np
 
 import config
 from engine.paper_trading import _connect
+from engine.pillar_weighting import apply_weight_guardrails, pillar_parity_gate, positive_ic_allocation
 
 logger = logging.getLogger(__name__)
 
@@ -208,14 +209,25 @@ def _weights_from_pillar_effectiveness(
     if not chosen or chosen_horizon is None or chosen_source is None:
         return None
 
+    gate_ok, gate_reasons, _gate_summary = pillar_parity_gate()
+    if not gate_ok:
+        logger.info("Bayesian discovery weights blocked by parity gate: %s", "; ".join(gate_reasons))
+        return None
+
     prior = _normalise({p: float(base_weights.get(p, 0.0)) for p in _PILLARS})
     ic_by_pillar = {p: chosen.get(p, (0.0, 0))[0] for p in _PILLARS}
     n_eff = int(median([v[1] for v in chosen.values()]))
 
-    # Convert ICs to a long-only allocation. Negative pillars are not allowed
-    # to flip sign inside this blend; they receive only a small floor.
-    empirical_raw = {p: max(0.02, float(ic_by_pillar.get(p, 0.0))) for p in _PILLARS}
-    empirical = _normalise(empirical_raw)
+    min_positive = int(getattr(config, "ADAPTIVE_WEIGHTS_GATE_MIN_POSITIVE_PILLARS", 1))
+    empirical = positive_ic_allocation(ic_by_pillar, min_positive_pillars=min_positive)
+    if empirical is None:
+        logger.info(
+            "Bayesian discovery weights blocked (%s/%s): no positive signed IC evidence (%s)",
+            chosen_source,
+            chosen_horizon,
+            {k: round(float(v), 4) for k, v in ic_by_pillar.items()},
+        )
+        return dict(prior)
 
     k0 = float(getattr(config, "BAYESIAN_EFFECTIVENESS_PRIOR_STRENGTH", 200))
     max_blend = float(getattr(config, "BAYESIAN_MAX_LIVE_BLEND", 0.25))
@@ -231,6 +243,7 @@ def _weights_from_pillar_effectiveness(
     }
     max_rel = float(getattr(config, "BAYESIAN_DAILY_MAX_REL_DELTA", 0.20))
     posterior = _cap_relative_delta(posterior, prior, max_relative=max_rel)
+    posterior = apply_weight_guardrails(posterior, horizon=chosen_horizon, ic_by_pillar=ic_by_pillar)
     _persist_weight_deltas(
         source=chosen_source,
         horizon=chosen_horizon,
@@ -301,14 +314,28 @@ def get_bayesian_pillar_weights(
     if not chosen_rows:
         return dict(base_weights)
 
-    empirical: dict[str, float] = {}
+    gate_ok, gate_reasons, _gate_summary = pillar_parity_gate()
+    if not gate_ok:
+        logger.info("Bayesian discovery weights blocked by parity gate: %s", "; ".join(gate_reasons))
+        return dict(base_weights)
+
     returns = [float(r[f"return_{chosen_horizon}"] or 0.0) for r in chosen_rows]
+    ic_by_pillar: dict[str, float] = {}
     for pillar in _PILLARS:
         scores = [float(r[f"{pillar}_score"] or 0.0) for r in chosen_rows]
         ic = _rank_ic(scores, returns)
-        empirical[pillar] = max(0.02, ic or 0.0)
+        ic_by_pillar[pillar] = float(ic or 0.0)
 
-    empirical = _normalise(empirical)
+    min_positive = int(getattr(config, "ADAPTIVE_WEIGHTS_GATE_MIN_POSITIVE_PILLARS", 1))
+    empirical = positive_ic_allocation(ic_by_pillar, min_positive_pillars=min_positive)
+    if empirical is None:
+        logger.info(
+            "Bayesian discovery weights blocked (%s/%s): no positive signed IC evidence (%s)",
+            chosen_source,
+            chosen_horizon,
+            {k: round(float(v), 4) for k, v in ic_by_pillar.items()},
+        )
+        return dict(base_weights)
     prior = _normalise({p: float(base_weights.get(p, 0.0)) for p in _PILLARS})
 
     prior_strength = float(getattr(config, "BAYESIAN_PRIOR_STRENGTH", 125))
@@ -325,7 +352,7 @@ def get_bayesian_pillar_weights(
         p: (1.0 - blend) * prior.get(p, 0.0) + blend * empirical.get(p, 0.0)
         for p in _PILLARS
     }
-    posterior = _normalise(posterior)
+    posterior = apply_weight_guardrails(_normalise(posterior), horizon=chosen_horizon, ic_by_pillar=ic_by_pillar)
     logger.info(
         "Bayesian discovery weights: source=%s horizon=%s n=%d blend=%.2f weights=%s",
         chosen_source,

@@ -25,6 +25,12 @@ import yfinance as yf
 
 import config
 from engine.factors import compute_factor_scores_from_result
+from engine.pillar_weighting import (
+    PILLARS as _WEIGHT_PILLARS,
+    apply_weight_guardrails,
+    pillar_parity_gate,
+    positive_ic_allocation,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -2444,26 +2450,34 @@ def _ic_rows_to_weights(rows, source: str, horizon: str, min_samples: int) -> di
     Enhanced with signal half-life weighting (Grinold & Kahn 2000):
     pillars with longer half-lives receive a boost for the 30-90 day horizon.
     """
-    pillars = ["technical", "fundamental", "sentiment", "forecast"]
-    # Floor: prevents any pillar from fully zeroing out (single-pillar
-    # dependence is risky), but high enough to mask differentiation if
-    # ICs are realistically small (~0.01-0.03 in equity factor research,
-    # Grinold-Kahn 2000).  Default 0.01 matches the IC scale; legacy
-    # behaviour was 0.05.  Configurable so the change is reversible.
+    pillars = list(_WEIGHT_PILLARS)
+    # Positive signed-IC evidence only. A negative IC can reduce a pillar
+    # toward the safety floor; it must not become positive allocation pressure.
     ic_floor = float(getattr(config, "ADAPTIVE_WEIGHTS_IC_FLOOR", 0.01))
-    raw = {pillar: ic_floor for pillar in pillars}
+    ic_by_pillar = {pillar: 0.0 for pillar in pillars}
     for r in rows:
         pillar = r["pillar"]
-        if pillar not in raw:
+        if pillar not in ic_by_pillar:
             continue
-        ic = max(r["information_coefficient"], ic_floor)
-        raw[pillar] = ic
+        try:
+            ic_by_pillar[pillar] = float(r["information_coefficient"])
+        except (TypeError, ValueError):
+            ic_by_pillar[pillar] = 0.0
 
-    total = sum(raw.values())
-    if total <= 0:
+    min_positive = int(getattr(config, "ADAPTIVE_WEIGHTS_GATE_MIN_POSITIVE_PILLARS", 1))
+    weights = positive_ic_allocation(
+        ic_by_pillar,
+        min_positive_ic=ic_floor,
+        min_positive_pillars=min_positive,
+    )
+    if weights is None:
+        logger.info(
+            "Adaptive weights blocked (%s/%s): no positive signed IC evidence (%s)",
+            source,
+            horizon,
+            {k: round(v, 4) for k, v in ic_by_pillar.items()},
+        )
         return None
-
-    weights = {k: round(v / total, 4) for k, v in raw.items()}
 
     # Signal half-life boost: pillars with longer persistence get upweighted
     # for the 30-90 day holding period
@@ -2498,6 +2512,7 @@ def _ic_rows_to_weights(rows, source: str, horizon: str, min_samples: int) -> di
     # Normalize
     total_s = sum(shrunk.values())
     shrunk = {k: round(v / total_s, 4) for k, v in shrunk.items()}
+    shrunk = apply_weight_guardrails(shrunk, horizon=horizon, ic_by_pillar=ic_by_pillar)
 
     logger.info("Adaptive weights (%s/%s, n=%d, shrinkage=%.2f): %s",
                 source, horizon, min_samples, shrinkage, shrunk)
@@ -2617,6 +2632,11 @@ def get_adaptive_weights(source: str = "all", horizon: str = "90d") -> dict[str,
     Returns dict like {"technical": 0.35, "fundamental": 0.20, ...} or None.
     """
     init_backtest_db()
+
+    gate_ok, gate_reasons, _gate_summary = pillar_parity_gate()
+    if not gate_ok:
+        logger.info("Adaptive weights blocked by parity gate: %s", "; ".join(gate_reasons))
+        return None
 
     # Prefer multi-horizon blending when enabled and the requested horizon is
     # one of the standard targets.  Fall back to single-horizon for unusual

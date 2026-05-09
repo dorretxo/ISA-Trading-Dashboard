@@ -463,6 +463,16 @@ BACKTEST_WEIGHT_STEP = 0.05    # Grid search step size for weight optimization
 BACKTEST_KEEP_THRESHOLD = 2.0  # Forward return % below which KEEP is "correct"
 WEIGHT_SHRINKAGE = 0.40        # Blend 40% toward equal weights to prevent overfitting
 WEIGHT_MIN_FLOOR = 0.10        # Minimum 10% weight per pillar (signal diversification)
+PILLAR_WEIGHT_AUDIT_PATH = "feature_cache/pillar_weight_audit.json"
+PILLAR_WEIGHT_MIN_FLOOR = 0.03
+PILLAR_WEIGHT_MAX_SINGLE = 0.55
+PILLAR_WEIGHT_SENTIMENT_LONG_MAX = 0.08
+PILLAR_WEIGHT_FORECAST_MAX = 0.30
+PILLAR_WEIGHT_FORECAST_MAX_WITH_NEGATIVE_IC = 0.03
+PILLAR_WEIGHT_LONG_HORIZONS = ("30d", "60d", "90d", "multi")
+ADAPTIVE_WEIGHTS_GATE_ENABLED = True
+ADAPTIVE_WEIGHTS_GATE_REQUIRE_PARITY = True
+ADAPTIVE_WEIGHTS_GATE_MIN_POSITIVE_PILLARS = 1
 
 # FMP (Financial Modeling Prep) API — PRIMARY data source (Starter plan)
 # Sign up at https://site.financialmodelingprep.com/developer/docs

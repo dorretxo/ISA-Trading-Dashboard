@@ -137,6 +137,12 @@ def get_regime_adjusted_weights(base_weights: dict[str, float]) -> dict[str, flo
     if total > 0:
         adjusted = {k: round(v / total, 4) for k, v in adjusted.items()}
 
+    try:
+        from engine.pillar_weighting import apply_weight_guardrails
+        adjusted = apply_weight_guardrails(adjusted, horizon="90d")
+    except Exception:
+        pass
+
     return adjusted
 
 

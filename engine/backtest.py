@@ -33,6 +33,7 @@ import pandas as pd
 from scipy.stats import spearmanr
 
 import config
+from engine.pillar_weighting import apply_weight_guardrails, positive_ic_allocation
 from engine.technical import analyse_from_df
 from engine.forecasting import _run_experts_on_slice
 from engine import fundamental, sentiment
@@ -377,7 +378,7 @@ def _ics_to_weights(
     """Convert IC values to weights using shrinkage toward equal and floor.
 
     Steps:
-    1. Take absolute IC (we want magnitude of predictive power)
+    1. Use positive signed IC only (negative IC is adverse evidence)
     2. Normalize to proportional weights
     3. Shrink toward equal weights (25% each)
     4. Apply minimum floor
@@ -388,10 +389,10 @@ def _ics_to_weights(
     if min_floor is None:
         min_floor = getattr(config, "WEIGHT_MIN_FLOOR", 0.10)
 
-    # Step 1-2: Absolute IC → proportional
-    abs_ics = {p: max(abs(v), 0.001) for p, v in pillar_ic_values.items()}
-    total_ic = sum(abs_ics.values())
-    data_weights = {p: v / total_ic for p, v in abs_ics.items()}
+    # Step 1-2: Positive signed IC evidence -> proportional
+    data_weights = positive_ic_allocation(pillar_ic_values, min_positive_ic=0.001)
+    if data_weights is None:
+        data_weights = {p: 1.0 / len(PILLARS) for p in PILLARS}
 
     # Step 3: Shrink toward equal
     equal = 1.0 / len(PILLARS)  # 0.25
@@ -406,7 +407,8 @@ def _ics_to_weights(
 
     # Step 5: Normalize
     total = sum(blended.values())
-    return {p: round(v / total, 4) for p, v in blended.items()}
+    normalized = {p: v / total for p, v in blended.items()}
+    return apply_weight_guardrails(normalized, horizon="90d", ic_by_pillar=pillar_ic_values)
 
 
 # ---------------------------------------------------------------------------
