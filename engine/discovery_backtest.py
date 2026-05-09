@@ -28,6 +28,7 @@ from engine.factors import compute_factor_scores_from_result
 from engine.pillar_weighting import (
     PILLARS as _WEIGHT_PILLARS,
     apply_weight_guardrails,
+    blend_with_default_prior,
     pillar_parity_gate,
     positive_ic_allocation,
 )
@@ -2536,6 +2537,7 @@ def _ic_rows_to_weights(rows, source: str, horizon: str, min_samples: int) -> di
     # Normalize
     total_s = sum(shrunk.values())
     shrunk = {k: round(v / total_s, 4) for k, v in shrunk.items()}
+    shrunk = blend_with_default_prior(shrunk)
     shrunk = apply_weight_guardrails(shrunk, horizon=horizon, ic_by_pillar=ic_by_pillar)
 
     logger.info("Adaptive weights (%s/%s, n=%d, shrinkage=%.2f): %s",

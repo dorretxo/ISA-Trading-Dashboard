@@ -15,7 +15,12 @@ import numpy as np
 
 import config
 from engine.paper_trading import _connect
-from engine.pillar_weighting import apply_weight_guardrails, pillar_parity_gate, positive_ic_allocation
+from engine.pillar_weighting import (
+    apply_weight_guardrails,
+    blend_with_default_prior,
+    pillar_parity_gate,
+    positive_ic_allocation,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -243,6 +248,7 @@ def _weights_from_pillar_effectiveness(
     }
     max_rel = float(getattr(config, "BAYESIAN_DAILY_MAX_REL_DELTA", 0.20))
     posterior = _cap_relative_delta(posterior, prior, max_relative=max_rel)
+    posterior = blend_with_default_prior(posterior)
     posterior = apply_weight_guardrails(posterior, horizon=chosen_horizon, ic_by_pillar=ic_by_pillar)
     _persist_weight_deltas(
         source=chosen_source,
@@ -352,7 +358,8 @@ def get_bayesian_pillar_weights(
         p: (1.0 - blend) * prior.get(p, 0.0) + blend * empirical.get(p, 0.0)
         for p in _PILLARS
     }
-    posterior = apply_weight_guardrails(_normalise(posterior), horizon=chosen_horizon, ic_by_pillar=ic_by_pillar)
+    posterior = blend_with_default_prior(_normalise(posterior))
+    posterior = apply_weight_guardrails(posterior, horizon=chosen_horizon, ic_by_pillar=ic_by_pillar)
     logger.info(
         "Bayesian discovery weights: source=%s horizon=%s n=%d blend=%.2f weights=%s",
         chosen_source,

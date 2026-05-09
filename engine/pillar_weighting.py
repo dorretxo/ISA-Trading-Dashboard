@@ -35,6 +35,28 @@ def normalise_weights(weights: Mapping[str, float], *, pillars: tuple[str, ...] 
     return {p: values[p] / total for p in pillars}
 
 
+def blend_with_default_prior(
+    weights: Mapping[str, float],
+    *,
+    blend: float | None = None,
+    pillars: tuple[str, ...] = PILLARS,
+) -> dict[str, float]:
+    """Blend learned weights toward configured priors before live serving."""
+    adaptive_blend = float(
+        getattr(config, "ADAPTIVE_WEIGHTS_LIVE_BLEND", 0.60)
+        if blend is None
+        else blend
+    )
+    adaptive_blend = max(0.0, min(1.0, adaptive_blend))
+    learned = normalise_weights(weights, pillars=pillars)
+    prior = normalise_weights(getattr(config, "WEIGHTS", {}), pillars=pillars)
+    mixed = {
+        pillar: adaptive_blend * learned.get(pillar, 0.0) + (1.0 - adaptive_blend) * prior.get(pillar, 0.0)
+        for pillar in pillars
+    }
+    return normalise_weights(mixed, pillars=pillars)
+
+
 def positive_ic_allocation(
     ic_by_pillar: Mapping[str, float],
     *,
@@ -169,18 +191,22 @@ def apply_weight_guardrails(
     if "sentiment" in upper and _horizon_is_long(horizon):
         upper["sentiment"] = min(upper["sentiment"], float(getattr(config, "PILLAR_WEIGHT_SENTIMENT_LONG_MAX", 0.08)))
 
-    # If negative-IC caps and long-horizon sentiment caps make the box
-    # infeasible, relax the generic max cap on positive non-specialist pillars
-    # before allocating weight to adverse evidence.
+    # If negative-IC caps and long-horizon sentiment/forecast caps make the box
+    # infeasible, relax generic non-positive caps before breaking the single
+    # pillar concentration cap. This keeps a passing adaptive model from
+    # becoming a one-pillar bet.
     if ic_by_pillar is not None and sum(upper.values()) < 1.0 and positive_pillars:
         hard_capped = set()
         if "sentiment" in upper and _horizon_is_long(horizon):
             hard_capped.add("sentiment")
         if "forecast" in upper:
             hard_capped.add("forecast")
-        relaxable = [p for p in positive_pillars if p not in hard_capped]
+        relaxable = [
+            p for p in pillars
+            if p not in hard_capped and _finite(ic_by_pillar.get(p), 0.0) <= 0
+        ]
         if not relaxable:
-            relaxable = list(positive_pillars)
+            relaxable = [p for p in pillars if p not in hard_capped]
         shortfall = 1.0 - sum(upper.values())
         for pillar in relaxable:
             upper[pillar] = min(1.0, upper[pillar] + shortfall / max(1, len(relaxable)))

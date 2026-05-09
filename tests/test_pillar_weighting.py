@@ -9,7 +9,12 @@ import config
 from engine import bayesian_learning
 from engine import discovery_backtest
 from engine.backtest import _ics_to_weights
-from engine.pillar_weighting import apply_weight_guardrails, pillar_parity_gate, positive_ic_allocation
+from engine.pillar_weighting import (
+    apply_weight_guardrails,
+    blend_with_default_prior,
+    pillar_parity_gate,
+    positive_ic_allocation,
+)
 
 
 def test_positive_ic_allocation_ignores_negative_ic():
@@ -30,6 +35,7 @@ def test_positive_ic_allocation_ignores_negative_ic():
 
 def test_guardrails_cap_long_horizon_sentiment_and_negative_forecast(monkeypatch):
     monkeypatch.setattr(config, "PILLAR_WEIGHT_MIN_FLOOR", 0.03)
+    monkeypatch.setattr(config, "PILLAR_WEIGHT_MAX_SINGLE", 0.55)
     monkeypatch.setattr(config, "PILLAR_WEIGHT_SENTIMENT_LONG_MAX", 0.08)
     monkeypatch.setattr(config, "PILLAR_WEIGHT_FORECAST_MAX_WITH_NEGATIVE_IC", 0.03)
 
@@ -40,14 +46,33 @@ def test_guardrails_cap_long_horizon_sentiment_and_negative_forecast(monkeypatch
     )
 
     assert sum(weights.values()) == pytest.approx(1.0, abs=0.0002)
+    assert max(weights.values()) <= 0.55
     assert weights["sentiment"] <= 0.08
     assert weights["forecast"] <= 0.03
+
+
+def test_adaptive_blend_tilts_toward_default_prior(monkeypatch):
+    monkeypatch.setattr(
+        config,
+        "WEIGHTS",
+        {"technical": 0.30, "fundamental": 0.40, "sentiment": 0.08, "forecast": 0.22},
+    )
+    monkeypatch.setattr(config, "ADAPTIVE_WEIGHTS_LIVE_BLEND", 0.60)
+
+    weights = blend_with_default_prior(
+        {"technical": 0.0, "fundamental": 1.0, "sentiment": 0.0, "forecast": 0.0}
+    )
+
+    assert weights["fundamental"] == pytest.approx(0.76)
+    assert weights["technical"] == pytest.approx(0.12)
+    assert weights["forecast"] == pytest.approx(0.088)
 
 
 def test_backtest_ics_to_weights_does_not_reward_negative_ic(monkeypatch):
     monkeypatch.setattr(config, "WEIGHT_SHRINKAGE", 0.0)
     monkeypatch.setattr(config, "WEIGHT_MIN_FLOOR", 0.03)
     monkeypatch.setattr(config, "PILLAR_WEIGHT_MIN_FLOOR", 0.03)
+    monkeypatch.setattr(config, "PILLAR_WEIGHT_MAX_SINGLE", 0.55)
 
     weights = _ics_to_weights(
         {
@@ -62,6 +87,7 @@ def test_backtest_ics_to_weights_does_not_reward_negative_ic(monkeypatch):
 
     assert weights["fundamental"] > weights["technical"]
     assert weights["sentiment"] > weights["forecast"]
+    assert max(weights.values()) <= 0.55
     assert weights["forecast"] <= 0.03
 
 
@@ -151,12 +177,14 @@ def test_adaptive_weights_use_signed_ic_and_caps(monkeypatch):
     monkeypatch.setattr(discovery_backtest, "_estimate_signal_halflife", lambda source: {p: 63.0 for p in ("technical", "fundamental", "sentiment", "forecast")})
     monkeypatch.setattr(config, "WEIGHT_SHRINKAGE", 0.0)
     monkeypatch.setattr(config, "PILLAR_WEIGHT_MIN_FLOOR", 0.03)
+    monkeypatch.setattr(config, "PILLAR_WEIGHT_MAX_SINGLE", 0.55)
+    monkeypatch.setattr(config, "ADAPTIVE_WEIGHTS_LIVE_BLEND", 0.60)
 
     weights = discovery_backtest._ic_rows_to_weights(rows, "all", "90d", min_samples=1000)
 
     assert weights is not None
     assert weights["fundamental"] > weights["technical"]
-    assert weights["technical"] <= 0.12
+    assert max(weights.values()) <= 0.55
     assert weights["sentiment"] <= 0.08
     assert weights["forecast"] <= 0.03
 
@@ -179,6 +207,8 @@ def test_bayesian_pillar_effectiveness_uses_signed_ic(monkeypatch):
     monkeypatch.setattr(config, "BAYESIAN_MAX_LIVE_BLEND", 1.0)
     monkeypatch.setattr(config, "BAYESIAN_EFFECTIVENESS_PRIOR_STRENGTH", 0)
     monkeypatch.setattr(config, "BAYESIAN_DAILY_MAX_REL_DELTA", 10.0)
+    monkeypatch.setattr(config, "PILLAR_WEIGHT_MAX_SINGLE", 0.55)
+    monkeypatch.setattr(config, "ADAPTIVE_WEIGHTS_LIVE_BLEND", 0.60)
 
     weights = bayesian_learning._weights_from_pillar_effectiveness(
         {"technical": 0.25, "fundamental": 0.25, "sentiment": 0.25, "forecast": 0.25},
@@ -188,6 +218,6 @@ def test_bayesian_pillar_effectiveness_uses_signed_ic(monkeypatch):
 
     assert weights is not None
     assert weights["fundamental"] > weights["technical"]
-    assert weights["technical"] <= 0.12
+    assert max(weights.values()) <= 0.55
     assert weights["sentiment"] <= 0.08
     assert weights["forecast"] <= 0.03
