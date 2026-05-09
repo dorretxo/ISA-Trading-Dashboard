@@ -808,6 +808,20 @@ ML_RANKER_META_PROBA_FOR_ALL = True         # Cache meta-label probability for e
 ML_RANKER_PROMOTION_MIN_SAMPLES = 300       # Promotion gate after purged validation
 ML_RANKER_PROMOTION_MIN_RANK_IC = 0.02      # Positive, but not top-decile-only
 ML_RANKER_PROMOTION_MIN_R_SQUARED = -0.05   # Ranker is judged mainly on OOS rank IC
+ML_RANKER_PARITY_GATE_ENABLED = True        # Block live ML blend when replay/live features diverge
+ML_RANKER_PARITY_GATE_REQUIRE_REPORT = True
+ML_RANKER_PARITY_REPORT_PATH = REPLAY_LIVE_PARITY_REPORT_PATH
+ML_RANKER_PARITY_MAX_AGE_HOURS = 48
+ML_RANKER_PARITY_MIN_AVAILABLE_RATIO = 0.70
+ML_RANKER_PARITY_MAX_MISSING_REPLAY_RATIO = 0.20
+ML_RANKER_PARITY_MAX_STALE_RATIO = 0.10
+ML_RANKER_PARITY_MAX_DRIFTED_PAIR_RATIO = 0.25
+ML_RANKER_PARITY_MAX_CRITICAL_MISSING_RATIO = 0.15
+ML_RANKER_PARITY_CRITICAL_FIELDS = [
+    "quality_factor_score", "value_factor_score", "momentum_factor_score",
+    "return_10d_prior", "return_30d_prior", "return_90d_prior", "vol_20d",
+    "f_score", "gpa", "institutional_prior_score", "r_r_ratio", "strong_buy_eligible",
+]
 ML_RANKER_EMBARGO_DAYS = 30                 # Purge overlapping 30d target windows
 ML_RANKER_MIN_TRAIN_SAMPLES = 80
 ML_RANKER_MODEL_CACHE_FILE = "feature_cache/ml_ranker_model.pkl"

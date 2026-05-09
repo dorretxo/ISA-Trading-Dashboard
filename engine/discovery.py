@@ -1839,6 +1839,112 @@ def _evaluate_ready_strong_buy_contract(
     return status, reasons
 
 
+def _append_unique_reasons(existing, reasons: list[str]) -> list[str]:
+    """Return reasons appended without duplicating text already present."""
+    out = list(existing or [])
+    seen = {str(item) for item in out}
+    for reason in reasons:
+        text = str(reason)
+        if text and text not in seen:
+            out.append(text)
+            seen.add(text)
+    return out
+
+
+def _final_strong_buy_contract_blockers(
+    candidate,
+    *,
+    meta_floor: float,
+    core_ready_meta_floor: float,
+    enforce_action_gate_ceiling: bool = True,
+) -> list[str]:
+    """Final load-bearing contract for an executable STRONG BUY label."""
+    blockers: list[str] = []
+
+    if getattr(candidate, "ticker_identity_warning", None):
+        blockers.append("ticker identity warning")
+    if getattr(candidate, "trap_safeguard_triggered", False):
+        blockers.append("trap safeguard triggered")
+    if str(getattr(candidate, "gate_v2_status", "") or "").upper() == "REJECT":
+        blockers.append("gate v2 rejected")
+
+    ready_status = str(getattr(candidate, "ready_contract_status", "") or "").upper()
+    if ready_status != "PASS":
+        blockers.append(f"ready contract {ready_status or 'UNKNOWN'}")
+    if not bool(getattr(candidate, "strong_buy_eligible", False)):
+        blockers.append("strong-buy eligibility false")
+
+    ceiling = str(getattr(candidate, "action_gate_ceiling", "STRONG BUY") or "STRONG BUY").upper()
+    if enforce_action_gate_ceiling and ceiling != "STRONG BUY":
+        blockers.append(f"action gate ceiling {ceiling}")
+
+    entry_stance = str(getattr(candidate, "entry_stance", "") or "")
+    if entry_stance != "Ready":
+        blockers.append(f"entry stance is {entry_stance or 'UNKNOWN'}")
+    if not (safe_float(getattr(candidate, "entry_price", None), default=0.0) > 0):
+        blockers.append("entry price missing")
+    if not (safe_float(getattr(candidate, "stop_loss", None), default=0.0) > 0):
+        blockers.append("stop missing")
+    if not (safe_float(getattr(candidate, "take_profit", None), default=0.0) > 0):
+        blockers.append("target missing")
+
+    min_rr = float(getattr(config, "READY_STRONG_BUY_MIN_RR", 1.50))
+    if safe_float(getattr(candidate, "r_r_ratio", None), default=0.0) < min_rr:
+        blockers.append(f"R/R below {min_rr:.1f}x")
+    min_weight = float(getattr(config, "READY_STRONG_BUY_MIN_POSITION_WEIGHT", 0.005))
+    if safe_float(getattr(candidate, "position_weight", None), default=0.0) < min_weight:
+        blockers.append("position size unavailable")
+    min_conf = float(getattr(config, "READY_STRONG_BUY_MIN_CONFIDENCE", 0.70))
+    data_confidence = safe_float(
+        getattr(candidate, "effective_data_confidence", None),
+        default=safe_float(getattr(candidate, "data_confidence", None), default=1.0),
+    )
+    if data_confidence < min_conf:
+        blockers.append(f"data confidence below {min_conf:.0%}")
+
+    meta_prob = getattr(candidate, "meta_success_prob", None)
+    if meta_prob is not None:
+        candidate_meta_floor = (
+            core_ready_meta_floor
+            if str(getattr(candidate, "ready_contract_core_status", "") or "").upper() == "PASS"
+            else meta_floor
+        )
+        if safe_float(meta_prob, default=0.0) < candidate_meta_floor:
+            blockers.append(
+                f"Meta-label confidence {safe_float(meta_prob, default=0.0):.0%} "
+                f"below {candidate_meta_floor:.0%}"
+            )
+
+    return blockers
+
+
+def _demote_failed_strong_buy_contract(candidate, *, blockers: list[str], target_action: str = "BUY") -> None:
+    """Demote a failed STRONG BUY while retaining the blocker diagnostics."""
+    candidate.action = target_action
+    candidate.strong_buy_eligible = False
+    candidate.ready_contract_status = "FAIL"
+    candidate.ready_contract_reasons = _append_unique_reasons(
+        getattr(candidate, "ready_contract_reasons", []),
+        blockers,
+    )
+    candidate.strong_buy_blockers = list(candidate.ready_contract_reasons)
+
+
+_ACTION_LABEL_RANK = {"MANUAL REVIEW": 0, "AVOID": 1, "NEUTRAL": 2, "BUY": 3, "STRONG BUY": 4}
+
+
+def _cap_action_label(action: str, ceiling: str) -> str:
+    """Return action capped by the stricter of action and ceiling."""
+    action_u = str(action or "NEUTRAL").upper()
+    ceiling_u = str(ceiling or "STRONG BUY").upper()
+    return action_u if _ACTION_LABEL_RANK.get(action_u, 2) <= _ACTION_LABEL_RANK.get(ceiling_u, 4) else ceiling_u
+
+
+def _failed_strong_buy_target_action(candidate, *, enforce_action_gate_ceiling: bool) -> str:
+    ceiling = getattr(candidate, "action_gate_ceiling", "STRONG BUY") if enforce_action_gate_ceiling else "STRONG BUY"
+    return _cap_action_label("BUY", ceiling)
+
+
 def _institutional_prior_weights() -> tuple[float, float]:
     """Return clipped (alpha_weight, rank_weight) to avoid double-counting IP."""
     alpha_w = max(0.0, float(getattr(config, "INSTITUTIONAL_PRIOR_ALPHA_WEIGHT", 0.0)))
@@ -2240,10 +2346,12 @@ def _assign_percentile_actions(candidates: list, *, regime: str = "NEUTRAL") -> 
         except Exception as exc:
             logger.exception("Action gates failed (continuing with percentile labels): %s", exc)
 
+    enforce_gate_ceiling = not bool(getattr(config, "ACTION_GATES_SHADOW", False))
+
     # High-conviction scorecard override (post-action-gates).
-    # When the additive scorecard evidence is overwhelming (sb_score in the
-    # very top of the cohort AND above an absolute z floor), restore STRONG
-    # BUY even if individual Tier gates flagged it.  Rationale: any single
+    # When the additive scorecard evidence is overwhelming, preserve it as
+    # a promotion proposal, then validate the final STRONG BUY contract.
+    # Rationale: any single
     # gate (F-score, EV/EBIT, entry-stance) is a noisy filter; a +1.0σ
     # composite combining 8 such signals has substantially higher SNR than
     # any one of them.  Trap-safeguard / V2-reject still veto via the
@@ -2255,6 +2363,7 @@ def _assign_percentile_actions(candidates: list, *, regime: str = "NEUTRAL") -> 
         eligible = [c for c in scored if getattr(c, "sb_score", None) is not None]
         eligible.sort(key=lambda c: safe_float(c.sb_score, default=-999.0), reverse=True)
         n_override = 0
+        n_override_capped = 0
         for c in eligible[:override_top_n]:
             sb_val = safe_float(c.sb_score, default=-999.0)
             if sb_val < override_z:
@@ -2262,6 +2371,27 @@ def _assign_percentile_actions(candidates: list, *, regime: str = "NEUTRAL") -> 
             # Don't resurrect MANUAL REVIEW (trap / V2 reject reached scoring earlier
             # would already have been filtered out of `scored`).
             if c.action in ("MANUAL REVIEW", "INSUFFICIENT DATA"):
+                continue
+            c.scorecard_override = True
+            blockers = _final_strong_buy_contract_blockers(
+                c,
+                meta_floor=meta_floor,
+                core_ready_meta_floor=core_ready_meta_floor,
+                enforce_action_gate_ceiling=enforce_gate_ceiling,
+            )
+            if blockers:
+                target = _failed_strong_buy_target_action(c, enforce_action_gate_ceiling=enforce_gate_ceiling)
+                c.scorecard_override_blockers = list(blockers)
+                if (
+                    c.action == "STRONG BUY"
+                    or _ACTION_LABEL_RANK.get(target, 2) > _ACTION_LABEL_RANK.get(str(c.action).upper(), 2)
+                ):
+                    logger.info(
+                        "Scorecard override capped: %s sb_score=%+.3f blocked from STRONG BUY -> %s (%s)",
+                        c.ticker, sb_val, target, "; ".join(blockers[:3]),
+                    )
+                    _demote_failed_strong_buy_contract(c, blockers=blockers, target_action=target)
+                    n_override_capped += 1
                 continue
             if c.action != "STRONG BUY":
                 logger.info(
@@ -2272,6 +2402,32 @@ def _assign_percentile_actions(candidates: list, *, regime: str = "NEUTRAL") -> 
                 n_override += 1
         if n_override:
             logger.info("Scorecard override: %d candidates restored to STRONG BUY", n_override)
+        if n_override_capped:
+            logger.info("Scorecard override: %d candidates capped below STRONG BUY by final contract", n_override_capped)
+
+    n_contract_demotions = 0
+    for c in candidates:
+        if str(getattr(c, "action", "") or "").upper() != "STRONG BUY":
+            continue
+        blockers = _final_strong_buy_contract_blockers(
+            c,
+            meta_floor=meta_floor,
+            core_ready_meta_floor=core_ready_meta_floor,
+            enforce_action_gate_ceiling=enforce_gate_ceiling,
+        )
+        if not blockers:
+            continue
+        target = _failed_strong_buy_target_action(c, enforce_action_gate_ceiling=enforce_gate_ceiling)
+        logger.info(
+            "Final STRONG BUY contract demotion: %s -> %s (%s)",
+            getattr(c, "ticker", ""),
+            target,
+            "; ".join(blockers[:3]),
+        )
+        _demote_failed_strong_buy_contract(c, blockers=blockers, target_action=target)
+        n_contract_demotions += 1
+    if n_contract_demotions:
+        logger.info("Final STRONG BUY contract demoted %d candidates", n_contract_demotions)
 
 
 # ---------------------------------------------------------------------------
@@ -2493,6 +2649,8 @@ class ScoredCandidate:
     # STRONG BUY scorecard (continuous combination of pillar + factor signals;
     # additive substitute for the historic 10-predicate AND-gate).
     sb_score: float | None = None
+    scorecard_override: bool = False
+    scorecard_override_blockers: list = field(default_factory=list)
     # Distribution-free conformal p-value (Vovk-Gammerman-Shafer 2005);
     # populated when calibration set has ≥ 50 mature 90d returns.
     conformal_p: float | None = None

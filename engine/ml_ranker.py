@@ -15,9 +15,11 @@ Key improvements over initial design:
 - Promotion gate: auto-forces shadow mode if OOS metrics are poor.
 """
 
+import json
 import logging
 import pickle
 import time
+from datetime import datetime
 from pathlib import Path
 
 import config
@@ -69,6 +71,7 @@ _model_cache: dict = {
     "meta_log_loss": None,
     "meta_calibration": None,
     "promotion_eligible": False,
+    "parity_gate": None,
 }
 
 _RETRAIN_HOURS = 24.0
@@ -84,6 +87,118 @@ _N_SPLITS = 5                # Number of walk-forward folds
 _PROMOTION_MIN_SAMPLES = int(getattr(config, "ML_RANKER_PROMOTION_MIN_SAMPLES", 300))
 _PROMOTION_MIN_RANK_IC = float(getattr(config, "ML_RANKER_PROMOTION_MIN_RANK_IC", 0.02))
 _PROMOTION_MIN_R_SQUARED = float(getattr(config, "ML_RANKER_PROMOTION_MIN_R_SQUARED", -0.05))
+
+
+def _safe_int(value, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_float(value, default: float = 0.0) -> float:
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return default
+    return out
+
+
+def _replay_live_parity_gate(report: dict | None = None) -> tuple[bool, list[str], dict]:
+    """Return whether replay/live parity is healthy enough for ML promotion."""
+    if not bool(getattr(config, "ML_RANKER_PARITY_GATE_ENABLED", True)):
+        return True, [], {"enabled": False}
+
+    path = Path(getattr(
+        config,
+        "ML_RANKER_PARITY_REPORT_PATH",
+        getattr(config, "REPLAY_LIVE_PARITY_REPORT_PATH", "feature_cache/replay_live_parity_report.json"),
+    ))
+    if report is None:
+        if not path.exists():
+            reason = f"parity report missing: {path}"
+            require = bool(getattr(config, "ML_RANKER_PARITY_GATE_REQUIRE_REPORT", True))
+            return (not require), ([] if not require else [reason]), {"enabled": True, "available": False, "reason": reason}
+        try:
+            report = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            reason = f"parity report unreadable: {exc}"
+            return False, [reason], {"enabled": True, "available": False, "reason": reason}
+
+    blockers: list[str] = []
+    if report.get("available") is False:
+        blockers.append(f"parity report unavailable: {report.get('reason') or 'unknown'}")
+
+    sample = _safe_int(report.get("sample", report.get("sample_size")), 0)
+    available_pairs = _safe_int(report.get("available_pairs"), 0)
+    missing_replay = _safe_int(report.get("missing_replay"), 0)
+    stale_replay = _safe_int(report.get("stale_replay"), 0)
+    drifted_tickers = _safe_int(report.get("drifted_tickers"), 0)
+    denominator = sample or max(available_pairs + missing_replay + stale_replay, available_pairs, 1)
+    pair_denominator = max(available_pairs, 1)
+
+    available_ratio = available_pairs / max(denominator, 1)
+    missing_ratio = missing_replay / max(denominator, 1)
+    stale_ratio = stale_replay / max(denominator, 1)
+    drifted_pair_ratio = drifted_tickers / pair_denominator
+
+    min_available = float(getattr(config, "ML_RANKER_PARITY_MIN_AVAILABLE_RATIO", 0.70))
+    max_missing = float(getattr(config, "ML_RANKER_PARITY_MAX_MISSING_REPLAY_RATIO", 0.20))
+    max_stale = float(getattr(config, "ML_RANKER_PARITY_MAX_STALE_RATIO", 0.10))
+    max_drifted = float(getattr(config, "ML_RANKER_PARITY_MAX_DRIFTED_PAIR_RATIO", 0.25))
+    if sample <= 0:
+        blockers.append("parity sample missing")
+    if available_ratio < min_available:
+        blockers.append(f"available_pairs_ratio={available_ratio:.0%}<{min_available:.0%}")
+    if missing_ratio > max_missing:
+        blockers.append(f"missing_replay_ratio={missing_ratio:.0%}>{max_missing:.0%}")
+    if stale_ratio > max_stale:
+        blockers.append(f"stale_replay_ratio={stale_ratio:.0%}>{max_stale:.0%}")
+    if drifted_pair_ratio > max_drifted:
+        blockers.append(f"drifted_pair_ratio={drifted_pair_ratio:.0%}>{max_drifted:.0%}")
+
+    generated_at = report.get("generated_at")
+    max_age_hours = _safe_float(getattr(config, "ML_RANKER_PARITY_MAX_AGE_HOURS", 48), 48.0)
+    age_hours = None
+    if generated_at:
+        try:
+            generated = datetime.fromisoformat(str(generated_at).replace("Z", "+00:00"))
+            now = datetime.now(tz=generated.tzinfo) if generated.tzinfo else datetime.now()
+            age_hours = (now - generated).total_seconds() / 3600.0
+            if age_hours > max_age_hours:
+                blockers.append(f"parity_report_age={age_hours:.1f}h>{max_age_hours:.1f}h")
+        except Exception:
+            blockers.append("parity report generated_at invalid")
+    else:
+        blockers.append("parity report generated_at missing")
+
+    critical_fields = list(getattr(config, "ML_RANKER_PARITY_CRITICAL_FIELDS", []) or [])
+    replay_missing = report.get("replay_missing_field_counts") or {}
+    critical_missing: dict[str, float] = {}
+    max_critical_missing = float(getattr(config, "ML_RANKER_PARITY_MAX_CRITICAL_MISSING_RATIO", 0.15))
+    for field in critical_fields:
+        missing_count = _safe_int(replay_missing.get(field), 0)
+        ratio = missing_count / pair_denominator
+        if ratio > max_critical_missing:
+            critical_missing[field] = ratio
+    if critical_missing:
+        top = ", ".join(f"{field}={ratio:.0%}" for field, ratio in list(critical_missing.items())[:5])
+        blockers.append(f"critical replay missingness too high: {top}")
+
+    summary = {
+        "enabled": True,
+        "path": str(path),
+        "sample": sample,
+        "available_pairs": available_pairs,
+        "available_ratio": round(available_ratio, 4),
+        "missing_replay_ratio": round(missing_ratio, 4),
+        "stale_replay_ratio": round(stale_ratio, 4),
+        "drifted_pair_ratio": round(drifted_pair_ratio, 4),
+        "age_hours": None if age_hours is None else round(age_hours, 2),
+        "critical_missing": {k: round(v, 4) for k, v in critical_missing.items()},
+        "blockers": blockers,
+    }
+    return not blockers, blockers, summary
 
 
 def _load_persisted_model() -> bool:
@@ -820,12 +935,15 @@ def train_model(min_samples: int | None = None, *, force: bool = False) -> bool:
             )
 
         # Promotion gate: check if model qualifies for live blend
+        parity_ok, parity_reasons, parity_summary = _replay_live_parity_gate()
+        _model_cache["parity_gate"] = parity_summary
         promotion_eligible = (
             len(raw_returns) >= _PROMOTION_MIN_SAMPLES
             and oos_rank_ic is not None
             and oos_rank_ic >= _PROMOTION_MIN_RANK_IC
             and oos_r2 is not None
             and oos_r2 >= _PROMOTION_MIN_R_SQUARED
+            and parity_ok
         )
         _model_cache["promotion_eligible"] = promotion_eligible
 
@@ -837,8 +955,8 @@ def train_model(min_samples: int | None = None, *, force: bool = False) -> bool:
                 reasons.append(f"rank_IC={oos_rank_ic}<{_PROMOTION_MIN_RANK_IC}")
             if oos_r2 is None or oos_r2 < _PROMOTION_MIN_R_SQUARED:
                 reasons.append(f"R²={oos_r2}<{_PROMOTION_MIN_R_SQUARED}")
+            reasons.extend(parity_reasons)
             logger.info("ML ranker: promotion gate FAILED (%s) — shadow mode enforced", ", ".join(reasons))
-
         # Bayesian HPO: optimize hyperparameters weekly (Snoek et al. 2012)
         hpo_params = None
         if len(raw_returns) >= _PROMOTION_MIN_SAMPLES:
@@ -1100,6 +1218,11 @@ def is_promotion_eligible() -> bool:
     eligible = cached_eligible or metric_eligible
     if not eligible:
         return False
+    parity_ok, parity_reasons, parity_summary = _replay_live_parity_gate()
+    _model_cache["parity_gate"] = parity_summary
+    if not parity_ok:
+        logger.warning("ML ranker promotion blocked by replay/live parity: %s", "; ".join(parity_reasons))
+        return False
     if getattr(config, "ML_DRIFT_MONITOR_ENABLED", True):
         try:
             from utils.drift_monitor import get_drift_status
@@ -1122,6 +1245,8 @@ def get_diagnostics() -> dict:
         and _model_cache.get("oos_r_squared") is not None
         and float(_model_cache.get("oos_r_squared") or 0.0) >= _PROMOTION_MIN_R_SQUARED
     )
+    parity_ok, parity_reasons, parity_summary = _replay_live_parity_gate()
+    promotion_eligible = bool((_model_cache.get("promotion_eligible", False) or metric_eligible) and parity_ok)
     return {
         "n_samples": _model_cache.get("n_samples", 0),
         "oos_rank_ic": _model_cache.get("oos_rank_ic"),
@@ -1132,7 +1257,9 @@ def get_diagnostics() -> dict:
         "meta_brier": _model_cache.get("meta_brier"),
         "meta_log_loss": _model_cache.get("meta_log_loss"),
         "meta_calibration": _model_cache.get("meta_calibration"),
-        "promotion_eligible": bool(_model_cache.get("promotion_eligible", False) or metric_eligible),
+        "promotion_eligible": promotion_eligible,
+        "parity_gate": parity_summary,
+        "parity_blockers": parity_reasons,
         "trained_at": _model_cache.get("trained_at", 0),
         "n_features": len(FEATURE_COLS),
         "n_interaction_features": len(INTERACTION_FEATURES),

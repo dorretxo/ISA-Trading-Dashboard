@@ -1592,6 +1592,8 @@ def save_discovery_results(disc_result, state: dict) -> int:
             "portfolio_fit_rank": getattr(c, "portfolio_fit_rank", None),
             # Cold-start scorecard fields (Phase 2 Steps 4 + 5).
             "sb_score": getattr(c, "sb_score", None),
+            "scorecard_override": getattr(c, "scorecard_override", False),
+            "scorecard_override_blockers": getattr(c, "scorecard_override_blockers", None),
             "conformal_p": getattr(c, "conformal_p", None),
             "final_rank": c.final_rank,
         }
