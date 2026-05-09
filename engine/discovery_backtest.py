@@ -1194,8 +1194,10 @@ def record_discovery_picks(candidates: list) -> int:
             if isinstance(c, dict):
                 f_score_val = c.get("f_score")
                 f_score_coverage = c.get("f_score_coverage")
+                f_score_score_val = c.get("f_score_score")
                 ev_ebit_val = c.get("ev_ebit")
                 ev_ebit_score_val = c.get("ev_ebit_score")
+                fcf_yield_val = c.get("fcf_yield", c.get("_fcf_yield"))
                 gpa_val = c.get("gpa")
                 gpa_score_val = c.get("gpa_score")
                 sma_200_val = c.get("sma_200")
@@ -1207,8 +1209,10 @@ def record_discovery_picks(candidates: list) -> int:
             else:
                 f_score_val = getattr(c, "f_score", None)
                 f_score_coverage = getattr(c, "f_score_coverage", None)
+                f_score_score_val = getattr(c, "f_score_score", None)
                 ev_ebit_val = getattr(c, "ev_ebit", None)
                 ev_ebit_score_val = getattr(c, "ev_ebit_score", None)
+                fcf_yield_val = getattr(c, "fcf_yield", None)
                 gpa_val = getattr(c, "gpa", None)
                 gpa_score_val = getattr(c, "gpa_score", None)
                 sma_200_val = getattr(c, "sma_200", None)
@@ -1246,6 +1250,17 @@ def record_discovery_picks(candidates: list) -> int:
                 meta_prob_value = float(meta_prob) if meta_prob is not None else None
             except (TypeError, ValueError):
                 meta_prob_value = None
+
+            if f_score_score_val is None and f_score_val is not None:
+                try:
+                    f_score_score_val = float(np.clip((float(f_score_val) - 4.5) / 3.0, -1.0, 1.0))
+                except (TypeError, ValueError):
+                    f_score_score_val = None
+            if gpa_score_val is None and gpa_val is not None:
+                try:
+                    gpa_score_val = float(np.clip((float(gpa_val) - 0.30) / 0.20, -1.0, 1.0))
+                except (TypeError, ValueError):
+                    gpa_score_val = None
 
             # Signal price: prefer the price the scoring engine saw at decision time.
             # Falling back to a fresh download only if the candidate lacks one, which
@@ -1295,6 +1310,14 @@ def record_discovery_picks(candidates: list) -> int:
                 "return_30d_prior": ret_30d,
                 "return_90d_prior": ret_90d,
                 "vol_20d": vol_20d,
+                "f_score": f_score_val,
+                "f_score_score": f_score_score_val,
+                "f_score_coverage": f_score_coverage,
+                "gpa": gpa_val,
+                "gpa_score": gpa_score_val,
+                "fcf_yield": fcf_yield_val,
+                "ev_ebit": ev_ebit_val,
+                "ev_ebit_score": ev_ebit_score_val,
                 "beta_90d": getattr(c, "beta_90d", None) if hasattr(c, "ticker") else c.get("beta_90d", c.get("_beta")),
                 "avg_dollar_volume": getattr(c, "avg_dollar_volume", None) if hasattr(c, "ticker") else c.get("avg_dollar_volume", c.get("_avg_dollar_volume")),
                 "market_cap": getattr(c, "market_cap", None) if hasattr(c, "ticker") else c.get("market_cap", c.get("_market_cap")),
@@ -1379,6 +1402,7 @@ def record_discovery_picks(candidates: list) -> int:
                 "r_r_ratio": rr_ratio,
                 "pe_ratio": pe_ratio,
                 "peg_ratio": peg_ratio,
+                "fcf_yield": fcf_yield_val,
                 "revenue_growth": revenue_growth,
                 "roe": roe,
                 "short_pct": short_pct,

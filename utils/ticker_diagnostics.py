@@ -18,6 +18,7 @@ from typing import Any
 import config
 from engine.discovery_backtest import init_backtest_db
 from engine.ml_ranker import FEATURE_COLS as _ML_FEATURE_COLS
+from utils.replay_live_parity import comparable_fields, compare_parity_rows
 from engine.paper_trading import _connect
 from utils.atomic_io import atomic_write_json
 from utils.global_universe import get_dynamic_entries, get_full_universe, get_global_universe
@@ -338,33 +339,20 @@ def _replay_live_parity(rows: list[dict], tolerance: float = 0.15) -> dict:
             "max_date_gap_days": max_date_gap_days,
             "comparisons": comparisons,
         }
-    for column in _FACTOR_COLUMNS:
-        live_val = _finite(live.get(column))
-        replay_val = _finite(replay.get(column))
-        if live_val is None or replay_val is None:
-            comparisons.append({
-                "field": column,
-                "live": live_val,
-                "replay": replay_val,
-                "delta": None,
-                "status": "missing",
-            })
-            continue
-        delta = live_val - replay_val
-        comparisons.append({
-            "field": column,
-            "live": live_val,
-            "replay": replay_val,
-            "delta": delta,
-            "status": "drift" if abs(delta) > tolerance else "ok",
-        })
+    compared = compare_parity_rows(
+        live,
+        replay,
+        comparable_fields(_FACTOR_COLUMNS),
+        default_tolerance=tolerance,
+    )
+    comparisons = compared["comparisons"]
     return {
         "available": True,
         "tolerance": tolerance,
         "latest_discovery_run": live.get("run_date"),
         "latest_replay_run": replay.get("run_date"),
         "date_gap_days": date_gap_days,
-        "drift_fields": [row["field"] for row in comparisons if row["status"] == "drift"],
+        "drift_fields": compared["drift_fields"],
         "comparisons": comparisons,
     }
 

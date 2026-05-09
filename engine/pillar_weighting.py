@@ -146,8 +146,18 @@ def apply_weight_guardrails(
     """Apply floor/cap constraints to learned pillar weights."""
     floor = float(getattr(config, "PILLAR_WEIGHT_MIN_FLOOR", 0.03))
     max_single = float(getattr(config, "PILLAR_WEIGHT_MAX_SINGLE", 0.55))
+    nonpositive_ic_max = max(floor, float(getattr(config, "PILLAR_WEIGHT_NONPOSITIVE_IC_MAX", max_single)))
     lower = {p: floor for p in pillars}
     upper = {p: max_single for p in pillars}
+
+    positive_pillars: list[str] = []
+    if ic_by_pillar is not None:
+        for pillar in pillars:
+            ic = _finite(ic_by_pillar.get(pillar), 0.0)
+            if ic > 0:
+                positive_pillars.append(pillar)
+            else:
+                upper[pillar] = min(upper[pillar], nonpositive_ic_max)
 
     if "forecast" in upper:
         upper["forecast"] = min(upper["forecast"], float(getattr(config, "PILLAR_WEIGHT_FORECAST_MAX", 0.30)))
@@ -158,6 +168,22 @@ def apply_weight_guardrails(
             )
     if "sentiment" in upper and _horizon_is_long(horizon):
         upper["sentiment"] = min(upper["sentiment"], float(getattr(config, "PILLAR_WEIGHT_SENTIMENT_LONG_MAX", 0.08)))
+
+    # If negative-IC caps and long-horizon sentiment caps make the box
+    # infeasible, relax the generic max cap on positive non-specialist pillars
+    # before allocating weight to adverse evidence.
+    if ic_by_pillar is not None and sum(upper.values()) < 1.0 and positive_pillars:
+        hard_capped = set()
+        if "sentiment" in upper and _horizon_is_long(horizon):
+            hard_capped.add("sentiment")
+        if "forecast" in upper:
+            hard_capped.add("forecast")
+        relaxable = [p for p in positive_pillars if p not in hard_capped]
+        if not relaxable:
+            relaxable = list(positive_pillars)
+        shortfall = 1.0 - sum(upper.values())
+        for pillar in relaxable:
+            upper[pillar] = min(1.0, upper[pillar] + shortfall / max(1, len(relaxable)))
 
     return {p: round(v, 4) for p, v in _bounded_normalise(weights, lower=lower, upper=upper, pillars=pillars).items()}
 
@@ -174,10 +200,16 @@ def pillar_parity_gate() -> tuple[bool, list[str], dict]:
         reason = f"parity report missing: {path}"
         return False, [reason], {"enabled": True, "available": False, "reason": reason}
     try:
-        report = json.loads(path.read_text(encoding="utf-8"))
+        root_report = json.loads(path.read_text(encoding="utf-8"))
     except Exception as exc:
         reason = f"parity report unreadable: {exc}"
         return False, [reason], {"enabled": True, "available": False, "reason": reason}
+    if not isinstance(root_report, dict):
+        reason = "parity report must be a JSON object"
+        return False, [reason], {"enabled": True, "available": False, "reason": reason}
+    report = root_report.get("adaptive_weight_parity") if isinstance(root_report, dict) else None
+    if not isinstance(report, dict):
+        report = root_report
 
     blockers: list[str] = []
     if report.get("available") is False:
@@ -211,7 +243,7 @@ def pillar_parity_gate() -> tuple[bool, list[str], dict]:
     if drifted_ratio > max_drifted:
         blockers.append(f"drifted_pair_ratio={drifted_ratio:.0%}>{max_drifted:.0%}")
 
-    generated_at = report.get("generated_at")
+    generated_at = report.get("generated_at") or root_report.get("generated_at")
     max_age_hours = float(getattr(config, "ML_RANKER_PARITY_MAX_AGE_HOURS", 48))
     age_hours = None
     if generated_at:
@@ -226,7 +258,7 @@ def pillar_parity_gate() -> tuple[bool, list[str], dict]:
     else:
         blockers.append("parity report generated_at missing")
 
-    critical_fields = list(getattr(config, "ML_RANKER_PARITY_CRITICAL_FIELDS", []) or [])
+    critical_fields = list(getattr(config, "ADAPTIVE_WEIGHTS_PARITY_CRITICAL_FIELDS", []) or [])
     replay_missing = report.get("replay_missing_field_counts") or {}
     max_critical_missing = float(getattr(config, "ML_RANKER_PARITY_MAX_CRITICAL_MISSING_RATIO", 0.15))
     critical_missing: dict[str, float] = {}

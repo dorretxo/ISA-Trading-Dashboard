@@ -326,6 +326,53 @@ DISCOVERY_SWAPS_REQUIRE_ENTRY_READY = True
 REPLAY_LIVE_PARITY_REPORT_PATH = "feature_cache/replay_live_parity_report.json"
 REPLAY_LIVE_PARITY_TOLERANCE = 0.15
 REPLAY_LIVE_PARITY_MAX_DATE_GAP_DAYS = 7
+REPLAY_LIVE_PARITY_EXCLUDED_FIELDS = [
+    # Live-only or not yet PIT-replayable; keep out of drift counts so the
+    # report measures comparable replay/live features rather than roadmap gaps.
+    "sentiment_score", "forecast_score", "rsi", "adx", "bb_pct",
+    "peg_ratio", "roe", "short_pct", "vix_percentile",
+    "downside_vol_60d", "max_dd_252d",
+    "factor_mom_momentum_tilt", "factor_mom_value_tilt", "factor_mom_quality_tilt",
+    "factor_mom_momentum_ret_1m", "factor_mom_momentum_ret_3m",
+    "factor_mom_value_ret_1m", "factor_mom_value_ret_3m",
+    "factor_mom_quality_ret_1m", "factor_mom_quality_ret_3m",
+    "network_momentum", "qa_sentiment_score",
+    "pead_factor_score", "sue_score", "revision_momentum_3m",
+    "sleeve_momentum", "sleeve_quality", "sleeve_value",
+    "sleeve_low_risk", "sleeve_pead", "sleeve_ready",
+]
+REPLAY_LIVE_PARITY_ZERO_AS_MISSING_FIELDS = ["pe_ratio", "peg_ratio", "roe", "short_pct"]
+REPLAY_LIVE_PARITY_FIELD_TOLERANCES = {
+    "quality_factor_score": 0.35,
+    "value_factor_score": 0.35,
+    "momentum_factor_score": 0.30,
+    "volatility_factor_score": 0.25,
+    "qmj_factor_score": 0.35,
+    "bab_factor_score": 0.35,
+    "turnover_cost_score": 0.25,
+    "quality_score_fundamental": 0.35,
+    "technical_score": 0.30,
+    "fundamental_score": 0.35,
+    "pe_ratio": 5.0,
+    "revenue_growth": 0.25,
+    "return_10d_prior": 0.20,
+    "return_30d_prior": 0.20,
+    "return_90d_prior": 0.25,
+    "vol_20d": 0.15,
+    "f_score": 1.25,
+    "f_score_coverage": 0.35,
+    "gpa": 0.12,
+    "gpa_score": 0.50,
+    "price_vs_sma200_stretch": 0.20,
+    "institutional_prior_score": 0.35,
+    "institutional_prior_percentile": 0.35,
+    "institutional_prior_confidence": 0.35,
+    "fill_probability": 0.36,
+    "r_r_ratio": 0.75,
+}
+REPLAY_LIVE_PARITY_ADAPTIVE_FIELDS = [
+    "technical_score", "return_10d_prior", "return_30d_prior", "return_90d_prior", "vol_20d",
+]
 READY_ENTRY_NEAR_HIGH_PULLBACK_RET30 = 0.12
 READY_ENTRY_NEAR_HIGH_MIN_UPSIDE = 8.0
 
@@ -466,13 +513,17 @@ WEIGHT_MIN_FLOOR = 0.10        # Minimum 10% weight per pillar (signal diversifi
 PILLAR_WEIGHT_AUDIT_PATH = "feature_cache/pillar_weight_audit.json"
 PILLAR_WEIGHT_MIN_FLOOR = 0.03
 PILLAR_WEIGHT_MAX_SINGLE = 0.55
+PILLAR_WEIGHT_NONPOSITIVE_IC_MAX = 0.12
 PILLAR_WEIGHT_SENTIMENT_LONG_MAX = 0.08
 PILLAR_WEIGHT_FORECAST_MAX = 0.30
 PILLAR_WEIGHT_FORECAST_MAX_WITH_NEGATIVE_IC = 0.03
 PILLAR_WEIGHT_LONG_HORIZONS = ("30d", "60d", "90d", "multi")
 ADAPTIVE_WEIGHTS_GATE_ENABLED = True
 ADAPTIVE_WEIGHTS_GATE_REQUIRE_PARITY = True
-ADAPTIVE_WEIGHTS_GATE_MIN_POSITIVE_PILLARS = 1
+ADAPTIVE_WEIGHTS_GATE_MIN_POSITIVE_PILLARS = 2
+ADAPTIVE_WEIGHTS_PARITY_CRITICAL_FIELDS = [
+    "technical_score", "return_10d_prior", "return_30d_prior", "return_90d_prior", "vol_20d",
+]
 
 # FMP (Financial Modeling Prep) API — PRIMARY data source (Starter plan)
 # Sign up at https://site.financialmodelingprep.com/developer/docs

@@ -572,10 +572,14 @@ def _write_replay_live_parity_report(candidates: list[dict]) -> None:
         from engine.paper_trading import _connect
 
         init_backtest_db()
+        from utils.replay_live_parity import adaptive_weight_fields, comparable_fields, compare_parity_rows
+
         with _connect() as conn:
             valid = {str(row[1]) for row in conn.execute("PRAGMA table_info(signal_backtest)").fetchall()}
-            compare_fields = [field for field in fields if field in valid]
-            select_cols = ["ticker", "run_date", "source"] + compare_fields
+            compare_fields = comparable_fields(fields, valid)
+            adaptive_fields = adaptive_weight_fields(valid)
+            select_fields = sorted(set(compare_fields) | set(adaptive_fields))
+            select_cols = ["ticker", "run_date", "source"] + select_fields
             for ticker in tickers:
                 live = conn.execute(
                     f"""
@@ -626,35 +630,31 @@ def _write_replay_live_parity_report(candidates: list[dict]) -> None:
                         "date_gap_days": date_gap_days,
                     })
                     continue
-                comparisons = []
-                live_missing_fields = []
-                replay_missing_fields = []
-                for field in compare_fields:
-                    live_val = _finite_float(live_d.get(field))
-                    replay_val = _finite_float(replay_d.get(field))
-                    if live_val is None or replay_val is None:
-                        status = "missing"
-                        delta = None
-                        missing_counts[field] += 1
-                        if live_val is None:
-                            live_missing_counts[field] += 1
-                            live_missing_fields.append(field)
-                        if replay_val is None:
-                            replay_missing_counts[field] += 1
-                            replay_missing_fields.append(field)
-                    else:
-                        delta = live_val - replay_val
-                        status = "drift" if abs(delta) > tolerance else "ok"
-                        if status == "drift":
-                            drift_counts[field] += 1
-                    comparisons.append({
-                        "field": field,
-                        "live": live_val,
-                        "replay": replay_val,
-                        "delta": None if delta is None else round(delta, 4),
-                        "status": status,
-                    })
-                drift_fields = [row["field"] for row in comparisons if row["status"] == "drift"]
+                main_compare = compare_parity_rows(
+                    live_d,
+                    replay_d,
+                    compare_fields,
+                    default_tolerance=tolerance,
+                )
+                comparisons = main_compare["comparisons"]
+                live_missing_fields = main_compare["live_missing_fields"]
+                replay_missing_fields = main_compare["replay_missing_fields"]
+                drift_fields = main_compare["drift_fields"]
+                for field in drift_fields:
+                    drift_counts[field] += 1
+                for field in set(live_missing_fields) | set(replay_missing_fields):
+                    missing_counts[field] += 1
+                for field in live_missing_fields:
+                    live_missing_counts[field] += 1
+                for field in replay_missing_fields:
+                    replay_missing_counts[field] += 1
+
+                adaptive_compare = compare_parity_rows(
+                    live_d,
+                    replay_d,
+                    adaptive_fields,
+                    default_tolerance=tolerance,
+                )
                 rows_out.append({
                     "ticker": ticker,
                     "available": True,
@@ -662,9 +662,11 @@ def _write_replay_live_parity_report(candidates: list[dict]) -> None:
                     "latest_replay_run": replay_d.get("run_date"),
                     "date_gap_days": date_gap_days,
                     "drift_fields": drift_fields,
+                    "adaptive_weight_drift_fields": adaptive_compare["drift_fields"],
                     "live_missing_fields": live_missing_fields,
                     "replay_missing_fields": replay_missing_fields,
                     "comparisons": comparisons,
+                    "adaptive_weight_comparisons": adaptive_compare["comparisons"],
                 })
     except Exception as exc:
         atomic_write_json(
@@ -680,10 +682,46 @@ def _write_replay_live_parity_report(candidates: list[dict]) -> None:
 
     available_rows = [row for row in rows_out if row.get("available")]
     drifted = [row for row in available_rows if row.get("drift_fields")]
+    adaptive_drift_counts: Counter[str] = Counter()
+    adaptive_missing_counts: Counter[str] = Counter()
+    adaptive_live_missing_counts: Counter[str] = Counter()
+    adaptive_replay_missing_counts: Counter[str] = Counter()
+    for row in available_rows:
+        for field in row.get("adaptive_weight_drift_fields") or []:
+            adaptive_drift_counts[field] += 1
+        comparisons = row.get("adaptive_weight_comparisons") or []
+        for comp in comparisons:
+            if comp.get("status") != "missing":
+                continue
+            field = comp.get("field")
+            adaptive_missing_counts[field] += 1
+            if comp.get("live") is None:
+                adaptive_live_missing_counts[field] += 1
+            if comp.get("replay") is None:
+                adaptive_replay_missing_counts[field] += 1
+    adaptive_drifted = [row for row in available_rows if row.get("adaptive_weight_drift_fields")]
+    adaptive_weight_parity = {
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "available": True,
+        "comparison_scope": "adaptive_weight_fields",
+        "fields": adaptive_fields if "adaptive_fields" in locals() else [],
+        "tolerance": tolerance,
+        "sample": len(tickers),
+        "available_pairs": len(available_rows),
+        "missing_replay": missing_replay,
+        "stale_replay": stale_replay,
+        "max_date_gap_days": max_date_gap_days,
+        "drifted_tickers": len(adaptive_drifted),
+        "drift_field_counts": dict(adaptive_drift_counts),
+        "missing_field_counts": dict(adaptive_missing_counts),
+        "live_missing_field_counts": dict(adaptive_live_missing_counts),
+        "replay_missing_field_counts": dict(adaptive_replay_missing_counts),
+    }
     payload = {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "available": True,
         "comparison_scope": comparison_scope,
+        "fields": compare_fields if "compare_fields" in locals() else fields,
         "tolerance": tolerance,
         "sample": len(tickers),
         "available_pairs": len(available_rows),
@@ -695,6 +733,7 @@ def _write_replay_live_parity_report(candidates: list[dict]) -> None:
         "missing_field_counts": dict(missing_counts),
         "live_missing_field_counts": dict(live_missing_counts),
         "replay_missing_field_counts": dict(replay_missing_counts),
+        "adaptive_weight_parity": adaptive_weight_parity,
         "top_drifted": sorted(
             drifted,
             key=lambda row: len(row.get("drift_fields") or []),

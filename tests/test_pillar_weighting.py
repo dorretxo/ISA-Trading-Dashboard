@@ -91,7 +91,7 @@ def test_pillar_parity_gate_blocks_critical_replay_missingness(monkeypatch, tmp_
     monkeypatch.setattr(config, "REPLAY_LIVE_PARITY_REPORT_PATH", str(report_path))
     monkeypatch.setattr(config, "ADAPTIVE_WEIGHTS_GATE_ENABLED", True)
     monkeypatch.setattr(config, "ADAPTIVE_WEIGHTS_GATE_REQUIRE_PARITY", True)
-    monkeypatch.setattr(config, "ML_RANKER_PARITY_CRITICAL_FIELDS", ["forecast_score"])
+    monkeypatch.setattr(config, "ADAPTIVE_WEIGHTS_PARITY_CRITICAL_FIELDS", ["forecast_score"])
     monkeypatch.setattr(config, "ML_RANKER_PARITY_MAX_CRITICAL_MISSING_RATIO", 0.15)
 
     ok, reasons, summary = pillar_parity_gate()
@@ -99,6 +99,45 @@ def test_pillar_parity_gate_blocks_critical_replay_missingness(monkeypatch, tmp_
     assert not ok
     assert any("critical replay missingness" in reason for reason in reasons)
     assert summary["critical_missing"]["forecast_score"] == pytest.approx(0.3)
+
+
+def test_pillar_parity_gate_prefers_adaptive_weight_subreport(monkeypatch, tmp_path):
+    report_path = tmp_path / "parity.json"
+    report_path.write_text(
+        json.dumps(
+            {
+                "generated_at": datetime.now().isoformat(timespec="seconds"),
+                "available": True,
+                "sample": 10,
+                "available_pairs": 10,
+                "missing_replay": 0,
+                "stale_replay": 0,
+                "drifted_tickers": 10,
+                "replay_missing_field_counts": {"technical_score": 10},
+                "adaptive_weight_parity": {
+                    "available": True,
+                    "sample": 10,
+                    "available_pairs": 10,
+                    "missing_replay": 0,
+                    "stale_replay": 0,
+                    "drifted_tickers": 1,
+                    "replay_missing_field_counts": {},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(config, "REPLAY_LIVE_PARITY_REPORT_PATH", str(report_path))
+    monkeypatch.setattr(config, "ADAPTIVE_WEIGHTS_GATE_ENABLED", True)
+    monkeypatch.setattr(config, "ADAPTIVE_WEIGHTS_GATE_REQUIRE_PARITY", True)
+    monkeypatch.setattr(config, "ADAPTIVE_WEIGHTS_PARITY_CRITICAL_FIELDS", ["technical_score"])
+    monkeypatch.setattr(config, "ML_RANKER_PARITY_MAX_AGE_HOURS", 999999)
+
+    ok, reasons, summary = pillar_parity_gate()
+
+    assert ok
+    assert reasons == []
+    assert summary["drifted_pair_ratio"] == pytest.approx(0.1)
 
 
 def test_adaptive_weights_use_signed_ic_and_caps(monkeypatch):
@@ -117,6 +156,7 @@ def test_adaptive_weights_use_signed_ic_and_caps(monkeypatch):
 
     assert weights is not None
     assert weights["fundamental"] > weights["technical"]
+    assert weights["technical"] <= 0.12
     assert weights["sentiment"] <= 0.08
     assert weights["forecast"] <= 0.03
 
@@ -148,5 +188,6 @@ def test_bayesian_pillar_effectiveness_uses_signed_ic(monkeypatch):
 
     assert weights is not None
     assert weights["fundamental"] > weights["technical"]
+    assert weights["technical"] <= 0.12
     assert weights["sentiment"] <= 0.08
     assert weights["forecast"] <= 0.03
