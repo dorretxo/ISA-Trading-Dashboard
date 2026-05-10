@@ -70,7 +70,7 @@ def test_evidence_classification_distinguishes_yfinance_balance_only():
     assert breakdown.classify_evidence(
         ticker="AAPL",
         pit_source="fmp",
-        qmj_components=3,
+        qmj_components=2,
     ) == "fmp_full"
     assert breakdown.classify_evidence(
         ticker="AAPL",

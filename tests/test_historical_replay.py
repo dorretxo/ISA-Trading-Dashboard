@@ -31,6 +31,7 @@ def test_pit_fundamentals_enrich_replay_factor_inputs(monkeypatch):
                         "shares_outstanding": 100.0,
                     },
                     "2024-03-31": {
+                        "_source": "fmp",
                         "_accepted_date": "2024-04-20",
                         "revenue": 1000.0,
                         "net_income": 100.0,
@@ -57,6 +58,7 @@ def test_pit_fundamentals_enrich_replay_factor_inputs(monkeypatch):
     )
 
     assert features["market_cap"] == 1000.0
+    assert features["pit_source"] == "fmp"
     assert features["pe_ratio"] == 5.0
     assert features["fcf_yield"] == 0.10
     assert round(features["ev_ebit"], 2) == 8.60
@@ -76,6 +78,8 @@ def test_pit_fundamentals_enrich_replay_factor_inputs(monkeypatch):
         pd.Timestamp("2024-06-30"),
         {"signal_price": 10.0, "momentum_score": 0.75, "vol_20d": 20.0},
     )
+    assert payload["pit_source"] == "fmp"
+    assert payload["qmj_component_count"] >= 1
     assert payload["value_factor_score"] > 0
     assert payload["momentum_factor_score"] == 0.5
 

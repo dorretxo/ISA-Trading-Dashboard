@@ -16,6 +16,7 @@ from engine.fscore_utils import is_f_score_actionable
 
 
 YFINANCE_PIT_SOURCES = {"yfinance_info", "yfinance_quarterly", "yfinance"}
+QMJ_LITE_FULL_EVIDENCE_COMPONENTS = 2
 
 
 def _finite(value: Any) -> float | None:
@@ -90,7 +91,7 @@ def classify_evidence(
     yf_like = source in YFINANCE_PIT_SOURCES or (not source and is_non_us(symbol))
 
     if fmp_like:
-        return "fmp_full" if components >= 3 else "fmp_partial"
+        return "fmp_full" if components >= QMJ_LITE_FULL_EVIDENCE_COMPONENTS else "fmp_partial"
     if yf_like:
         if components <= 1:
             return "yfinance_balance_only"

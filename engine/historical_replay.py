@@ -564,6 +564,7 @@ def _fundamental_features(ticker: str, as_of: pd.Timestamp, *, signal_price: flo
     )
 
     return {
+        "pit_source": str(latest.get("_source") or "unknown"),
         "f_score": f_result.get("f_score"),
         "f_score_coverage": f_result.get("f_score_coverage"),
         "f_score_gate": f_result.get("f_score_gate"),

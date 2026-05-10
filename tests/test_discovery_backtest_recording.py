@@ -28,6 +28,8 @@ def _candidate(action="BUY", **overrides):
         "ready_contract_status": "PASS",
         "strong_buy_eligible": action == "STRONG BUY",
         "meta_success_prob": 0.51,
+        "qmj_component_count": 2,
+        "pit_source": "yfinance",
     }
     base.update(overrides)
     return base
@@ -49,7 +51,7 @@ def test_record_discovery_picks_upserts_same_day_action_upgrade(tmp_path, monkey
     with paper_trading._connect() as conn:
         rows = conn.execute(
             "SELECT ticker, action, final_rank, aggregate_score, meta_prob, "
-            "ready_contract_status, strong_buy_eligible "
+            "ready_contract_status, strong_buy_eligible, qmj_component_count, pit_source "
             "FROM signal_backtest WHERE source='discovery'"
         ).fetchall()
 
@@ -62,6 +64,8 @@ def test_record_discovery_picks_upserts_same_day_action_upgrade(tmp_path, monkey
     assert row["meta_prob"] == 0.51
     assert row["ready_contract_status"] == "PASS"
     assert row["strong_buy_eligible"] == 1
+    assert row["qmj_component_count"] == 2
+    assert row["pit_source"] == "yfinance"
 
 
 def test_live_sanity_report_confirms_cache_email_and_backtest(tmp_path, monkeypatch):

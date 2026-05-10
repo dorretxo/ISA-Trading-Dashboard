@@ -300,6 +300,8 @@ _FEATURE_STORE_COLUMNS = [
     ("f_score", "INTEGER"), ("f_score_coverage", "REAL"),
     ("ev_ebit", "REAL"), ("ev_ebit_score", "REAL"),
     ("gpa", "REAL"), ("gpa_score", "REAL"),
+    ("qmj_component_count", "INTEGER"),
+    ("pit_source", "TEXT"),
     # Late-cycle / stretch diagnostic: signal_price / sma_200 - 1
     ("price_vs_sma200_stretch", "REAL"),
     # Gate-v2 shadow telemetry and active trap safeguard outcome
@@ -1091,6 +1093,8 @@ def record_discovery_picks(candidates: list) -> int:
                 earnings_stability = getattr(c, "earnings_stability", None)
                 eps_growth_variance_5y = getattr(c, "eps_growth_variance_5y", None)
                 qmj_factor_score = getattr(c, "qmj_factor_score", None)
+                qmj_component_count = getattr(c, "qmj_component_count", None)
+                pit_source = getattr(c, "pit_source", None)
                 pead_factor_score = getattr(c, "pead_factor_score", None)
                 sue_score = getattr(c, "sue_score", None)
                 revision_momentum_3m = getattr(c, "revision_momentum_3m", None)
@@ -1154,6 +1158,8 @@ def record_discovery_picks(candidates: list) -> int:
                 earnings_stability = c.get("earnings_stability")
                 eps_growth_variance_5y = c.get("eps_growth_variance_5y")
                 qmj_factor_score = c.get("qmj_factor_score")
+                qmj_component_count = c.get("qmj_component_count")
+                pit_source = c.get("pit_source") or c.get("_pit_source")
                 pead_factor_score = c.get("pead_factor_score")
                 sue_score = c.get("sue_score")
                 revision_momentum_3m = c.get("revision_momentum_3m")
@@ -1330,6 +1336,8 @@ def record_discovery_picks(candidates: list) -> int:
                 "turnover_cost_score": turnover_cost_score,
             }
             factor_scores = compute_factor_scores_from_result(factor_snapshot)
+            if qmj_component_count is None:
+                qmj_component_count = factor_scores.get("qmj_component_count")
 
             payload = {
                 "run_date": now,
@@ -1348,6 +1356,8 @@ def record_discovery_picks(candidates: list) -> int:
                 "momentum_score": mom,
                 "quality_factor_score": factor_scores.get("quality_factor_score"),
                 "qmj_factor_score": qmj_factor_score if qmj_factor_score is not None else factor_scores.get("qmj_factor_score"),
+                "qmj_component_count": qmj_component_count,
+                "pit_source": pit_source,
                 "value_factor_score": factor_scores.get("value_factor_score"),
                 "momentum_factor_score": factor_scores.get("momentum_factor_score"),
                 "volatility_factor_score": factor_scores.get("volatility_factor_score"),
