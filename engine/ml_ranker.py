@@ -47,7 +47,8 @@ FEATURE_COLS = [
     # Enterprise and entry-quality factors
     "f_score", "f_score_coverage", "gpa", "gpa_score", "price_vs_sma200_stretch",
     "institutional_prior_score", "institutional_prior_percentile", "institutional_prior_confidence",
-    "fill_probability", "r_r_ratio", "strong_buy_eligible",
+    # Entry/readiness fields are monitored separately and belong in the
+    # future readiness classifier, not the forward-return alpha ranker.
     "sleeve_momentum", "sleeve_quality", "sleeve_value",
     "sleeve_low_risk", "sleeve_pead", "sleeve_ready",
 ]

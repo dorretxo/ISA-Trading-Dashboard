@@ -506,6 +506,117 @@ def _candidate_market_cap(candidate: dict, snapshot: dict | None = None) -> floa
     )
 
 
+def _fill_missing_candidate_field(candidate: dict, key: str, value) -> None:
+    """Fill Stage 5b metadata without clobbering PIT-safe Stage 2 fields."""
+    if candidate.get(key) in (None, "") and value not in (None, ""):
+        candidate[key] = value
+
+
+_PIT_RESULT_OVERRIDE_MAP = {
+    "f_score": "_f_score",
+    "f_score_coverage": "_f_score_coverage",
+    "f_score_score": "_f_score_score",
+    "gpa": "_gpa",
+    "gpa_score": "_gpa_score",
+    "gross_profitability": "_gross_profitability",
+    "fcf_to_assets": "_fcf_to_assets",
+    "fcf_yield": "_fcf_yield",
+    "ev_ebit": "_ev_ebit",
+    "ebit_yield": "_pit_ebit_yield",
+    "ev_ebit_score": "_ev_ebit_score",
+    "net_debt_ebitda": "_net_debt_ebitda",
+    "cash_to_debt": "_cash_to_debt",
+    "revenue_growth": "_revenue_growth",
+    "pe_ratio": "_pe_ratio",
+    "market_cap": "_market_cap",
+    "quality_score_fundamental": "_pit_quality_score",
+}
+
+
+def _current_replay_like_fundamental_features(ticker: str, candidate: dict) -> dict:
+    """Return today's replay-style PIT feature bundle for live discovery."""
+    price = safe_float(
+        candidate.get("price", candidate.get("_last_price", candidate.get("current_price"))),
+        default=None,
+    )
+    if price is None or price <= 0:
+        return {}
+    try:
+        from engine.historical_replay import _fundamental_features as replay_fundamental_features
+
+        features = replay_fundamental_features(ticker, pd.Timestamp(date.today()), signal_price=price)
+        return features if isinstance(features, dict) else {}
+    except Exception as exc:
+        logger.debug("Replay-style PIT fundamentals unavailable for %s: %s", ticker, exc)
+        return {}
+
+
+def _apply_replay_like_stage2_features(out: dict, features: dict) -> None:
+    """Merge replay-style PIT features into Stage 2 private fields."""
+    if not features:
+        return
+    mapping = {
+        "f_score": "_f_score",
+        "f_score_coverage": "_f_score_coverage",
+        "f_score_score": "_f_score_score",
+        "gpa": "_gpa",
+        "gpa_score": "_gpa_score",
+        "gross_profitability": "_gross_profitability",
+        "fcf_to_assets": "_fcf_to_assets",
+        "earnings_stability": "_earnings_stability",
+        "eps_growth_variance_5y": "_eps_growth_variance_5y",
+        "fcf_yield": "_fcf_yield",
+        "ev_ebit": "_ev_ebit",
+        "ebit_yield": "_pit_ebit_yield",
+        "ev_ebit_score": "_ev_ebit_score",
+        "net_debt_ebitda": "_net_debt_ebitda",
+        "cash_to_debt": "_cash_to_debt",
+        "revenue_growth": "_revenue_growth",
+        "pe_ratio": "_pe_ratio",
+        "market_cap": "_market_cap",
+        "quality_score_fundamental": "_pit_quality_score",
+        "value_factor_score": "_pit_value_score",
+    }
+    for public_key, private_key in mapping.items():
+        value = features.get(public_key)
+        if value not in (None, ""):
+            out[private_key] = value
+    if features.get("f_score") is not None:
+        try:
+            out["_f_score"] = int(features["f_score"])
+        except (TypeError, ValueError):
+            pass
+
+
+def _apply_pit_factor_overrides(result: dict, candidate: dict) -> dict:
+    """Prefer PIT-safe Stage 2 factor inputs over live Stage 6 metadata."""
+    for public_key, private_key in _PIT_RESULT_OVERRIDE_MAP.items():
+        value = candidate.get(private_key)
+        if value not in (None, ""):
+            result[public_key] = value
+
+    pit_earnings_yield = safe_float(candidate.get("_pit_earnings_yield"), default=None)
+    pit_pe_ratio = safe_float(candidate.get("_pe_ratio"), default=None)
+    if pit_pe_ratio is None and pit_earnings_yield is not None and pit_earnings_yield > 0:
+        result["pe_ratio"] = 1.0 / pit_earnings_yield
+
+    f_score = safe_float(result.get("f_score"), default=None)
+    if f_score is not None:
+        result["f_score_score"] = float(np.clip((f_score - 4.5) / 3.0, -1.0, 1.0))
+        result["f_score_gate"] = bool(f_score >= 6)
+
+    gpa = safe_float(result.get("gpa"), default=None)
+    if gpa is not None:
+        result["gross_profitability"] = gpa
+        result["_gross_profitability"] = gpa
+        result["gpa_score"] = float(np.clip((gpa - 0.30) / 0.20, -1.0, 1.0))
+
+    ebit_yield = safe_float(result.get("ebit_yield"), default=None)
+    if ebit_yield is not None:
+        result["ev_ebit_score"] = float(np.clip((ebit_yield - 0.10) / 0.10, -1.0, 1.0))
+    return result
+
+
 def _pit_snapshot_to_info(
     ticker: str,
     candidate: dict,
@@ -569,6 +680,7 @@ def _pit_snapshot_to_info(
 def _compute_stage2_factor_metrics(ticker: str, candidate: dict, momentum_metrics: dict) -> dict:
     """Cached, PIT-safe factor sleeves used before expensive Stage 6 analysis."""
     latest, prior, report_date = _pit_latest_and_prior(ticker)
+    replay_like_features = _current_replay_like_fundamental_features(ticker, candidate)
     coverage = 0.0
     out: dict = {
         "_pit_report_date": report_date,
@@ -653,6 +765,7 @@ def _compute_stage2_factor_metrics(ticker: str, candidate: dict, momentum_metric
         out["_pit_quality_score"] = float(np.clip(np.mean(quality_components), -1.0, 1.0))
     if value_components:
         out["_pit_value_score"] = float(np.clip(np.mean(value_components), -1.0, 1.0))
+    _apply_replay_like_stage2_features(out, replay_like_features)
 
     beta = safe_float(momentum_metrics.get("_beta"), default=None)
     vol = safe_float(momentum_metrics.get("_vol_20d"), default=None)
@@ -2556,6 +2669,7 @@ class ScoredCandidate:
     quality_score_fundamental: float = 0.0
     gross_profitability: float | None = None
     fcf_to_assets: float | None = None
+    fcf_yield: float | None = None
     earnings_stability: float | None = None
     eps_growth_variance_5y: float | None = None
     qmj_factor_score: float | None = None
@@ -4411,12 +4525,12 @@ def _stage_quick_rank(
                 logger.debug("QMJ quality failed for %s: %s", symbol, _qe)
                 qmj_score, qmj_details = 0.0, {}
             quality_score = qmj_score
-            c["_quality_score"] = quality_score
-            c["_quality_score_fundamental"] = qmj_score
-            c["_gross_profitability"] = qmj_details.get("gross_profitability")
-            c["_fcf_to_assets"] = qmj_details.get("fcf_to_assets")
-            c["_earnings_stability"] = qmj_details.get("earnings_stability")
-            c["_eps_growth_variance_5y"] = qmj_details.get("eps_growth_variance_5y")
+            _fill_missing_candidate_field(c, "_quality_score", quality_score)
+            _fill_missing_candidate_field(c, "_quality_score_fundamental", qmj_score)
+            _fill_missing_candidate_field(c, "_gross_profitability", qmj_details.get("gross_profitability"))
+            _fill_missing_candidate_field(c, "_fcf_to_assets", qmj_details.get("fcf_to_assets"))
+            _fill_missing_candidate_field(c, "_earnings_stability", qmj_details.get("earnings_stability"))
+            _fill_missing_candidate_field(c, "_eps_growth_variance_5y", qmj_details.get("eps_growth_variance_5y"))
             fundamental_bonus += 0.12 * qmj_score
 
             pe = _sf(info.get("trailingPE")) or _sf(info.get("forwardPE"))
@@ -4427,7 +4541,7 @@ def _stage_quick_rank(
                     fundamental_bonus += 0.05
                 elif pe > 60:
                     fundamental_bonus -= 0.05
-                c["_pe_ratio"] = pe
+                _fill_missing_candidate_field(c, "_pe_ratio", pe)
 
             eg = _sf(info.get("earningsGrowth"))
             if eg is not None:
@@ -4826,37 +4940,11 @@ def _stage_full_scoring(
         result["_fcf_to_assets"] = c.get("_fcf_to_assets")
         result["_earnings_stability"] = c.get("_earnings_stability")
         result["_eps_growth_variance_5y"] = c.get("_eps_growth_variance_5y")
-        # Stage 5 carries PIT-safe quality/value evidence. Preserve it when
-        # the slower Stage 6 fundamental component times out or returns sparse
-        # data, otherwise the ready contract treats known values as missing.
-        pit_fallbacks = {
-            "f_score": "_f_score",
-            "f_score_coverage": "_f_score_coverage",
-            "gpa": "_gpa",
-            "gross_profitability": "_gross_profitability",
-            "fcf_to_assets": "_fcf_to_assets",
-            "fcf_yield": "_fcf_yield",
-            "ev_ebit": "_ev_ebit",
-            "ebit_yield": "_pit_ebit_yield",
-            "net_debt_ebitda": "_net_debt_ebitda",
-            "cash_to_debt": "_cash_to_debt",
-            "revenue_growth": "_revenue_growth",
-            "pe_ratio": "_pe_ratio",
-            "market_cap": "_market_cap",
-        }
-        for public_key, private_key in pit_fallbacks.items():
-            if result.get(public_key) in (None, "") and c.get(private_key) not in (None, ""):
-                result[public_key] = c.get(private_key)
-        pit_f_cov = safe_float(c.get("_f_score_coverage"), default=None)
-        res_f_cov = safe_float(result.get("f_score_coverage"), default=0.0)
-        if pit_f_cov is not None and pit_f_cov > max(res_f_cov or 0.0, 0.0):
-            result["f_score_coverage"] = pit_f_cov
-        if result.get("gpa_score") in (None, "") and result.get("gpa") not in (None, ""):
-            result["gpa_score"] = float(np.clip((safe_float(result.get("gpa"), default=0.0) - 0.25) / 0.20, -1.0, 1.0))
-        if result.get("f_score_score") in (None, "") and result.get("f_score") not in (None, ""):
-            result["f_score_score"] = float(np.clip((safe_float(result.get("f_score"), default=4.5) - 4.5) / 3.0, -1.0, 1.0))
-        if result.get("quality_score_fundamental") in (None, "") and c.get("_pit_quality_score") is not None:
-            result["quality_score_fundamental"] = c.get("_pit_quality_score")
+        # Stage 5 carries PIT-safe quality/value evidence. Make it
+        # authoritative for ML/gate factor inputs so live rows and replay rows
+        # use the same as-of definitions; Stage 6 still fills fields with no
+        # PIT surrogate.
+        _apply_pit_factor_overrides(result, c)
         return result
 
     def _fallback_scored_item(item: dict, reason: str) -> dict:
@@ -5986,14 +6074,19 @@ def _stage_final_ranking(
                 else r.get("_quality_score_fundamental", 0.0)
             ),
             gross_profitability=(
-                r.get("gross_profitability")
-                if r.get("gross_profitability") is not None
-                else r.get("_gross_profitability")
+                r.get("_gross_profitability")
+                if r.get("_gross_profitability") is not None
+                else r.get("gross_profitability")
             ),
             fcf_to_assets=(
-                r.get("fcf_to_assets")
-                if r.get("fcf_to_assets") is not None
-                else r.get("_fcf_to_assets")
+                r.get("_fcf_to_assets")
+                if r.get("_fcf_to_assets") is not None
+                else r.get("fcf_to_assets")
+            ),
+            fcf_yield=(
+                r.get("_fcf_yield")
+                if r.get("_fcf_yield") is not None
+                else r.get("fcf_yield")
             ),
             earnings_stability=(
                 r.get("earnings_stability")

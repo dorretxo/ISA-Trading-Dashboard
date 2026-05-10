@@ -373,6 +373,12 @@ REPLAY_LIVE_PARITY_FIELD_TOLERANCES = {
 REPLAY_LIVE_PARITY_ADAPTIVE_FIELDS = [
     "technical_score", "return_10d_prior", "return_30d_prior", "return_90d_prior", "vol_20d",
 ]
+REPLAY_LIVE_PARITY_READINESS_FIELDS = [
+    # Execution-timing fields are not alpha-ranker features.  Keep them in
+    # the report so readiness-model work remains measurable without blocking
+    # the current forward-return model on a separate contract.
+    "fill_probability", "r_r_ratio", "strong_buy_eligible",
+]
 READY_ENTRY_NEAR_HIGH_PULLBACK_RET30 = 0.12
 READY_ENTRY_NEAR_HIGH_MIN_UPSIDE = 8.0
 
@@ -892,7 +898,7 @@ ML_RANKER_PARITY_MAX_CRITICAL_MISSING_RATIO = 0.15
 ML_RANKER_PARITY_CRITICAL_FIELDS = [
     "quality_factor_score", "value_factor_score", "momentum_factor_score",
     "return_10d_prior", "return_30d_prior", "return_90d_prior", "vol_20d",
-    "f_score", "gpa", "institutional_prior_score", "r_r_ratio", "strong_buy_eligible",
+    "f_score", "gpa", "institutional_prior_score",
 ]
 ML_RANKER_EMBARGO_DAYS = 30                 # Purge overlapping 30d target windows
 ML_RANKER_MIN_TRAIN_SAMPLES = 80

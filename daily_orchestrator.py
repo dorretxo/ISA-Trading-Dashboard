@@ -578,7 +578,11 @@ def _write_replay_live_parity_report(candidates: list[dict]) -> None:
             valid = {str(row[1]) for row in conn.execute("PRAGMA table_info(signal_backtest)").fetchall()}
             compare_fields = comparable_fields(fields, valid)
             adaptive_fields = adaptive_weight_fields(valid)
-            select_fields = sorted(set(compare_fields) | set(adaptive_fields))
+            readiness_fields = comparable_fields(
+                getattr(config, "REPLAY_LIVE_PARITY_READINESS_FIELDS", ()),
+                valid,
+            )
+            select_fields = sorted(set(compare_fields) | set(adaptive_fields) | set(readiness_fields))
             select_cols = ["ticker", "run_date", "source"] + select_fields
             for ticker in tickers:
                 live = conn.execute(
@@ -655,6 +659,12 @@ def _write_replay_live_parity_report(candidates: list[dict]) -> None:
                     adaptive_fields,
                     default_tolerance=tolerance,
                 )
+                readiness_compare = compare_parity_rows(
+                    live_d,
+                    replay_d,
+                    readiness_fields,
+                    default_tolerance=tolerance,
+                )
                 rows_out.append({
                     "ticker": ticker,
                     "available": True,
@@ -663,10 +673,12 @@ def _write_replay_live_parity_report(candidates: list[dict]) -> None:
                     "date_gap_days": date_gap_days,
                     "drift_fields": drift_fields,
                     "adaptive_weight_drift_fields": adaptive_compare["drift_fields"],
+                    "readiness_drift_fields": readiness_compare["drift_fields"],
                     "live_missing_fields": live_missing_fields,
                     "replay_missing_fields": replay_missing_fields,
                     "comparisons": comparisons,
                     "adaptive_weight_comparisons": adaptive_compare["comparisons"],
+                    "readiness_comparisons": readiness_compare["comparisons"],
                 })
     except Exception as exc:
         atomic_write_json(
@@ -686,6 +698,10 @@ def _write_replay_live_parity_report(candidates: list[dict]) -> None:
     adaptive_missing_counts: Counter[str] = Counter()
     adaptive_live_missing_counts: Counter[str] = Counter()
     adaptive_replay_missing_counts: Counter[str] = Counter()
+    readiness_drift_counts: Counter[str] = Counter()
+    readiness_missing_counts: Counter[str] = Counter()
+    readiness_live_missing_counts: Counter[str] = Counter()
+    readiness_replay_missing_counts: Counter[str] = Counter()
     for row in available_rows:
         for field in row.get("adaptive_weight_drift_fields") or []:
             adaptive_drift_counts[field] += 1
@@ -699,7 +715,20 @@ def _write_replay_live_parity_report(candidates: list[dict]) -> None:
                 adaptive_live_missing_counts[field] += 1
             if comp.get("replay") is None:
                 adaptive_replay_missing_counts[field] += 1
+        for field in row.get("readiness_drift_fields") or []:
+            readiness_drift_counts[field] += 1
+        readiness_comparisons = row.get("readiness_comparisons") or []
+        for comp in readiness_comparisons:
+            if comp.get("status") != "missing":
+                continue
+            field = comp.get("field")
+            readiness_missing_counts[field] += 1
+            if comp.get("live") is None:
+                readiness_live_missing_counts[field] += 1
+            if comp.get("replay") is None:
+                readiness_replay_missing_counts[field] += 1
     adaptive_drifted = [row for row in available_rows if row.get("adaptive_weight_drift_fields")]
+    readiness_drifted = [row for row in available_rows if row.get("readiness_drift_fields")]
     adaptive_weight_parity = {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "available": True,
@@ -716,6 +745,23 @@ def _write_replay_live_parity_report(candidates: list[dict]) -> None:
         "missing_field_counts": dict(adaptive_missing_counts),
         "live_missing_field_counts": dict(adaptive_live_missing_counts),
         "replay_missing_field_counts": dict(adaptive_replay_missing_counts),
+    }
+    readiness_parity = {
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "available": True,
+        "comparison_scope": "readiness_execution_fields",
+        "fields": readiness_fields if "readiness_fields" in locals() else [],
+        "tolerance": tolerance,
+        "sample": len(tickers),
+        "available_pairs": len(available_rows),
+        "missing_replay": missing_replay,
+        "stale_replay": stale_replay,
+        "max_date_gap_days": max_date_gap_days,
+        "drifted_tickers": len(readiness_drifted),
+        "drift_field_counts": dict(readiness_drift_counts),
+        "missing_field_counts": dict(readiness_missing_counts),
+        "live_missing_field_counts": dict(readiness_live_missing_counts),
+        "replay_missing_field_counts": dict(readiness_replay_missing_counts),
     }
     payload = {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
@@ -734,6 +780,7 @@ def _write_replay_live_parity_report(candidates: list[dict]) -> None:
         "live_missing_field_counts": dict(live_missing_counts),
         "replay_missing_field_counts": dict(replay_missing_counts),
         "adaptive_weight_parity": adaptive_weight_parity,
+        "readiness_parity": readiness_parity,
         "top_drifted": sorted(
             drifted,
             key=lambda row: len(row.get("drift_fields") or []),

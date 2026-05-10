@@ -456,10 +456,10 @@ def analyse_holding(holding: dict) -> dict:
             # Replace the action label only if the smoother changed it
             if smoothed.action != action:
                 _logger.info(
-                    "Exit smoother: %s %s → %s (reason=%s, score=%.3f, σ=%s, vix_pct=%.0f)",
+                    "Exit smoother: %s %s -> %s (reason=%s, score=%.3f, sigma=%s, vix_pct=%.0f)",
                     ticker, action, smoothed.action, smoothed.reason,
                     aggregate_score,
-                    f"{score_vol:.3f}" if score_vol is not None else "—",
+                    f"{score_vol:.3f}" if score_vol is not None else "n/a",
                     vix_pct,
                 )
                 action = smoothed.action
