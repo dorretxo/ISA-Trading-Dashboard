@@ -169,10 +169,10 @@ def compute_fundamental_quality_metrics(
             for key in component_scores
         ) / total_weight
     else:
-        quality_score = 0.0
+        quality_score = None
 
     return {
-        "quality_score": float(np.clip(quality_score, -1.0, 1.0)),
+        "quality_score": None if quality_score is None else float(np.clip(quality_score, -1.0, 1.0)),
         "gross_profitability": gross_profitability,
         "roe": roe,
         "fcf_to_assets": fcf_to_assets,
@@ -708,17 +708,49 @@ def compute_factor_scores_from_result(result: dict) -> dict[str, float | None]:
     residual_mom = _first_valid(result.get("residual_momentum_score"), result.get("_residual_momentum_score"))
     idio_vol = _first_valid(result.get("idiosyncratic_vol_score"), result.get("_idiosyncratic_vol_score"))
 
-    qmj_components: list[float] = []
-    for q in (
-        quality_score,
-        gpa_score,
-        f_score_score,
-        _first_valid(result.get("earnings_stability"), result.get("_earnings_stability")),
-        leverage,
-    ):
-        if q is not None:
-            qmj_components.append(float(np.clip(q, -1.0, 1.0)))
-    qmj_factor_score = float(np.mean(qmj_components)) if qmj_components else None
+    if getattr(config, "QMJ_LITE_ENABLED", True):
+        gp_anchor = _first_valid(
+            gpa_score,
+            result.get("gpa"),
+            result.get("gross_profitability"),
+            result.get("_gross_profitability"),
+        )
+        profitability = None
+        if gp_anchor is not None:
+            if gp_anchor == gpa_score:
+                profitability = float(np.clip(gp_anchor, -1.0, 1.0))
+            else:
+                profitability = float(np.clip((gp_anchor - 0.30) / 0.20, -1.0, 1.0))
+
+        safety_vals = [
+            _first_valid(result.get("earnings_stability"), result.get("_earnings_stability")),
+            leverage,
+        ]
+        safety_parts = [float(np.clip(x, -1.0, 1.0)) for x in safety_vals if x is not None]
+        safety = float(np.mean(safety_parts)) if safety_parts else None
+
+        qmj_components = [
+            x for x in (
+                profitability,
+                None if f_score_score is None else float(np.clip(f_score_score, -1.0, 1.0)),
+                safety,
+            )
+            if x is not None
+        ]
+        qmj_min_components = int(getattr(config, "QMJ_LITE_MIN_COMPONENTS", 2))
+        qmj_factor_score = float(np.mean(qmj_components)) if len(qmj_components) >= qmj_min_components else None
+    else:
+        qmj_components = []
+        for q in (
+            quality_score,
+            gpa_score,
+            f_score_score,
+            _first_valid(result.get("earnings_stability"), result.get("_earnings_stability")),
+            leverage,
+        ):
+            if q is not None:
+                qmj_components.append(float(np.clip(q, -1.0, 1.0)))
+        qmj_factor_score = float(np.mean(qmj_components)) if qmj_components else None
 
     bab_context = dict(result)
     if volatility_score is not None:
@@ -735,6 +767,7 @@ def compute_factor_scores_from_result(result: dict) -> dict[str, float | None]:
     return {
         "quality_factor_score": None if quality_score is None else float(np.clip(quality_score, -1.0, 1.0)),
         "qmj_factor_score": None if qmj_factor_score is None else float(np.clip(qmj_factor_score, -1.0, 1.0)),
+        "qmj_component_count": len(qmj_components),
         "value_factor_score": value_score,
         "momentum_factor_score": float(np.clip(momentum_score, -1.0, 1.0)),
         "volatility_factor_score": 0.0 if volatility_score is None else volatility_score,

@@ -34,6 +34,12 @@ class QuantFactorTests(unittest.TestCase):
         self.assertIsNotNone(metrics["eps_growth_variance_5y"])
         self.assertGreater(metrics["quality_score"], 0.0)
 
+    def test_fundamental_quality_metrics_empty_is_unknown_not_zero(self):
+        metrics = compute_fundamental_quality_metrics({})
+
+        self.assertIsNone(metrics["quality_score"])
+        self.assertEqual(metrics["component_count"], 0)
+
     def test_confidence_adjustment_uses_floor_and_cross_sectional_mean(self):
         adjusted, effective = adjust_alpha_for_confidence(
             alpha=1.0,
@@ -63,6 +69,23 @@ class QuantFactorTests(unittest.TestCase):
         self.assertIn("qmj_factor_score", scores)
         self.assertIn("bab_factor_score", scores)
         self.assertIn("turnover_cost_score", scores)
+
+    def test_qmj_lite_requires_multiple_non_overlapping_components(self):
+        sparse = compute_factor_scores_from_result({"gpa_score": 0.7})
+        self.assertIsNone(sparse["qmj_factor_score"])
+        self.assertEqual(sparse["qmj_component_count"], 1)
+
+        composite_only = compute_factor_scores_from_result({"quality_score_fundamental": 0.9})
+        self.assertIsNone(composite_only["qmj_factor_score"])
+        self.assertEqual(composite_only["qmj_component_count"], 0)
+
+        enough = compute_factor_scores_from_result({
+            "gpa_score": 0.7,
+            "f_score_score": 0.5,
+            "earnings_stability": 0.3,
+        })
+        self.assertIsNotNone(enough["qmj_factor_score"])
+        self.assertGreaterEqual(enough["qmj_component_count"], 2)
 
     def test_bab_and_turnover_scores_reward_lower_risk_liquid_names(self):
         scores = compute_factor_scores_from_result(

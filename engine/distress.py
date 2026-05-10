@@ -20,6 +20,8 @@ from __future__ import annotations
 import logging
 import math
 from dataclasses import dataclass, field
+
+from engine.fscore_utils import f_score_min_coverage, normalize_f_score_coverage
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -438,9 +440,9 @@ def evaluate_distress_gates(
 
     # Piotroski F-Score
     f = _f(f_score)
-    fcov = _f(f_score_coverage) or 0.0
-    fcov_min = float(getattr(cfg, "F_SCORE_GATE_MIN_COVERAGE", 6.0 / 9.0))
-    if f is not None and fcov >= fcov_min:
+    fcov = normalize_f_score_coverage(f_score_coverage)
+    fcov_min = f_score_min_coverage(cfg)
+    if f is not None and fcov is not None and fcov >= fcov_min:
         f_strong = float(getattr(cfg, "F_SCORE_STRONG_BUY_MIN", 6))
         f_buy = float(getattr(cfg, "F_SCORE_BUY_MIN", 5))
         if f < f_buy:

@@ -30,6 +30,8 @@ import math
 from typing import Iterable, Mapping
 
 import numpy as np
+
+from engine.fscore_utils import f_score_min_coverage
 import pandas as pd
 
 logger = logging.getLogger(__name__)
@@ -246,7 +248,7 @@ def compute_piotroski_f_score(
     if not latest:
         return {
             "f_score": None,
-            "f_score_coverage": 0.0,
+            "f_score_coverage": None,
             "f_score_gate": False,
             "checks": {},
             "f_score_score": None,
@@ -260,7 +262,7 @@ def compute_piotroski_f_score(
     scaled = _clip((passed - 4.5) / 3.0)
 
     # Gate requires decent coverage (≥6 answered checks) and ≥6 passes
-    gate = coverage >= 6 / 9 and passed >= 6
+    gate = coverage >= f_score_min_coverage() and passed >= 6
 
     return {
         "f_score": int(passed),
@@ -645,7 +647,7 @@ def compute_ttm_piotroski_f_score(
     ):
         return {
             "f_score": None,
-            "f_score_coverage": 0.0,
+            "f_score_coverage": None,
             "f_score_gate": False,
             "checks": {},
             "f_score_score": None,
@@ -667,7 +669,7 @@ def compute_ttm_piotroski_f_score(
     if latest is None:
         return {
             "f_score": None,
-            "f_score_coverage": 0.0,
+            "f_score_coverage": None,
             "f_score_gate": False,
             "checks": {},
             "f_score_score": None,

@@ -40,6 +40,10 @@ def _strictest(*labels: str) -> str:
     return min(labels, key=lambda x: _RANK.get(x, 4))
 
 
+def _cap_action(current: str, candidate: str) -> str:
+    return candidate if _RANK.get(candidate, 4) < _RANK.get(current, 4) else current
+
+
 def _f(value: Any) -> float | None:
     try:
         num = float(value)
@@ -111,6 +115,31 @@ class GateContext:
     sector_median_ev_ebit: dict = field(default_factory=dict)
     qmj_percentiles: dict = field(default_factory=dict)        # ticker -> percentile [0,1]
     gpa_percentiles: dict = field(default_factory=dict)
+
+
+def _fundamental_coverage_gate(t1, t3, *, config_module=None) -> tuple[str | None, str | None]:
+    """Return a cap/reason when all core quality evidence is unevaluable."""
+    cfg = config_module
+    if cfg is None:
+        import config as cfg    # type: ignore[no-redef]
+
+    if not getattr(cfg, "FUNDAMENTAL_COVERAGE_GATE_ENABLED", True):
+        return None, None
+
+    checks: list[bool] = [t1.flags.get("f_score") == "skip"]
+    if getattr(cfg, "GPA_GATE_ENABLED", True):
+        checks.append(t3.flags.get("gpa_pctile") == "skip")
+    if getattr(cfg, "QMJ_GATE_ENABLED", True):
+        checks.append(t3.flags.get("qmj_pctile") == "skip")
+    if getattr(cfg, "ROIC_WACC_GATE_ENABLED", True):
+        checks.append(t3.flags.get("roic_wacc") == "skip")
+
+    if checks and all(checks):
+        cap = str(getattr(cfg, "FUNDAMENTAL_COVERAGE_FAIL_CAP", "BUY") or "BUY").upper()
+        if cap not in _RANK:
+            cap = "BUY"
+        return cap, "All core fundamental quality gates unevaluable"
+    return None, None
 
 
 def _sector_aware_percentiles(
@@ -258,6 +287,13 @@ def evaluate_candidate(candidate: Any, *, context: GateContext, config_module=No
     for r in (t1, t2, t3, t4):
         reasons.extend(r.reasons)
         flags.update(r.flags)
+
+    coverage_cap, coverage_reason = _fundamental_coverage_gate(t1, t3, config_module=cfg)
+    if coverage_cap is not None:
+        ceiling = _cap_action(ceiling, coverage_cap)
+        flags["fundamental_coverage"] = "fail"
+        if coverage_reason:
+            reasons.append(coverage_reason)
 
     # Limit-price suggestion when momentum gates demand a pullback
     limit_price = None

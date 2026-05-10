@@ -16,6 +16,7 @@ import numpy as np
 
 import config
 from engine.factors import cross_sectional_zscore
+from engine.fscore_utils import is_f_score_actionable
 
 SLEEVE_NAMES = ("quality", "momentum", "value", "low_risk", "pead", "ready")
 
@@ -103,14 +104,14 @@ def _raw_sleeves(candidate: Mapping, feature_cache: Mapping[str, Mapping]) -> tu
     ])
 
     f_score = _float(candidate.get("_f_score", candidate.get("f_score")))
-    f_cov = _float(candidate.get("_f_score_coverage", candidate.get("f_score_coverage")), 0.0) or 0.0
+    f_cov = candidate.get("_f_score_coverage", candidate.get("f_score_coverage"))
     quality, quality_cov = _bounded_mean([
         _pm1(candidate.get("_quality_score")),
         _pm1(candidate.get("quality_factor_score")),
         _pm1(candidate.get("qmj_factor_score")),
         _clip(candidate.get("_pit_quality_score")),
         _pm1(candidate.get("gpa_score")),
-        _clip((f_score - 4.5) / 4.5) if f_score is not None and f_cov >= 0.45 else None,
+        _clip((f_score - 4.5) / 4.5) if is_f_score_actionable(f_score, f_cov, config_module=config) else None,
         _low_better(candidate.get("debt_to_assets", candidate.get("_debt_to_assets")), 0.15, 0.70),
     ])
 

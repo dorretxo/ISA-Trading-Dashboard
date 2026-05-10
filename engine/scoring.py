@@ -7,6 +7,7 @@ import time
 
 import config
 from engine import technical, fundamental, sentiment, stops
+from engine.fscore_utils import is_f_score_actionable, normalize_f_score_coverage
 from engine.forecasting import forecast_dual_horizon
 from engine.regime import get_regime_adjusted_weights
 from utils.data_fetch import get_current_price, get_daily_change
@@ -379,10 +380,10 @@ def analyse_holding(holding: dict) -> dict:
     if getattr(config, "F_SCORE_GATE_ENABLED", False):
         _fs_raw = fund.get("f_score")
         _fs = safe_float(_fs_raw, default=None)
-        _fs_cov = safe_float(fund.get("f_score_coverage"), default=0.0)
+        _fs_cov = normalize_f_score_coverage(fund.get("f_score_coverage"))
         if (
             _fs is not None
-            and _fs_cov >= 6.0 / 9.0
+            and is_f_score_actionable(_fs, _fs_cov, config_module=config)
             and _fs <= 3
             and action in ("STRONG BUY", "BUY")
         ):
@@ -539,7 +540,7 @@ def analyse_holding(holding: dict) -> dict:
         "profit_margin": fund.get("profit_margin"),
         "roe": fund.get("roe"),
         "fcf_yield": fund.get("fcf_yield"),
-        "quality_score_fundamental": fund.get("quality_score_fundamental", 0.0),
+        "quality_score_fundamental": fund.get("quality_score_fundamental"),
         "gross_profitability": fund.get("gross_profitability"),
         # Enterprise-grade factor bundle (roadmap items #1, #2)
         "enterprise_value": fund.get("enterprise_value"),
@@ -552,7 +553,7 @@ def analyse_holding(holding: dict) -> dict:
         "f_score": fund.get("f_score"),
         "f_score_gate": fund.get("f_score_gate", False),
         "f_score_score": fund.get("f_score_score"),
-        "f_score_coverage": fund.get("f_score_coverage", 0.0),
+        "f_score_coverage": fund.get("f_score_coverage"),
         "fcf_to_assets": fund.get("fcf_to_assets"),
         "earnings_stability": fund.get("earnings_stability"),
         "eps_growth_variance_5y": fund.get("eps_growth_variance_5y"),

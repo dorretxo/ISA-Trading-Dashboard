@@ -45,6 +45,11 @@ from engine.factors import (
     factor_tilt_adjustment,
 )
 from engine.enterprise_factors import compute_piotroski_f_score
+from engine.fscore_utils import (
+    f_score_min_coverage,
+    is_f_score_actionable,
+    normalize_f_score_coverage,
+)
 from engine.institutional_prior import neutral_prior, score_universe
 from utils.atomic_io import atomic_write_json
 from utils import pit_store
@@ -698,10 +703,10 @@ def _compute_stage2_factor_metrics(ticker: str, candidate: dict, momentum_metric
         out["_pit_source"] = pit_source
         f = compute_piotroski_f_score(latest, prior)
         f_score = safe_float(f.get("f_score"), default=None)
-        f_cov = safe_float(f.get("f_score_coverage"), default=0.0)
-        if f_score is not None and f_cov >= 0.45:
+        f_cov = normalize_f_score_coverage(f.get("f_score_coverage"))
+        if is_f_score_actionable(f_score, f_cov, config_module=config):
             quality_components.append(float(np.clip((f_score - 4.5) / 3.0, -1.0, 1.0)))
-            coverage += 0.25 * f_cov
+            coverage += 0.25 * (f_cov or 0.0)
             out["_f_score"] = int(f_score)
             out["_f_score_coverage"] = f_cov
 
@@ -1114,8 +1119,8 @@ def _cheap_quality_score(candidate: dict) -> float:
             score += 0.06
 
     f_score = safe_float(candidate.get("_f_score"), default=None)
-    f_cov = safe_float(candidate.get("_f_score_coverage"), default=0.0)
-    if f_score is not None and f_cov >= 0.45:
+    f_cov = normalize_f_score_coverage(candidate.get("_f_score_coverage"))
+    if is_f_score_actionable(f_score, f_cov, config_module=config):
         if f_score >= 7:
             score += 0.20
         elif f_score >= 6:
@@ -1572,19 +1577,19 @@ def _evaluate_discovery_gates_v2(
     reject = False
     review = False
 
-    min_cov = float(getattr(config, "DISCOVERY_GATES_V2_F_SCORE_MIN_COVERAGE", 6 / 9))
+    min_cov = f_score_min_coverage(config)
     min_f = int(getattr(config, "DISCOVERY_GATES_V2_F_SCORE_MIN", 5))
     min_gpa = float(getattr(config, "DISCOVERY_GATES_V2_GPA_MIN", 0.15))
     max_stretch = float(getattr(config, "DISCOVERY_GATES_V2_MAX_STRETCH", 0.50))
 
     f_score = _optional_int(result.get("f_score"))
-    f_cov = _optional_float(result.get("f_score_coverage")) or 0.0
+    f_cov = normalize_f_score_coverage(result.get("f_score_coverage"))
     gpa = _optional_float(result.get("gpa"))
     ev_ebit = _optional_float(result.get("ev_ebit"))
     fcf_yield = _optional_float(result.get("fcf_yield"))
     revenue_growth = _optional_float(result.get("revenue_growth"))
 
-    if f_score is None or f_cov < min_cov:
+    if f_score is None or (f_cov or 0.0) < min_cov:
         review = True
         reasons.append("F-score missing/low coverage")
     elif f_score < min_f:
@@ -1646,19 +1651,19 @@ def _evaluate_trap_safeguard(
         return False, None
 
     f_score = _optional_int(result.get("f_score"))
-    f_cov = _optional_float(result.get("f_score_coverage")) or 0.0
+    f_cov = normalize_f_score_coverage(result.get("f_score_coverage"))
     max_f = int(getattr(config, "DISCOVERY_TRAP_SAFEGUARD_F_SCORE_MAX", 3))
-    min_cov = float(getattr(config, "DISCOVERY_TRAP_SAFEGUARD_F_SCORE_MIN_COVERAGE", 6 / 9))
+    min_cov = f_score_min_coverage(config)
     gpa = _optional_float(result.get("gpa"))
     max_gpa = float(getattr(config, "DISCOVERY_TRAP_SAFEGUARD_GPA_MAX", 0.15))
 
-    fscore_weak_or_missing = f_score is None or f_cov < min_cov or f_score <= max_f
+    fscore_weak_or_missing = f_score is None or (f_cov or 0.0) < min_cov or f_score <= max_f
     gpa_weak_or_missing = gpa is None or gpa < max_gpa
     if not (fscore_weak_or_missing and gpa_weak_or_missing):
         return False, None
 
     health_bits = []
-    if f_score is None or f_cov < min_cov:
+    if f_score is None or (f_cov or 0.0) < min_cov:
         health_bits.append("F-score unavailable")
     else:
         health_bits.append(f"F-score {f_score}")
@@ -1741,10 +1746,10 @@ def apply_action_label(
     # Piotroski F-score downgrade (gated by config flag).
     if getattr(config, "F_SCORE_GATE_ENABLED", False):
         fs = _optional_float(result.get("f_score"))
-        fs_cov = _optional_float(result.get("f_score_coverage")) or 0.0
+        fs_cov = normalize_f_score_coverage(result.get("f_score_coverage"))
         if (
             fs is not None
-            and fs_cov >= 6.0 / 9.0
+            and is_f_score_actionable(fs, fs_cov, config_module=config)
             and fs <= 3
             and action in ("STRONG BUY", "BUY")
         ):
@@ -2086,26 +2091,34 @@ def _institutional_prior_rank_term(prior, weight: float) -> float:
     return float(weight * score * max(0.0, min(1.0, confidence)))
 
 
-def _zscore_array(values: list[float | None]) -> list[float]:
-    """Cross-sectional z-score with NaN-safe handling and 1-element/zero-std fallbacks."""
+def _zscore_array(
+    values: list[float | None],
+    *,
+    fill_z: float = 0.0,
+    return_imputed: bool = False,
+) -> list[float] | tuple[list[float], list[bool]]:
+    """Cross-sectional z-score with explicit missing-data imputation."""
     arr = np.array(
         [float(v) if v is not None and np.isfinite(float(v)) else np.nan for v in values],
         dtype=float,
     )
     mask = ~np.isnan(arr)
+    imputed = [not bool(m) for m in mask]
     if mask.sum() < 2:
-        return [0.0 for _ in values]
+        out = [0.0 if bool(m) else fill_z for m in mask]
+        return (out, imputed) if return_imputed else out
     mean = float(np.mean(arr[mask]))
     std = float(np.std(arr[mask], ddof=0))
     if std < 1e-9:
-        return [0.0 for _ in values]
+        out = [0.0 if bool(m) else fill_z for m in mask]
+        return (out, imputed) if return_imputed else out
     out = []
     for v in arr:
         if np.isnan(v):
-            out.append(0.0)
+            out.append(fill_z)
         else:
             out.append((float(v) - mean) / std)
-    return out
+    return (out, imputed) if return_imputed else out
 
 
 def compute_strong_buy_scorecard(candidates: list) -> dict[str, float]:
@@ -2116,7 +2129,7 @@ def compute_strong_buy_scorecard(candidates: list) -> dict[str, float]:
     aggregate into a strong one; we keep the trap safeguard as an explicit
     post-veto so commodity-cycle traps still cannot reach STRONG BUY.
 
-    Inputs (all optional — missing values contribute 0 z-score):
+    Inputs (all optional — missing values receive a mild confidence-discounted imputation):
         aggregate_score (40%) — pillar-driven signal
         f_score / 9     (15%) — Piotroski quality
         gpa             (10%) — Novy-Marx 2013 gross profitability
@@ -2147,20 +2160,23 @@ def compute_strong_buy_scorecard(candidates: list) -> dict[str, float]:
 
     # F-score is meaningful only with sufficient coverage.
     fscore_filtered = [
-        (fs / 9.0) if (fs is not None and (fc or 0.0) >= 6.0 / 9.0) else None
+        (fs / 9.0) if is_f_score_actionable(fs, fc, config_module=config) else None
         for fs, fc in zip(fscore, fcov)
     ]
     # Meta probability is already 0..1; use raw.
     meta_clean = [(float(m) if m is not None else None) for m in meta]
 
-    z_agg = _zscore_array(agg)
-    z_fs = _zscore_array(fscore_filtered)
-    z_gpa = _zscore_array(gpa)
-    z_meta = _zscore_array(meta_clean)
-    z_ip = _zscore_array(ip_pct)
-    z_mom = _zscore_array(mom)
-    z_qual = _zscore_array(qual)
-    z_val = _zscore_array(val)
+    impute_missing = bool(getattr(config, "SB_SCORECARD_MISSING_IMPUTATION_ENABLED", True))
+    fill_z = float(getattr(config, "SB_SCORECARD_MISSING_FILL_Z", -0.25)) if impute_missing else 0.0
+    imputed_weight = float(getattr(config, "SB_SCORECARD_IMPUTED_WEIGHT", 0.50)) if impute_missing else 1.0
+    z_agg, imp_agg = _zscore_array(agg, fill_z=fill_z, return_imputed=True)
+    z_fs, imp_fs = _zscore_array(fscore_filtered, fill_z=fill_z, return_imputed=True)
+    z_gpa, imp_gpa = _zscore_array(gpa, fill_z=fill_z, return_imputed=True)
+    z_meta, imp_meta = _zscore_array(meta_clean, fill_z=fill_z, return_imputed=True)
+    z_ip, imp_ip = _zscore_array(ip_pct, fill_z=fill_z, return_imputed=True)
+    z_mom, imp_mom = _zscore_array(mom, fill_z=fill_z, return_imputed=True)
+    z_qual, imp_qual = _zscore_array(qual, fill_z=fill_z, return_imputed=True)
+    z_val, imp_val = _zscore_array(val, fill_z=fill_z, return_imputed=True)
 
     w_agg = float(getattr(config, "SB_SCORECARD_W_AGG", 0.40))
     w_fs = float(getattr(config, "SB_SCORECARD_W_FSCORE", 0.15))
@@ -2178,15 +2194,18 @@ def compute_strong_buy_scorecard(candidates: list) -> dict[str, float]:
         ticker = getattr(c, "ticker", None) or getattr(c, "symbol", None)
         if not ticker:
             continue
+        def _term(weight: float, zvals: list[float], imputed: list[bool]) -> float:
+            return weight * zvals[i] * (imputed_weight if imputed[i] else 1.0)
+
         s = (
-            w_agg * z_agg[i]
-            + w_fs * z_fs[i]
-            + w_gpa * z_gpa[i]
-            + w_meta * z_meta[i]
-            + w_ip * z_ip[i]
-            + w_mom * z_mom[i]
-            + w_qual * z_qual[i]
-            + w_val * z_val[i]
+            _term(w_agg, z_agg, imp_agg)
+            + _term(w_fs, z_fs, imp_fs)
+            + _term(w_gpa, z_gpa, imp_gpa)
+            + _term(w_meta, z_meta, imp_meta)
+            + _term(w_ip, z_ip, imp_ip)
+            + _term(w_mom, z_mom, imp_mom)
+            + _term(w_qual, z_qual, imp_qual)
+            + _term(w_val, z_val, imp_val)
         )
         st = stretch[i]
         if st is not None and float(st) > stretch_threshold:
@@ -2314,7 +2333,7 @@ def _assign_percentile_actions(candidates: list, *, regime: str = "NEUTRAL") -> 
         fscore_block = (
             getattr(config, "F_SCORE_GATE_ENABLED", False)
             and _fscore_val is not None
-            and safe_float(c.f_score_coverage, default=0.0) >= 6.0 / 9.0
+            and is_f_score_actionable(_fscore_val, getattr(c, "f_score_coverage", None), config_module=config)
             and _fscore_val <= 3
         )
 
@@ -2666,7 +2685,7 @@ class ScoredCandidate:
     asymmetric_risk_flag: bool = False
     asymmetric_risk_reason: str | None = None
     # Fundamental quality (Fama-French 2015 / Asness QMJ)
-    quality_score_fundamental: float = 0.0
+    quality_score_fundamental: float | None = None
     gross_profitability: float | None = None
     fcf_to_assets: float | None = None
     fcf_yield: float | None = None
@@ -2689,7 +2708,7 @@ class ScoredCandidate:
     f_score: int | None = None
     f_score_gate: bool = False
     f_score_score: float | None = None
-    f_score_coverage: float = 0.0
+    f_score_coverage: float | None = None
     # Trend anchor — persisted for stretch diagnostics in signal_backtest
     sma_200: float | None = None
     price_vs_sma200_stretch: float | None = None
@@ -4088,10 +4107,10 @@ def _gate_aware_ready_lane_score(candidate: dict) -> float:
             score -= 0.08
 
     f_score = safe_float(candidate.get("_f_score"), default=None)
-    f_cov = safe_float(candidate.get("_f_score_coverage"), default=0.0)
+    f_cov = normalize_f_score_coverage(candidate.get("_f_score_coverage"))
     gpa = safe_float(candidate.get("_gpa"), default=None)
     pit_quality = safe_float(candidate.get("_pit_quality_score"), default=None)
-    if f_score is not None and f_cov >= 0.45:
+    if is_f_score_actionable(f_score, f_cov, config_module=config):
         score += 0.12 if f_score >= 5 else -0.12
     elif f_score is None:
         score -= 0.04
@@ -4131,7 +4150,7 @@ def _gate_aware_ready_lane_score(candidate: dict) -> float:
 
 def _ready_lane_missing_fields(candidate: dict) -> list[str]:
     missing: list[str] = []
-    if candidate.get("_f_score") is None or safe_float(candidate.get("_f_score_coverage"), default=0.0) < 0.45:
+    if not is_f_score_actionable(candidate.get("_f_score"), candidate.get("_f_score_coverage"), config_module=config):
         missing.append("f_score")
     if candidate.get("_gpa") is None:
         missing.append("gpa")
@@ -5689,10 +5708,10 @@ def _stage_final_ranking(
         if getattr(config, "F_SCORE_GATE_ENABLED", False):
             _fs_raw = r.get("f_score")
             _fs = safe_float(_fs_raw, default=None)
-            _fs_cov = safe_float(r.get("f_score_coverage"), default=0.0)
+            _fs_cov = normalize_f_score_coverage(r.get("f_score_coverage"))
             if (
                 _fs is not None
-                and _fs_cov >= 6.0 / 9.0
+                and is_f_score_actionable(_fs, _fs_cov, config_module=config)
                 and _fs <= 3
                 and action in ("STRONG BUY", "BUY")
             ):
@@ -6071,7 +6090,7 @@ def _stage_final_ranking(
             quality_score_fundamental=(
                 r.get("quality_score_fundamental")
                 if r.get("quality_score_fundamental") is not None
-                else r.get("_quality_score_fundamental", 0.0)
+                else r.get("_quality_score_fundamental")
             ),
             gross_profitability=(
                 r.get("_gross_profitability")
@@ -6115,7 +6134,7 @@ def _stage_final_ranking(
             f_score=r.get("f_score"),
             f_score_gate=bool(r.get("f_score_gate", False)),
             f_score_score=r.get("f_score_score"),
-            f_score_coverage=float(r.get("f_score_coverage") or 0.0),
+            f_score_coverage=normalize_f_score_coverage(r.get("f_score_coverage")),
             sma_200=r.get("sma_200"),
             price_vs_sma200_stretch=_stretch_vs_200,
             # Distress / quality-of-earnings — `None` means "no data, skip the

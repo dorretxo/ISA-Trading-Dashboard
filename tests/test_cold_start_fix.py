@@ -56,6 +56,13 @@ def test_zscore_handles_nan_and_none():
     assert abs(out[4]) < 1e-9
 
 
+def test_zscore_can_tag_and_penalize_missing_values():
+    out, imputed = _zscore_array([1.0, None, 5.0], fill_z=-0.25, return_imputed=True)
+
+    assert out[1] == -0.25
+    assert imputed == [False, True, False]
+
+
 def test_zscore_single_finite_value_returns_zero():
     """Less than 2 finite values -> all zeros."""
     out = _zscore_array([None, 5.0, None, None])

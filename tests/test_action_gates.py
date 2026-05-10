@@ -34,7 +34,7 @@ class _Cand:
     altman_z: float | None = None
     beneish_m: float | None = None
     f_score: int | None = None
-    f_score_coverage: float = 1.0
+    f_score_coverage: float | None = 1.0
     accruals_factor_score: float | None = None
     investment_factor_score: float | None = None
     net_debt_ebitda: float | None = None
@@ -327,14 +327,14 @@ def test_apply_action_gates_skipped_when_disabled():
 # manipulator threshold).  This test pins the correct contract.
 # ---------------------------------------------------------------------------
 
-def test_candidate_with_no_distress_data_is_not_downgraded():
+def test_candidate_with_no_distress_data_is_not_downgraded_when_quality_is_evaluable():
     c = _Cand(
         ticker="DARK", sector="Industrials",
-        altman_z=None, beneish_m=None, f_score=None, f_score_coverage=0.0,
+        altman_z=None, beneish_m=None, f_score=None, f_score_coverage=None,
         accruals_factor_score=None, investment_factor_score=None,
         net_debt_ebitda=None,
         ev_ebit=None, ev_sales=None, pe_ratio=None, pe_forward=None,
-        qmj_factor_score=None, gpa=None, roic=None, wacc=None,
+        qmj_factor_score=None, gpa=None, roic=0.14, wacc=0.07,
         op_margin_yoy_delta=None,
         rsi=None, price_vs_sma200_stretch=None, entry_stance="Ready",
     )
@@ -346,3 +346,22 @@ def test_candidate_with_no_distress_data_is_not_downgraded():
     # Every gate should record "skip", never "fail"
     for k, v in c.action_gate_flags.items():
         assert v != "fail", f"Gate '{k}' marked fail despite missing data"
+
+
+def test_all_core_fundamental_quality_missing_caps_strong_buy_to_buy():
+    c = _Cand(
+        ticker="BLIND", sector="Industrials",
+        altman_z=None, beneish_m=None, f_score=None, f_score_coverage=None,
+        accruals_factor_score=None, investment_factor_score=None,
+        net_debt_ebitda=None,
+        ev_ebit=None, ev_sales=None, pe_ratio=None, pe_forward=None,
+        qmj_factor_score=None, gpa=None, roic=None, wacc=None,
+        op_margin_yoy_delta=None,
+        rsi=None, price_vs_sma200_stretch=None, entry_stance="Ready",
+    )
+
+    apply_action_gates([c])
+
+    assert c.action_gate_ceiling == "BUY"
+    assert c.action_gate_flags["fundamental_coverage"] == "fail"
+    assert any("fundamental quality gates unevaluable" in r for r in c.action_gate_reasons)

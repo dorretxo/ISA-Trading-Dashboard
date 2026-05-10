@@ -765,6 +765,7 @@ def analyse(
     # --- Sub-factor 2: QUALITY (30%) ---
     # Gross profitability, ROE, FCF/assets, earnings stability
     quality_score = quality_metrics["quality_score"]
+    quality_score_for_blend = quality_score if quality_score is not None else 0.0
     if quality_metrics.get("gross_profitability") is not None:
         gp = quality_metrics["gross_profitability"]
         if gp >= 0.35:
@@ -870,7 +871,7 @@ def analyse(
     # --- Blend sub-factors ---
     score = (
         0.30 * value_score
-        + 0.30 * quality_score
+        + 0.30 * quality_score_for_blend
         + 0.25 * growth_score
         + 0.15 * inst_score
     )
@@ -995,7 +996,7 @@ def analyse(
         _logger.debug("enterprise_factors bundle failed for %s: %s", ticker, _ef_err)
         _ev_ebit = {"ev_ebit": None, "ev_ebitda": None, "ev_ebit_score": None}
         _gpa = {"gpa": None, "gpa_score": None}
-        _fscore = {"f_score": None, "f_score_gate": False, "f_score_score": None, "f_score_coverage": 0.0}
+        _fscore = {"f_score": None, "f_score_gate": False, "f_score_score": None, "f_score_coverage": None}
 
     # --- Enterprise pillar contribution (coverage-aware) -------------------
     # Average the scores of whichever enterprise factors were computable, so
@@ -1013,7 +1014,8 @@ def analyse(
             )
             if v is not None
         ]
-        if _ent_scores:
+        _min_ent_components = int(getattr(_cfg, "ENTERPRISE_FACTORS_MIN_COMPONENTS", 2))
+        if len(_ent_scores) >= max(1, _min_ent_components):
             _ent_mean = sum(_ent_scores) / len(_ent_scores)
             # Cap contribution at ±_ent_weight so it tilts, never dominates.
             _ent_delta = max(-_ent_weight, min(_ent_weight, _ent_weight * _ent_mean))
@@ -1059,7 +1061,7 @@ def analyse(
         "f_score": _fscore.get("f_score"),
         "f_score_gate": _fscore.get("f_score_gate", False),
         "f_score_score": _fscore.get("f_score_score"),
-        "f_score_coverage": _fscore.get("f_score_coverage", 0.0),
+        "f_score_coverage": _fscore.get("f_score_coverage"),
         "f_score_source": _fscore.get("f_score_source"),
         "gpa_source": _gpa.get("gpa_source"),
         # yfinance metrics
@@ -1145,7 +1147,7 @@ def _empty_result(reason: str) -> dict:
         "analyst_rec": None, "num_analysts": None,
         "revenue_growth": None, "profit_margin": None,
         "roe": None, "fcf_yield": None, "market_cap": None,
-        "quality_score_fundamental": 0.0,
+        "quality_score_fundamental": None,
         "gross_profitability": None,
         "fcf_to_assets": None,
         "earnings_stability": None,

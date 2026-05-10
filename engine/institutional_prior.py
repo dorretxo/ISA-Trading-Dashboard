@@ -15,6 +15,7 @@ from typing import Iterable, Mapping
 import numpy as np
 
 import config
+from engine.fscore_utils import is_f_score_actionable
 
 
 @dataclass(frozen=True)
@@ -135,8 +136,8 @@ def _turnover_capacity_score(row: Mapping) -> float | None:
 def _component_scores(row: Mapping) -> tuple[dict[str, float | None], float]:
     """Return component scores in [-1, +1] plus raw feature coverage."""
     f_score = _float(row.get("f_score"))
-    f_cov = _float(row.get("f_score_coverage"), 0.0) or 0.0
-    if f_score is not None and f_cov >= 6.0 / 9.0:
+    f_cov = row.get("f_score_coverage")
+    if is_f_score_actionable(f_score, f_cov, config_module=config):
         f_score_norm = _clip((f_score - 4.5) / 4.5)
     else:
         f_score_norm = None

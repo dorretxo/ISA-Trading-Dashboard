@@ -193,6 +193,7 @@ ENTERPRISE_FACTORS_ENABLED = True                  # Master toggle
 EV_EBIT_YIELD_ANCHOR = 0.10                        # 10% EBIT/EV is median
 F_SCORE_GATE_ENABLED = True                       # Hard gate on F-score ≥ 6
 F_SCORE_GATE_MIN = 6                               # Piotroski 2000 original cut
+F_SCORE_GATE_MIN_COVERAGE = 6 / 9                  # Must have computed >=6 of 9 components
 FACTOR_SECTOR_NEUTRAL = True                       # Apply sector-neutral z-scoring
 FACTOR_WINSOR_SIGMA = 3.0                          # ±3σ winsorisation
 FACTOR_JS_SHRINKAGE_MAX = 0.40                     # James-Stein max shrinkage
@@ -207,14 +208,14 @@ RESIDUAL_MOMENTUM_TARGET_VOL = 0.12                # Barroso-Santa-Clara target
 DISCOVERY_GATES_V2_ENABLED = False
 DISCOVERY_GATES_V2_SHADOW = True
 DISCOVERY_GATES_V2_F_SCORE_MIN = 5
-DISCOVERY_GATES_V2_F_SCORE_MIN_COVERAGE = 6 / 9
+DISCOVERY_GATES_V2_F_SCORE_MIN_COVERAGE = F_SCORE_GATE_MIN_COVERAGE
 DISCOVERY_GATES_V2_GPA_MIN = 0.15
 DISCOVERY_GATES_V2_MAX_STRETCH = 0.50
 DISCOVERY_GATES_V2_REJECT_RANK_MULTIPLIER = 0.20
 DISCOVERY_TRAP_SAFEGUARD_ENABLED = True
 DISCOVERY_TRAP_SAFEGUARD_MIN_STRETCH = 0.50
 DISCOVERY_TRAP_SAFEGUARD_F_SCORE_MAX = 3
-DISCOVERY_TRAP_SAFEGUARD_F_SCORE_MIN_COVERAGE = 6 / 9
+DISCOVERY_TRAP_SAFEGUARD_F_SCORE_MIN_COVERAGE = F_SCORE_GATE_MIN_COVERAGE
 DISCOVERY_TRAP_SAFEGUARD_GPA_MAX = 0.15
 DISCOVERY_TRAP_SAFEGUARD_RANK_MULTIPLIER = 0.25
 
@@ -405,7 +406,8 @@ BENEISH_M_BUY_MAX = -1.78                # Beneish (1999) original threshold
 
 F_SCORE_STRONG_BUY_MIN = 6               # Piotroski recommended long cut (was: only blocked F<=3)
 F_SCORE_BUY_MIN = 5
-F_SCORE_GATE_MIN_COVERAGE = 6 / 9        # Must have computed >=6 of 9 components
+FUNDAMENTAL_COVERAGE_GATE_ENABLED = True
+FUNDAMENTAL_COVERAGE_FAIL_CAP = "BUY"     # All quality gates unevaluable cannot keep STRONG BUY
 
 ACCRUALS_GATE_ENABLED = True
 ACCRUALS_FACTOR_STRONG_BUY_MIN = -0.60   # accruals_factor_score in [-1,1]; very-negative = high accruals
@@ -434,7 +436,13 @@ ROIC_VS_WACC_STRONG_BUY_MIN_BPS = 200    # Need 200 bps spread for STRONG BUY
 
 QMJ_GATE_ENABLED = True
 QMJ_PCTILE_STRONG_BUY_MIN = 0.50         # QMJ below median blocked
+QMJ_LITE_ENABLED = True
+QMJ_LITE_MIN_COMPONENTS = 2              # Require at least two non-overlapping QMJ dimensions
+ENTERPRISE_FACTORS_MIN_COMPONENTS = 2    # Avoid one-signal dominance in holding fundamentals
 OP_MARGIN_YOY_DELTA_FLOOR_BPS = -150     # Margins compressed > 150 bps demote one label
+SB_SCORECARD_MISSING_IMPUTATION_ENABLED = True
+SB_SCORECARD_MISSING_FILL_Z = -0.25      # Mild penalty for unavailable scorecard components
+SB_SCORECARD_IMPUTED_WEIGHT = 0.50       # Imputed dimensions contribute at half confidence
 
 # Tier 4 — momentum sanity (Wilder 1978; Faber 2007; George-Hwang 2004;
 # Daniel-Moskowitz 2016).

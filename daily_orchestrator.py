@@ -31,6 +31,7 @@ ROOT = Path(__file__).parent
 sys.path.insert(0, str(ROOT))
 
 import config
+from engine.fscore_utils import is_f_score_actionable, normalize_f_score_coverage
 from utils.data_fetch import load_portfolio
 from utils.state_manager import (
     get_cached_discovery,
@@ -933,8 +934,8 @@ def _write_live_run_sanity_report(
 def _candidate_missing_fundamental_fields(candidate: dict) -> list[str]:
     missing: list[str] = []
     f_score = _finite_float(candidate.get("f_score"))
-    f_cov = _finite_float(candidate.get("f_score_coverage")) or 0.0
-    if f_score is None or f_cov < 0.45:
+    f_cov = normalize_f_score_coverage(candidate.get("f_score_coverage"))
+    if not is_f_score_actionable(f_score, f_cov, config_module=config):
         missing.append("f_score")
     if _finite_float(candidate.get("gpa")) is None:
         missing.append("gpa")
@@ -1650,7 +1651,7 @@ def save_discovery_results(disc_result, state: dict) -> int:
             "f_score": getattr(c, "f_score", None),
             "f_score_gate": getattr(c, "f_score_gate", False),
             "f_score_score": getattr(c, "f_score_score", None),
-            "f_score_coverage": getattr(c, "f_score_coverage", 0.0),
+            "f_score_coverage": getattr(c, "f_score_coverage", None),
             # Day-1 quality / self-learning diagnostics
             "institutional_prior_score": getattr(c, "institutional_prior_score", None),
             "institutional_prior_percentile": getattr(c, "institutional_prior_percentile", None),
