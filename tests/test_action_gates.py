@@ -46,6 +46,8 @@ class _Cand:
     eps_growth_3y_cagr: float | None = None
     # Quality
     qmj_factor_score: float | None = None
+    qmj_component_count: int | None = None
+    pit_source: str | None = None
     gpa: float | None = None
     gpa_score: float | None = None
     roic: float | None = None
@@ -348,7 +350,7 @@ def test_candidate_with_no_distress_data_is_not_downgraded_when_quality_is_evalu
         assert v != "fail", f"Gate '{k}' marked fail despite missing data"
 
 
-def test_all_core_fundamental_quality_missing_caps_strong_buy_to_buy():
+def test_all_core_fundamental_quality_missing_caps_fmp_style_to_neutral():
     c = _Cand(
         ticker="BLIND", sector="Industrials",
         altman_z=None, beneish_m=None, f_score=None, f_score_coverage=None,
@@ -362,6 +364,95 @@ def test_all_core_fundamental_quality_missing_caps_strong_buy_to_buy():
 
     apply_action_gates([c])
 
+    assert c.action_gate_ceiling == "NEUTRAL"
+    assert c.action_gate_flags["fundamental_coverage"] == "fail"
+    assert c.action_gate_flags["fundamental_coverage_evidence"] == "fmp_partial"
+    assert any("FMP-style fundamentals missing" in r for r in c.action_gate_reasons)
+
+
+def test_source_aware_non_us_balance_only_quality_caps_to_buy():
+    c = _Cand(
+        ticker="THIN.L", sector="Industrials",
+        pit_source="yfinance_quarterly",
+        qmj_component_count=1,
+        altman_z=None, beneish_m=None, f_score=None, f_score_coverage=None,
+        accruals_factor_score=None, investment_factor_score=None,
+        net_debt_ebitda=None,
+        ev_ebit=None, ev_sales=None, pe_ratio=None, pe_forward=None,
+        qmj_factor_score=None, gpa=0.12, roic=None, wacc=None,
+        op_margin_yoy_delta=None,
+        rsi=None, price_vs_sma200_stretch=None, entry_stance="Ready",
+    )
+
+    apply_action_gates([c])
+
     assert c.action_gate_ceiling == "BUY"
     assert c.action_gate_flags["fundamental_coverage"] == "fail"
-    assert any("fundamental quality gates unevaluable" in r for r in c.action_gate_reasons)
+    assert c.action_gate_flags["fundamental_coverage_evidence"] == "yfinance_balance_only"
+    assert any("Thin yfinance quality evidence" in r for r in c.action_gate_reasons)
+
+
+def test_source_aware_fmp_style_yfinance_balance_only_caps_to_neutral():
+    c = _Cand(
+        ticker="PLAIN", sector="Industrials",
+        pit_source="yfinance_info",
+        qmj_component_count=1,
+        altman_z=None, beneish_m=None, f_score=None, f_score_coverage=None,
+        accruals_factor_score=None, investment_factor_score=None,
+        net_debt_ebitda=None,
+        ev_ebit=None, ev_sales=None, pe_ratio=None, pe_forward=None,
+        qmj_factor_score=None, gpa=0.12, roic=None, wacc=None,
+        op_margin_yoy_delta=None,
+        rsi=None, price_vs_sma200_stretch=None, entry_stance="Ready",
+    )
+
+    apply_action_gates([c])
+
+    assert c.action_gate_ceiling == "NEUTRAL"
+    assert c.action_gate_flags["fundamental_coverage"] == "fail"
+    assert c.action_gate_flags["fundamental_coverage_evidence"] == "yfinance_balance_only"
+
+
+def test_source_aware_non_us_with_two_quality_components_uses_normal_gates():
+    c = _Cand(
+        ticker="COVERED.L", sector="Industrials",
+        pit_source="yfinance_quarterly",
+        qmj_component_count=2,
+        altman_z=None, beneish_m=None, f_score=7, f_score_coverage=1.0,
+        accruals_factor_score=None, investment_factor_score=None,
+        net_debt_ebitda=None,
+        ev_ebit=None, ev_sales=None, pe_ratio=None, pe_forward=None,
+        qmj_factor_score=0.8, gpa=0.45, roic=None, wacc=None,
+        op_margin_yoy_delta=None,
+        rsi=None, price_vs_sma200_stretch=None, entry_stance="Ready",
+    )
+
+    apply_action_gates([c])
+
+    assert c.action_gate_ceiling == "STRONG BUY"
+    assert c.action_gate_flags.get("fundamental_coverage") != "fail"
+    assert c.action_gate_flags["fundamental_coverage_evidence"] == "yfinance_partial"
+
+
+def test_source_aware_gate_can_fall_back_to_legacy_buy_cap():
+    class _Cfg:
+        SOURCE_AWARE_COVERAGE_ENABLED = False
+        FUNDAMENTAL_COVERAGE_GATE_ENABLED = True
+        FUNDAMENTAL_COVERAGE_FAIL_CAP = "BUY"
+
+    c = _Cand(
+        ticker="BLIND", sector="Industrials",
+        altman_z=None, beneish_m=None, f_score=None, f_score_coverage=None,
+        accruals_factor_score=None, investment_factor_score=None,
+        net_debt_ebitda=None,
+        ev_ebit=None, ev_sales=None, pe_ratio=None, pe_forward=None,
+        qmj_factor_score=None, gpa=None, roic=None, wacc=None,
+        op_margin_yoy_delta=None,
+        rsi=None, price_vs_sma200_stretch=None, entry_stance="Ready",
+    )
+
+    apply_action_gates([c], config_module=_Cfg)
+
+    assert c.action_gate_ceiling == "BUY"
+    assert c.action_gate_flags["fundamental_coverage"] == "fail"
+    assert "fundamental_coverage_evidence" not in c.action_gate_flags

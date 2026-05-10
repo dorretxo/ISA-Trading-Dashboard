@@ -17,8 +17,14 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import config
+from engine.coverage_evidence import (
+    classify_evidence,
+    is_fmp_statement_candidate,
+    is_non_us,
+    qmj_usable_components,
+)
 from engine.discovery_backtest import init_backtest_db
-from engine.fscore_utils import f_score_min_coverage, is_f_score_actionable, normalize_f_score_coverage
+from engine.fscore_utils import f_score_min_coverage, normalize_f_score_coverage
 from engine.ml_ranker import FEATURE_COLS
 from engine.paper_trading import _connect
 from utils.atomic_io import atomic_write_json
@@ -74,13 +80,11 @@ def _finite(value) -> float | None:
 
 
 def _is_fmp_statement_candidate(ticker: str) -> bool:
-    symbol = str(ticker or "").upper().strip()
-    return bool(symbol) and "." not in symbol
+    return is_fmp_statement_candidate(ticker)
 
 
 def _is_non_us(ticker: str) -> bool:
-    symbol = str(ticker or "").upper().strip()
-    return "." in symbol
+    return is_non_us(ticker)
 
 
 def _parse_flags(value) -> dict:
@@ -169,16 +173,7 @@ def _coverage_buckets(live: Mapping | None, replay: Mapping | None, *, config_mo
 
 
 def _qmj_lite_component_count(row: Mapping | None, *, config_module=None) -> int:
-    if not row:
-        return 0
-    count = 0
-    if any(_finite(row.get(field)) is not None for field in ("gpa_score", "gpa", "gross_profitability")):
-        count += 1
-    if is_f_score_actionable(row.get("f_score"), row.get("f_score_coverage"), config_module=config_module):
-        count += 1
-    if any(_finite(row.get(field)) is not None for field in ("earnings_stability", "leverage_factor_score")):
-        count += 1
-    return count
+    return qmj_usable_components(row, config_module=config_module)
 
 
 def _threshold_audit_sites() -> list[dict]:
@@ -412,6 +407,7 @@ def build_blocker_breakdown(*, top_n: int | None = None) -> dict:
     field_summary: dict[str, Counter] = defaultdict(Counter)
     category_counts: Counter = Counter()
     bucket_counts: Counter = Counter()
+    evidence_class_counts: Counter = Counter()
     region_summary: dict[str, dict] = {}
     source_summary: dict[str, dict] = {}
     threshold_audit = _threshold_audit_sites()
@@ -422,7 +418,8 @@ def build_blocker_breakdown(*, top_n: int | None = None) -> dict:
             "id", "ticker", "run_date", "source", "action", "exchange", "sector",
             "action_gate_ceiling", "action_gate_flags_json",
             "f_score", "f_score_coverage", "gpa", "gpa_score", "gross_profitability",
-            "earnings_stability", "qmj_factor_score",
+            "earnings_stability", "qmj_factor_score", "qmj_component_count",
+            "pit_source", "_pit_source",
         }
         select_fields = sorted((set(fields) | extra_fields) & valid)
         holdings_discovery_parity = _build_holdings_discovery_parity(
@@ -440,15 +437,34 @@ def build_blocker_breakdown(*, top_n: int | None = None) -> dict:
             queue_item = queue.get(ticker, {})
             ledger_item = ledger.get(ticker, {})
             recent_unresolved = bool(ledger_item) and not bool(ledger_item.get("last_resolved"))
+            candidate_qmj_components = candidate.get("qmj_component_count")
+            if candidate_qmj_components is None:
+                candidate_qmj_components = qmj_usable_components(candidate, config_module=config)
+            candidate_pit_source = (
+                candidate.get("pit_source")
+                or candidate.get("_pit_source")
+                or (live or {}).get("pit_source")
+                or (live or {}).get("_pit_source")
+            )
+            evidence_class = classify_evidence(
+                ticker=ticker,
+                pit_source=candidate_pit_source,
+                qmj_components=int(candidate_qmj_components or 0),
+            )
 
             if not live or not replay:
-                buckets = []
+                buckets = [evidence_class]
+                evidence_class_counts[evidence_class] += 1
+                bucket_counts.update(buckets)
+                for bucket in buckets:
+                    category_counts[bucket] += 1
                 row = {
                     "ticker": ticker,
                     "paired": False,
                     "reason": "missing live discovery row" if not live else "missing replay_pit_v1 row",
                     "region": region,
                     "source_bucket": source_bucket,
+                    "evidence_class": evidence_class,
                     "blocker_buckets": buckets,
                     "fmp_statement_candidate": fmp_candidate,
                     "non_us": non_us,
@@ -510,6 +526,14 @@ def build_blocker_breakdown(*, top_n: int | None = None) -> dict:
                 buckets.append("qmj_component_count_lt_2")
             if replay_qmj_components < int(getattr(config, "QMJ_LITE_MIN_COMPONENTS", 2)):
                 buckets.append("replay_qmj_component_count_lt_2")
+            row_pit_source = candidate_pit_source or live.get("pit_source") or live.get("_pit_source")
+            evidence_class = classify_evidence(
+                ticker=ticker,
+                pit_source=row_pit_source,
+                qmj_components=live_qmj_components,
+            )
+            evidence_class_counts[evidence_class] += 1
+            buckets.append(evidence_class)
             buckets = sorted(set(buckets))
             bucket_counts.update(buckets)
             for bucket in buckets:
@@ -524,6 +548,7 @@ def build_blocker_breakdown(*, top_n: int | None = None) -> dict:
                 "latest_replay_run": replay.get("run_date"),
                 "region": region,
                 "source_bucket": source_bucket,
+                "evidence_class": evidence_class,
                 "blocker_buckets": buckets,
                 "live_qmj_component_count": live_qmj_components,
                 "replay_qmj_component_count": replay_qmj_components,
@@ -581,6 +606,7 @@ def build_blocker_breakdown(*, top_n: int | None = None) -> dict:
         "sample": len(tickers),
         "categories": dict(category_counts),
         "blocker_buckets": dict(bucket_counts),
+        "evidence_class_summary": dict(evidence_class_counts),
         "region_summary": _serialise_segment_summary(region_summary),
         "source_summary": _serialise_segment_summary(source_summary),
         "threshold_audit": {
@@ -614,6 +640,7 @@ def main() -> None:
         "path": args.path,
         "sample": payload.get("sample"),
         "categories": payload.get("categories"),
+        "evidence_class_summary": payload.get("evidence_class_summary"),
         "top_fields": payload.get("field_summary", [])[:10],
         "top_fmp_targets": [
             {

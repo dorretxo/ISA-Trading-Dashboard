@@ -18,6 +18,12 @@ import math
 from dataclasses import dataclass, field
 from typing import Any, Iterable
 
+from engine.coverage_evidence import (
+    classify_evidence,
+    is_fmp_statement_candidate,
+    is_non_us,
+    qmj_usable_components,
+)
 from engine.distress import evaluate_distress_gates
 from engine.momentum_gates import (
     evaluate_momentum_gates,
@@ -117,7 +123,14 @@ class GateContext:
     gpa_percentiles: dict = field(default_factory=dict)
 
 
-def _fundamental_coverage_gate(t1, t3, *, config_module=None) -> tuple[str | None, str | None]:
+def _fundamental_coverage_gate(
+    t1,
+    t3,
+    *,
+    candidate: Any | None = None,
+    qmj_components: int | None = None,
+    config_module=None,
+) -> tuple[str | None, str | None]:
     """Return a cap/reason when all core quality evidence is unevaluable."""
     cfg = config_module
     if cfg is None:
@@ -134,11 +147,60 @@ def _fundamental_coverage_gate(t1, t3, *, config_module=None) -> tuple[str | Non
     if getattr(cfg, "ROIC_WACC_GATE_ENABLED", True):
         checks.append(t3.flags.get("roic_wacc") == "skip")
 
-    if checks and all(checks):
-        cap = str(getattr(cfg, "FUNDAMENTAL_COVERAGE_FAIL_CAP", "BUY") or "BUY").upper()
+    all_skip = bool(checks and all(checks))
+    if not getattr(cfg, "SOURCE_AWARE_COVERAGE_ENABLED", True):
+        if all_skip:
+            cap = str(getattr(cfg, "FUNDAMENTAL_COVERAGE_FAIL_CAP", "BUY") or "BUY").upper()
+            if cap not in _RANK:
+                cap = "BUY"
+            return cap, "All core fundamental quality gates unevaluable"
+        return None, None
+
+    ticker = str(getattr(candidate, "ticker", "") or "")
+    components = qmj_components
+    if components is None and candidate is not None:
+        components = qmj_usable_components(candidate, config_module=cfg)
+    components = int(components or 0)
+    fmp_candidate = is_fmp_statement_candidate(ticker)
+    non_fmp_source = is_non_us(ticker) or not fmp_candidate
+    evidence_class = classify_evidence(
+        ticker=ticker,
+        pit_source=getattr(candidate, "pit_source", None),
+        qmj_components=components,
+    )
+    non_us_min_components = int(
+        getattr(
+            cfg,
+            "SOURCE_AWARE_NON_US_MIN_QMJ_COMPONENTS",
+            getattr(cfg, "QMJ_LITE_MIN_COMPONENTS", 2),
+        )
+    )
+
+    if evidence_class == "yfinance_balance_only":
+        if fmp_candidate:
+            cap = str(getattr(cfg, "SOURCE_AWARE_US_MISSING_CAP", "NEUTRAL") or "NEUTRAL").upper()
+            if cap not in _RANK:
+                cap = "NEUTRAL"
+        else:
+            cap = str(getattr(cfg, "SOURCE_AWARE_NON_US_THIN_EVIDENCE_CAP", "BUY") or "BUY").upper()
+            if cap not in _RANK:
+                cap = "BUY"
+        source = getattr(candidate, "pit_source", None)
+        return cap, f"Thin yfinance quality evidence (qmj_components={components}, source={source})"
+
+    if non_fmp_source and (all_skip or components < non_us_min_components):
+        cap = str(getattr(cfg, "SOURCE_AWARE_NON_US_THIN_EVIDENCE_CAP", "BUY") or "BUY").upper()
         if cap not in _RANK:
             cap = "BUY"
-        return cap, "All core fundamental quality gates unevaluable"
+        source = getattr(candidate, "pit_source", None)
+        return cap, f"Non-US thin quality evidence (qmj_components={components}, source={source})"
+
+    if all_skip:
+        cap = str(getattr(cfg, "SOURCE_AWARE_US_MISSING_CAP", "NEUTRAL") or "NEUTRAL").upper()
+        if cap not in _RANK:
+            cap = "NEUTRAL"
+        return cap, "FMP-style fundamentals missing despite statement availability"
+
     return None, None
 
 
@@ -288,10 +350,34 @@ def evaluate_candidate(candidate: Any, *, context: GateContext, config_module=No
         reasons.extend(r.reasons)
         flags.update(r.flags)
 
-    coverage_cap, coverage_reason = _fundamental_coverage_gate(t1, t3, config_module=cfg)
+    qmj_component_count = getattr(candidate, "qmj_component_count", None)
+    if qmj_component_count is None:
+        qmj_component_count = qmj_usable_components(candidate, config_module=cfg)
+    if getattr(cfg, "SOURCE_AWARE_COVERAGE_ENABLED", True):
+        flags["fundamental_coverage_evidence"] = classify_evidence(
+            ticker=ticker,
+            pit_source=getattr(candidate, "pit_source", None),
+            qmj_components=int(qmj_component_count or 0),
+        )
+    coverage_cap, coverage_reason = _fundamental_coverage_gate(
+        t1,
+        t3,
+        candidate=candidate,
+        qmj_components=int(qmj_component_count or 0),
+        config_module=cfg,
+    )
     if coverage_cap is not None:
         ceiling = _cap_action(ceiling, coverage_cap)
         flags["fundamental_coverage"] = "fail"
+        if getattr(cfg, "SOURCE_AWARE_COVERAGE_ENABLED", True):
+            flags.setdefault(
+                "fundamental_coverage_evidence",
+                classify_evidence(
+                    ticker=ticker,
+                    pit_source=getattr(candidate, "pit_source", None),
+                    qmj_components=int(qmj_component_count or 0),
+                ),
+            )
         if coverage_reason:
             reasons.append(coverage_reason)
 

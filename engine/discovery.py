@@ -50,6 +50,7 @@ from engine.fscore_utils import (
     is_f_score_actionable,
     normalize_f_score_coverage,
 )
+from engine.coverage_evidence import is_non_us
 from engine.institutional_prior import neutral_prior, score_universe
 from utils.atomic_io import atomic_write_json
 from utils import pit_store
@@ -2692,6 +2693,8 @@ class ScoredCandidate:
     earnings_stability: float | None = None
     eps_growth_variance_5y: float | None = None
     qmj_factor_score: float | None = None
+    qmj_component_count: int | None = None
+    pit_source: str | None = None
     pead_factor_score: float | None = None
     sue_score: float | None = None
     revision_momentum_3m: float | None = None
@@ -5991,6 +5994,10 @@ def _stage_final_ranking(
         r["gate_v2_status"] = _gate_v2_status
         r["gate_v2_reasons"] = list(_gate_v2_reasons or [])
 
+        _pit_source = r.get("_pit_source") or r.get("pit_source")
+        if not _pit_source:
+            _pit_source = "yfinance" if is_non_us(ticker) else "fmp"
+
         candidates.append(ScoredCandidate(
             ticker=ticker,
             name=r.get("name", ticker),
@@ -6118,6 +6125,8 @@ def _stage_final_ranking(
                 else r.get("_eps_growth_variance_5y")
             ),
             qmj_factor_score=factor_scores.get("qmj_factor_score"),
+            qmj_component_count=int(factor_scores.get("qmj_component_count") or 0),
+            pit_source=_pit_source,
             pead_factor_score=factor_scores.get("pead_factor_score"),
             sue_score=factor_scores.get("sue_score"),
             revision_momentum_3m=factor_scores.get("revision_momentum_3m"),

@@ -56,6 +56,29 @@ def test_qmj_lite_component_count_matches_available_dimensions():
     }) == 3
 
 
+def test_evidence_classification_distinguishes_yfinance_balance_only():
+    assert breakdown.classify_evidence(
+        ticker="TELIA.ST",
+        pit_source="yfinance_info",
+        qmj_components=1,
+    ) == "yfinance_balance_only"
+    assert breakdown.classify_evidence(
+        ticker="TELIA.ST",
+        pit_source="yfinance_quarterly",
+        qmj_components=2,
+    ) == "yfinance_partial"
+    assert breakdown.classify_evidence(
+        ticker="AAPL",
+        pit_source="fmp",
+        qmj_components=3,
+    ) == "fmp_full"
+    assert breakdown.classify_evidence(
+        ticker="AAPL",
+        pit_source="fmp",
+        qmj_components=1,
+    ) == "fmp_partial"
+
+
 def test_region_bucket_uses_suffix_and_us_default():
     assert breakdown._region_bucket("BHP.AX") == "Australia"
     assert breakdown._region_bucket("AAPL") == "US"

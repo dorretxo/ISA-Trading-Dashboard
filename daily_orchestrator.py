@@ -1652,6 +1652,8 @@ def save_discovery_results(disc_result, state: dict) -> int:
             "f_score_gate": getattr(c, "f_score_gate", False),
             "f_score_score": getattr(c, "f_score_score", None),
             "f_score_coverage": getattr(c, "f_score_coverage", None),
+            "qmj_component_count": getattr(c, "qmj_component_count", None),
+            "pit_source": getattr(c, "pit_source", None),
             # Day-1 quality / self-learning diagnostics
             "institutional_prior_score": getattr(c, "institutional_prior_score", None),
             "institutional_prior_percentile": getattr(c, "institutional_prior_percentile", None),

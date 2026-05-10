@@ -408,6 +408,10 @@ F_SCORE_STRONG_BUY_MIN = 6               # Piotroski recommended long cut (was: 
 F_SCORE_BUY_MIN = 5
 FUNDAMENTAL_COVERAGE_GATE_ENABLED = True
 FUNDAMENTAL_COVERAGE_FAIL_CAP = "BUY"     # All quality gates unevaluable cannot keep STRONG BUY
+SOURCE_AWARE_COVERAGE_ENABLED = True
+SOURCE_AWARE_NON_US_MIN_QMJ_COMPONENTS = 2      # yfinance-backed global names need at least two QMJ dimensions
+SOURCE_AWARE_NON_US_THIN_EVIDENCE_CAP = "BUY"   # "We do not know enough" -> investable, not execution-grade
+SOURCE_AWARE_US_MISSING_CAP = "NEUTRAL"          # FMP-style missing fundamentals are unusual enough to cap harder
 
 ACCRUALS_GATE_ENABLED = True
 ACCRUALS_FACTOR_STRONG_BUY_MIN = -0.60   # accruals_factor_score in [-1,1]; very-negative = high accruals
