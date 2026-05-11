@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from utils import parity_blocker_breakdown as breakdown
 
 
@@ -136,6 +138,70 @@ def test_non_actionable_evidence_classes_default_when_missing():
         "yfinance_balance_only",
         "no_data",
     }
+
+
+def test_value_factor_drilldown_row_compares_value_components():
+    class DummyConfig:
+        REPLAY_LIVE_PARITY_NON_ACTIONABLE_EVIDENCE_CLASSES = ["yfinance_balance_only"]
+
+    row = breakdown._value_factor_drilldown_row(
+        ticker="ALGM",
+        live={
+            "pit_source": "fmp",
+            "value_factor_score": 0.6,
+            "pe_ratio": 1.0,
+            "fcf_yield": 0.07,
+            "ev_ebit_score": 1.0,
+        },
+        replay={
+            "pit_source": "fmp",
+            "value_factor_score": 0.1,
+            "pe_ratio": None,
+            "fcf_yield": 0.07,
+            "ev_ebit_score": -1.0,
+        },
+        fields=["value_factor_score", "pe_ratio", "fcf_yield", "ev_ebit_score"],
+        evidence_class="fmp_full",
+        source_bucket="fmp_us",
+        region="US",
+        component_drifted=[],
+        live_missing=[],
+        replay_missing=["pe_ratio"],
+        both_missing=[],
+        default_tolerance=0.15,
+        config_module=DummyConfig,
+    )
+
+    assert row["actionable"] is True
+    assert row["comparisons"]["value_factor_score"]["status"] == "drift"
+    assert row["comparisons"]["value_factor_score"]["delta"] > 0.35
+    assert row["comparisons"]["pe_ratio"]["status"] == "missing"
+    assert row["comparisons"]["fcf_yield"]["status"] == "ok"
+    assert row["live_pit_source"] == "fmp"
+    assert row["replay_pit_source"] == "fmp"
+
+
+def test_value_factor_drilldown_marks_non_actionable_evidence():
+    class DummyConfig:
+        REPLAY_LIVE_PARITY_NON_ACTIONABLE_EVIDENCE_CLASSES = ["yfinance_balance_only"]
+
+    row = breakdown._value_factor_drilldown_row(
+        ticker="NOKIA.HE",
+        live={"value_factor_score": 0.6},
+        replay={"value_factor_score": 0.1},
+        fields=["value_factor_score"],
+        evidence_class="yfinance_balance_only",
+        source_bucket="global_non_us",
+        region="Nordics",
+        component_drifted=[],
+        live_missing=[],
+        replay_missing=[],
+        both_missing=[],
+        default_tolerance=0.15,
+        config_module=DummyConfig,
+    )
+
+    assert row["actionable"] is False
 
 
 def test_region_bucket_uses_suffix_and_us_default():

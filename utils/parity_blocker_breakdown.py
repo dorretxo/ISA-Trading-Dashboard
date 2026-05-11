@@ -63,6 +63,17 @@ _COMPONENT_PARITY_FIELDS = (
     "fcf_yield",
     "ev_ebit_score",
 )
+_VALUE_FACTOR_DRILLDOWN_FIELDS = (
+    "value_factor_score",
+    "pe_ratio",
+    "peg_ratio",
+    "fcf_yield",
+    "ev_ebit_score",
+    "pb_score",
+    "ps_score",
+    "ev_ebit",
+    "ebit_yield",
+)
 _F_SCORE_THRESHOLD_AUDIT_FILES = (
     "daily_orchestrator.py",
     "engine/discovery.py",
@@ -295,6 +306,49 @@ def _field_breakdown(comparisons: list[dict]) -> tuple[list[str], list[str], lis
     return live_missing, replay_missing, both_missing, drifted
 
 
+def _comparison_map(comparisons: list[dict]) -> dict[str, dict]:
+    return {str(comp.get("field")): dict(comp) for comp in comparisons}
+
+
+def _value_factor_drilldown_row(
+    *,
+    ticker: str,
+    live: Mapping,
+    replay: Mapping,
+    fields: list[str],
+    evidence_class: str,
+    source_bucket: str,
+    region: str,
+    component_drifted: list[str],
+    live_missing: list[str],
+    replay_missing: list[str],
+    both_missing: list[str],
+    default_tolerance: float,
+    config_module=None,
+) -> dict:
+    cfg = config_module or config
+    compared = compare_parity_rows(
+        live,
+        replay,
+        fields,
+        default_tolerance=default_tolerance,
+    )
+    return {
+        "ticker": ticker,
+        "evidence_class": evidence_class,
+        "source_bucket": source_bucket,
+        "region": region,
+        "actionable": evidence_class not in _non_actionable_evidence_classes(cfg),
+        "live_pit_source": live.get("pit_source") or live.get("_pit_source"),
+        "replay_pit_source": replay.get("pit_source") or replay.get("_pit_source"),
+        "component_drift_fields": component_drifted,
+        "live_missing_fields": live_missing,
+        "replay_missing_fields": replay_missing,
+        "both_missing_fields": both_missing,
+        "comparisons": _comparison_map(compared["comparisons"]),
+    }
+
+
 def _quality_score_source(row: Mapping | None) -> str:
     if not row:
         return "missing_row"
@@ -473,6 +527,7 @@ def build_blocker_breakdown(*, top_n: int | None = None) -> dict:
     critical_fields = set(getattr(config, "ML_RANKER_PARITY_CRITICAL_FIELDS", []) or [])
 
     ticker_rows: list[dict] = []
+    value_factor_drift_rows: list[dict] = []
     field_summary: dict[str, Counter] = defaultdict(Counter)
     field_drift_by_evidence: dict[str, Counter] = defaultdict(Counter)
     component_summary: dict[str, Counter] = defaultdict(Counter)
@@ -493,9 +548,13 @@ def build_blocker_breakdown(*, top_n: int | None = None) -> dict:
             "f_score", "f_score_coverage", "gpa", "gpa_score", "gross_profitability",
             "earnings_stability", "qmj_factor_score", "qmj_component_count",
             "quality_score_fundamental", "fcf_yield", "ev_ebit", "ev_ebit_score",
-            "ebit_yield", "fcf_to_assets", "roe", "pit_source", "_pit_source",
+            "ebit_yield", "fcf_to_assets", "peg_ratio", "pb_score", "ps_score",
+            "roe", "pit_source", "_pit_source",
         }
         select_fields = sorted((set(fields) | extra_fields) & valid)
+        # Drilldown is explanatory, so include value inputs even when they are
+        # excluded from headline parity counts (for example peg_ratio).
+        value_drilldown_fields = [field for field in _VALUE_FACTOR_DRILLDOWN_FIELDS if field in valid]
         holdings_discovery_parity = _build_holdings_discovery_parity(
             conn,
             tolerance=float(getattr(config, "REPLAY_LIVE_PARITY_TOLERANCE", 0.15)),
@@ -581,6 +640,24 @@ def build_blocker_breakdown(*, top_n: int | None = None) -> dict:
                 pit_source=row_pit_source,
                 qmj_components=live_qmj_components,
             )
+            value_drilldown = {}
+            if "value_factor_score" in drifted and value_drilldown_fields:
+                drilldown_row = _value_factor_drilldown_row(
+                    ticker=ticker,
+                    live=live,
+                    replay=replay,
+                    fields=value_drilldown_fields,
+                    evidence_class=evidence_class,
+                    source_bucket=source_bucket,
+                    region=region,
+                    component_drifted=component_drifted,
+                    live_missing=live_missing,
+                    replay_missing=replay_missing,
+                    both_missing=both_missing,
+                    default_tolerance=float(getattr(config, "REPLAY_LIVE_PARITY_TOLERANCE", 0.15)),
+                )
+                value_drilldown = drilldown_row["comparisons"]
+                value_factor_drift_rows.append(drilldown_row)
             for field in live_missing:
                 field_summary[field]["live_missing"] += 1
             for field in replay_missing:
@@ -658,6 +735,7 @@ def build_blocker_breakdown(*, top_n: int | None = None) -> dict:
                 "component_replay_missing_fields": component_replay_missing,
                 "component_both_missing_fields": component_both_missing,
                 "component_drift_fields": component_drifted,
+                "value_factor_drilldown": value_drilldown,
                 "quality_score_fundamental_source": {
                     "live": live_quality_source,
                     "replay": replay_quality_source,
@@ -731,6 +809,13 @@ def build_blocker_breakdown(*, top_n: int | None = None) -> dict:
         )
     ]
     non_us_blocked.sort(key=lambda row: len(row.get("replay_missing_fields") or []) + len(row.get("drift_fields") or []), reverse=True)
+    value_factor_drift_rows.sort(
+        key=lambda row: (
+            not bool(row.get("actionable")),
+            str(row.get("evidence_class") or ""),
+            str(row.get("ticker") or ""),
+        )
+    )
 
     return {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
@@ -750,6 +835,7 @@ def build_blocker_breakdown(*, top_n: int | None = None) -> dict:
         "field_summary": field_rows,
         "component_summary": component_rows,
         "actionable_drift_summary": actionable_drift_summary,
+        "value_factor_drift_drilldown": value_factor_drift_rows[:80],
         "quality_score_fundamental_source_summary": dict(quality_source_counts),
         "fmp_targets": fmp_targets[:80],
         "non_us_blocked": non_us_blocked[:80],
@@ -779,6 +865,7 @@ def main() -> None:
         "top_fields": payload.get("field_summary", [])[:10],
         "component_summary": payload.get("component_summary", [])[:10],
         "actionable_drift_summary": payload.get("actionable_drift_summary"),
+        "value_factor_drift_drilldown": payload.get("value_factor_drift_drilldown", [])[:10],
         "quality_score_fundamental_source_summary": payload.get("quality_score_fundamental_source_summary"),
         "top_fmp_targets": [
             {
