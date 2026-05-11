@@ -344,6 +344,12 @@ REPLAY_LIVE_PARITY_EXCLUDED_FIELDS = [
 ]
 REPLAY_LIVE_PARITY_NON_ACTIONABLE_EVIDENCE_CLASSES = ["yfinance_balance_only", "no_data"]
 REPLAY_LIVE_PARITY_ZERO_AS_MISSING_FIELDS = ["pe_ratio", "peg_ratio", "roe", "short_pct"]
+# Inputs that are live-only and not yet PIT-replayable.  The canonicalizer
+# nulls these before recomputing derived factor scores so live and replay
+# rows feed `compute_factor_scores_from_result` on the same component basis.
+# They remain in REPLAY_LIVE_PARITY_EXCLUDED_FIELDS so they are also never
+# field-on-field compared.  Remove an entry only once replay can supply it.
+REPLAY_LIVE_PARITY_LIVE_ONLY_INPUTS_FOR_DERIVED = ["peg_ratio"]
 REPLAY_LIVE_PARITY_FIELD_TOLERANCES = {
     "quality_factor_score": 0.35,
     "value_factor_score": 0.35,

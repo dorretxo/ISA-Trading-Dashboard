@@ -68,6 +68,16 @@ def canonicalize_parity_row(row: Mapping) -> dict:
         if finite_float(out.get(field)) == 0.0:
             out[field] = None
 
+    # Live-only inputs that replay cannot supply PIT-safely (e.g. peg_ratio is
+    # yfinance-.info-only — no PIT analog for forward analyst growth).  Null
+    # them on both sides so the downstream recompute of derived factor scores
+    # (value_factor_score, etc.) uses the same component basis on live and
+    # replay rows.  Field-on-field comparison of these inputs is already
+    # suppressed via REPLAY_LIVE_PARITY_EXCLUDED_FIELDS.
+    live_only_inputs = set(getattr(config, "REPLAY_LIVE_PARITY_LIVE_ONLY_INPUTS_FOR_DERIVED", []) or [])
+    for field in live_only_inputs:
+        out[field] = None
+
     f_score = finite_float(out.get("f_score"))
     if f_score is not None and finite_float(out.get("f_score_score")) is None:
         out["f_score_score"] = compute_f_score_score(f_score)
