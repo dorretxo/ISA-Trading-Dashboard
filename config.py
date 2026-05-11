@@ -342,6 +342,7 @@ REPLAY_LIVE_PARITY_EXCLUDED_FIELDS = [
     "sleeve_momentum", "sleeve_quality", "sleeve_value",
     "sleeve_low_risk", "sleeve_pead", "sleeve_ready",
 ]
+REPLAY_LIVE_PARITY_NON_ACTIONABLE_EVIDENCE_CLASSES = ["yfinance_balance_only", "no_data"]
 REPLAY_LIVE_PARITY_ZERO_AS_MISSING_FIELDS = ["pe_ratio", "peg_ratio", "roe", "short_pct"]
 REPLAY_LIVE_PARITY_FIELD_TOLERANCES = {
     "quality_factor_score": 0.35,

@@ -333,6 +333,31 @@ def _quality_source_family(source: str) -> str:
     return f"{provider}_component_backed"
 
 
+def _non_actionable_evidence_classes(config_module=None) -> set[str]:
+    cfg = config_module or config
+    raw = getattr(
+        cfg,
+        "REPLAY_LIVE_PARITY_NON_ACTIONABLE_EVIDENCE_CLASSES",
+        ["yfinance_balance_only", "no_data"],
+    )
+    return {str(item) for item in (raw or [])}
+
+
+def _actionable_drift(rows: list[dict], *, config_module=None) -> dict[str, int]:
+    non_actionable = _non_actionable_evidence_classes(config_module)
+    out: dict[str, int] = {}
+    for row in rows:
+        by_evidence = row.get("drifted_by_evidence", {}) or {}
+        actionable = sum(
+            int(count)
+            for evidence_class, count in by_evidence.items()
+            if str(evidence_class) not in non_actionable
+        )
+        if actionable:
+            out[str(row.get("field"))] = actionable
+    return dict(sorted(out.items(), key=lambda item: item[1], reverse=True))
+
+
 def _priority(row: dict, *, critical_fields: set[str]) -> float:
     replay_missing = set(row.get("replay_missing_fields") or [])
     drifted = set(row.get("drift_fields") or [])
@@ -449,7 +474,9 @@ def build_blocker_breakdown(*, top_n: int | None = None) -> dict:
 
     ticker_rows: list[dict] = []
     field_summary: dict[str, Counter] = defaultdict(Counter)
+    field_drift_by_evidence: dict[str, Counter] = defaultdict(Counter)
     component_summary: dict[str, Counter] = defaultdict(Counter)
+    component_drift_by_evidence: dict[str, Counter] = defaultdict(Counter)
     category_counts: Counter = Counter()
     bucket_counts: Counter = Counter()
     evidence_class_counts: Counter = Counter()
@@ -546,6 +573,14 @@ def build_blocker_breakdown(*, top_n: int | None = None) -> dict:
                 component_both_missing,
                 component_drifted,
             ) = _field_breakdown(component_compared["comparisons"])
+            live_qmj_components = _qmj_lite_component_count(live, config_module=config)
+            replay_qmj_components = _qmj_lite_component_count(replay, config_module=config)
+            row_pit_source = candidate_pit_source or live.get("pit_source") or live.get("_pit_source")
+            evidence_class = classify_evidence(
+                ticker=ticker,
+                pit_source=row_pit_source,
+                qmj_components=live_qmj_components,
+            )
             for field in live_missing:
                 field_summary[field]["live_missing"] += 1
             for field in replay_missing:
@@ -554,6 +589,7 @@ def build_blocker_breakdown(*, top_n: int | None = None) -> dict:
                 field_summary[field]["both_missing"] += 1
             for field in drifted:
                 field_summary[field]["drifted"] += 1
+                field_drift_by_evidence[field][evidence_class] += 1
             for field in component_live_missing:
                 component_summary[field]["live_missing"] += 1
             for field in component_replay_missing:
@@ -562,6 +598,7 @@ def build_blocker_breakdown(*, top_n: int | None = None) -> dict:
                 component_summary[field]["both_missing"] += 1
             for field in component_drifted:
                 component_summary[field]["drifted"] += 1
+                component_drift_by_evidence[field][evidence_class] += 1
 
             blockers = set(live_missing) | set(replay_missing) | set(both_missing) | set(drifted)
             if blockers:
@@ -587,8 +624,6 @@ def build_blocker_breakdown(*, top_n: int | None = None) -> dict:
             flags = _parse_flags((candidate or {}).get("action_gate_flags") or live.get("action_gate_flags_json"))
             if flags.get("fundamental_coverage") == "fail":
                 buckets.append("fundamental_coverage_fail")
-            live_qmj_components = _qmj_lite_component_count(live, config_module=config)
-            replay_qmj_components = _qmj_lite_component_count(replay, config_module=config)
             if live_qmj_components < int(getattr(config, "QMJ_LITE_MIN_COMPONENTS", 2)):
                 buckets.append("qmj_component_count_lt_2")
             if replay_qmj_components < int(getattr(config, "QMJ_LITE_MIN_COMPONENTS", 2)):
@@ -599,12 +634,6 @@ def build_blocker_breakdown(*, top_n: int | None = None) -> dict:
             quality_source_counts[source_pair] += 1
             if _quality_source_family(live_quality_source) != _quality_source_family(replay_quality_source):
                 buckets.append("quality_source_drift")
-            row_pit_source = candidate_pit_source or live.get("pit_source") or live.get("_pit_source")
-            evidence_class = classify_evidence(
-                ticker=ticker,
-                pit_source=row_pit_source,
-                qmj_components=live_qmj_components,
-            )
             evidence_class_counts[evidence_class] += 1
             buckets.append(evidence_class)
             buckets = sorted(set(buckets))
@@ -661,6 +690,7 @@ def build_blocker_breakdown(*, top_n: int | None = None) -> dict:
             "replay_missing": counts.get("replay_missing", 0),
             "both_missing": counts.get("both_missing", 0),
             "drifted": counts.get("drifted", 0),
+            "drifted_by_evidence": dict(field_drift_by_evidence.get(field, {})),
             "critical": field in critical_fields,
         })
     field_rows.sort(key=lambda row: (row["critical"], row["total"]), reverse=True)
@@ -675,8 +705,16 @@ def build_blocker_breakdown(*, top_n: int | None = None) -> dict:
             "replay_missing": counts.get("replay_missing", 0),
             "both_missing": counts.get("both_missing", 0),
             "drifted": counts.get("drifted", 0),
+            "drifted_by_evidence": dict(component_drift_by_evidence.get(field, {})),
         })
     component_rows.sort(key=lambda row: row["total"], reverse=True)
+
+    non_actionable = _non_actionable_evidence_classes(config)
+    actionable_drift_summary = {
+        "field": _actionable_drift(field_rows, config_module=config),
+        "component": _actionable_drift(component_rows, config_module=config),
+        "non_actionable_classes": sorted(non_actionable),
+    }
 
     fmp_targets = [
         row for row in ticker_rows
@@ -711,6 +749,7 @@ def build_blocker_breakdown(*, top_n: int | None = None) -> dict:
         "critical_fields": sorted(critical_fields),
         "field_summary": field_rows,
         "component_summary": component_rows,
+        "actionable_drift_summary": actionable_drift_summary,
         "quality_score_fundamental_source_summary": dict(quality_source_counts),
         "fmp_targets": fmp_targets[:80],
         "non_us_blocked": non_us_blocked[:80],
@@ -739,6 +778,7 @@ def main() -> None:
         "evidence_class_summary": payload.get("evidence_class_summary"),
         "top_fields": payload.get("field_summary", [])[:10],
         "component_summary": payload.get("component_summary", [])[:10],
+        "actionable_drift_summary": payload.get("actionable_drift_summary"),
         "quality_score_fundamental_source_summary": payload.get("quality_score_fundamental_source_summary"),
         "top_fmp_targets": [
             {

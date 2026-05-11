@@ -100,6 +100,44 @@ def test_quality_source_family_ignores_component_count_noise():
     assert breakdown._quality_source_family("none") == "none"
 
 
+def test_actionable_drift_excludes_configured_evidence_classes(monkeypatch):
+    class DummyConfig:
+        REPLAY_LIVE_PARITY_NON_ACTIONABLE_EVIDENCE_CLASSES = [
+            "yfinance_balance_only",
+            "no_data",
+        ]
+
+    rows = [
+        {
+            "field": "quality_factor_score",
+            "drifted_by_evidence": {"yfinance_balance_only": 80, "fmp_full": 2},
+        },
+        {
+            "field": "value_factor_score",
+            "drifted_by_evidence": {"yfinance_balance_only": 7},
+        },
+        {
+            "field": "institutional_prior_score",
+            "drifted_by_evidence": {"fmp_partial": 1, "no_data": 4},
+        },
+    ]
+
+    assert breakdown._actionable_drift(rows, config_module=DummyConfig) == {
+        "quality_factor_score": 2,
+        "institutional_prior_score": 1,
+    }
+
+
+def test_non_actionable_evidence_classes_default_when_missing():
+    class EmptyConfig:
+        pass
+
+    assert breakdown._non_actionable_evidence_classes(EmptyConfig) == {
+        "yfinance_balance_only",
+        "no_data",
+    }
+
+
 def test_region_bucket_uses_suffix_and_us_default():
     assert breakdown._region_bucket("BHP.AX") == "Australia"
     assert breakdown._region_bucket("AAPL") == "US"
