@@ -15,6 +15,7 @@ from typing import Mapping
 import numpy as np
 
 import config
+from engine.canonical_scores import compute_f_score_score, compute_fcf_yield_score
 from engine.factors import cross_sectional_zscore
 from engine.fscore_utils import is_f_score_actionable
 
@@ -111,7 +112,7 @@ def _raw_sleeves(candidate: Mapping, feature_cache: Mapping[str, Mapping]) -> tu
         _pm1(candidate.get("qmj_factor_score")),
         _clip(candidate.get("_pit_quality_score")),
         _pm1(candidate.get("gpa_score")),
-        _clip((f_score - 4.5) / 4.5) if is_f_score_actionable(f_score, f_cov, config_module=config) else None,
+        compute_f_score_score(f_score) if is_f_score_actionable(f_score, f_cov, config_module=config) else None,
         _low_better(candidate.get("debt_to_assets", candidate.get("_debt_to_assets")), 0.15, 0.70),
     ])
 
@@ -122,7 +123,7 @@ def _raw_sleeves(candidate: Mapping, feature_cache: Mapping[str, Mapping]) -> tu
         _pm1(candidate.get("value_factor_score")),
         _clip(candidate.get("_pit_value_score")),
         _pm1(candidate.get("ev_ebit_score")),
-        _clip((fcf_yield - 0.03) / 0.08) if fcf_yield is not None else None,
+        compute_fcf_yield_score(fcf_yield),
         _clip((18.0 - pe) / 18.0) if pe is not None and pe > 0 else None,
     ])
 

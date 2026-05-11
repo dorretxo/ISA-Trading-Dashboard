@@ -31,6 +31,7 @@ from typing import Iterable, Mapping
 
 import numpy as np
 
+from engine.canonical_scores import compute_ev_ebit_score, compute_f_score_score, compute_gpa_score
 from engine.fscore_utils import f_score_min_coverage
 import pandas as pd
 
@@ -116,8 +117,7 @@ def compute_ev_ebit(info: Mapping) -> dict[str, float | None]:
     # Heuristic anchor score for ensembles that still expect [-1, 1]:
     # EBIT yield of 10% is roughly median; 20%+ is deep value.
     if out["ebit_yield"] is not None:
-        y = out["ebit_yield"]
-        out["ev_ebit_score"] = _clip((y - 0.10) / 0.10)
+        out["ev_ebit_score"] = compute_ev_ebit_score(out["ebit_yield"])
     return out
 
 
@@ -259,7 +259,7 @@ def compute_piotroski_f_score(
     coverage = answered / 9.0 if answered else 0.0
 
     # Scale score: 0..9 → −1..+1 centred at 4.5.  Below 4 = bearish, ≥6 = bullish.
-    scaled = _clip((passed - 4.5) / 3.0)
+    scaled = compute_f_score_score(passed)
 
     # Gate requires decent coverage (≥6 answered checks) and ≥6 passes
     gate = coverage >= f_score_min_coverage() and passed >= 6
@@ -289,7 +289,7 @@ def compute_gpa(info: Mapping) -> dict[str, float | None]:
     if gp is None or ta is None or ta <= 0:
         return {"gpa": None, "gpa_score": None}
     gpa = gp / ta
-    return {"gpa": gpa, "gpa_score": _clip((gpa - 0.30) / 0.20)}
+    return {"gpa": gpa, "gpa_score": compute_gpa_score(gpa)}
 
 
 # ---------------------------------------------------------------------------
@@ -698,7 +698,7 @@ def compute_ttm_gpa(
     if gp_ttm is None or ta is None or ta <= 0:
         return {"gpa": None, "gpa_score": None, "gpa_source": "ttm_extraction_failed"}
     gpa = gp_ttm / ta
-    return {"gpa": gpa, "gpa_score": _clip((gpa - 0.30) / 0.20), "gpa_source": "ttm_quarterly"}
+    return {"gpa": gpa, "gpa_score": compute_gpa_score(gpa), "gpa_source": "ttm_quarterly"}
 
 
 # ---------------------------------------------------------------------------

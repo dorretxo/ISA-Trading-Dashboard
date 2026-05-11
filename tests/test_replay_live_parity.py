@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 
 import config
-from utils.replay_live_parity import comparable_fields, compare_parity_rows
+from utils.replay_live_parity import canonicalize_parity_row, comparable_fields, compare_parity_rows
 
 
 def test_parity_comparison_uses_field_specific_tolerance(monkeypatch):
@@ -50,3 +50,9 @@ def test_comparable_fields_drops_configured_exclusions(monkeypatch):
     monkeypatch.setattr(config, "REPLAY_LIVE_PARITY_EXCLUDED_FIELDS", ["forecast_score"])
 
     assert comparable_fields(["technical_score", "forecast_score"]) == ["technical_score"]
+
+
+def test_canonicalize_derives_ev_ebit_score_from_ev_ebit():
+    row = canonicalize_parity_row({"ev_ebit": 5.0})
+
+    assert row["ev_ebit_score"] == pytest.approx(1.0)

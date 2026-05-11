@@ -79,6 +79,48 @@ def test_pit_factor_overrides_derive_pe_from_pit_earnings_yield():
     assert out["pe_ratio"] == 20.0
 
 
+def test_live_only_factor_fallbacks_are_removed_without_pit_surrogates():
+    result = {
+        "quality_score_fundamental": 0.85,
+        "_quality_score_fundamental": 0.85,
+        "gross_profitability": 0.4,
+        "gpa": 0.4,
+        "f_score": 7,
+        "value_factor_score": 0.6,
+        "pe_ratio": 12.0,
+        "fcf_yield": 0.08,
+        "ev_ebit_score": 0.5,
+    }
+    candidate = {}
+
+    discovery._drop_live_only_factor_fallbacks(result, candidate)
+
+    assert result["quality_score_fundamental"] is None
+    assert result["_quality_score_fundamental"] is None
+    assert result["gpa"] is None
+    assert result["f_score"] is None
+    assert result["value_factor_score"] is None
+    assert result["pe_ratio"] is None
+    assert result["ev_ebit_score"] is None
+
+
+def test_pit_factor_fallbacks_are_kept_when_surrogates_exist():
+    result = {
+        "quality_score_fundamental": 0.35,
+        "gpa": 0.5,
+        "value_factor_score": 0.4,
+        "fcf_yield": 0.08,
+    }
+    candidate = {"_pit_quality_score": 0.35, "_pit_value_score": 0.4}
+
+    discovery._drop_live_only_factor_fallbacks(result, candidate)
+
+    assert result["quality_score_fundamental"] == 0.35
+    assert result["gpa"] == 0.5
+    assert result["value_factor_score"] == 0.4
+    assert result["fcf_yield"] == 0.08
+
+
 def test_stage5b_metadata_fills_without_clobbering_pit_fields():
     candidate = {
         "_pe_ratio": 14.0,

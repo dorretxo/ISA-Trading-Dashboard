@@ -25,7 +25,9 @@ import pandas as pd
 import yfinance as yf
 
 import config
+from engine.canonical_scores import compute_ev_ebit_score, compute_f_score_score, compute_gpa_score
 from engine.enterprise_factors import compute_piotroski_f_score
+from engine.factors import compute_factor_scores_from_result
 from engine.paper_trading import _connect
 from utils.atomic_io import atomic_write_json
 from utils import fmp_client
@@ -422,38 +424,61 @@ def _pit_factor_snapshot(ticker: str, run_date: str, signal_price: float | None)
     }
     f_score_score = f_result.get("f_score_score")
     if f_score_score is not None:
-        fields["quality_factor_score"] = f_score_score
-        fields["quality_score_fundamental"] = f_score_score
-        fields["qmj_factor_score"] = f_score_score
+        fields["f_score_score"] = f_score_score
 
     total_assets = _finite(latest.get("total_assets"))
     gross_profit = _finite(latest.get("gross_profit"))
     if total_assets and total_assets > 0 and gross_profit is not None:
         gpa = gross_profit / total_assets
-        gpa_score = float(np.clip((gpa - 0.30) / 0.20, -1.0, 1.0))
+        gpa_score = compute_gpa_score(gpa)
         fields.update({
             "gpa": gpa,
             "gpa_score": gpa_score,
             "gross_profitability": gpa,
         })
-        if fields.get("quality_factor_score") is None:
-            fields["quality_factor_score"] = gpa_score
-            fields["quality_score_fundamental"] = gpa_score
-            fields["qmj_factor_score"] = gpa_score
 
     price = _finite(signal_price)
     shares = _finite(latest.get("shares_outstanding"))
     ebit = _finite(latest.get("ebit"))
+    operating_cashflow = _finite(latest.get("operating_cashflow"))
+    capex = _finite(latest.get("capital_expenditure"))
     total_debt = _finite(latest.get("total_debt")) or 0.0
     cash = _finite(latest.get("cash")) or 0.0
+    market_cap = price * shares if price and price > 0 and shares and shares > 0 else None
+    if operating_cashflow is not None:
+        if capex is None:
+            fcf = operating_cashflow
+        else:
+            fcf = operating_cashflow + capex if capex < 0 else operating_cashflow - capex
+        if market_cap and market_cap > 0:
+            fields["fcf_yield"] = fcf / market_cap
+        if total_assets and total_assets > 0:
+            fields["fcf_to_assets"] = fcf / total_assets
     if price and price > 0 and shares and shares > 0 and ebit and ebit > 0:
         ev = price * shares + total_debt - cash
         if ev > 0:
             ev_ebit = ev / ebit
             ebit_yield = ebit / ev
             fields["ev_ebit"] = ev_ebit
-            fields["ev_ebit_score"] = float(np.clip((ebit_yield - 0.10) / 0.10, -1.0, 1.0))
-            fields["value_factor_score"] = fields["ev_ebit_score"]
+            fields["ebit_yield"] = ebit_yield
+            fields["ev_ebit_score"] = compute_ev_ebit_score(ebit_yield)
+
+    try:
+        factor_scores = compute_factor_scores_from_result(fields)
+        if any(fields.get(k) is not None for k in ("quality_score_fundamental", "gpa_score", "f_score_score", "gpa", "f_score")):
+            for key in ("quality_factor_score", "gpa_factor_score", "f_score_factor_score"):
+                if factor_scores.get(key) is not None:
+                    fields[key] = factor_scores[key]
+        if any(fields.get(k) is not None for k in ("gpa_score", "gpa", "gross_profitability", "f_score_score", "earnings_stability")):
+            for key in ("qmj_factor_score", "qmj_component_count"):
+                if factor_scores.get(key) is not None:
+                    fields[key] = factor_scores[key]
+        if any(fields.get(k) is not None for k in ("pe_ratio", "peg_ratio", "fcf_yield", "ev_ebit_score", "pb_score", "ps_score")):
+            fields["value_factor_score"] = factor_scores.get("value_factor_score")
+            if factor_scores.get("ev_ebit_factor_score") is not None:
+                fields["ev_ebit_factor_score"] = factor_scores["ev_ebit_factor_score"]
+    except Exception:
+        logger.debug("PIT factor derivation failed for %s %s", ticker, run_date)
 
     return {k: v for k, v in fields.items() if v is not None}, report_date
 
@@ -645,10 +670,7 @@ def _mean_finite(values: Iterable[float | None]) -> float | None:
 
 
 def _score_from_f_score(value) -> float | None:
-    f_score = _finite(value)
-    if f_score is None:
-        return None
-    return float(np.clip((f_score - 5.0) / 4.0, -1.0, 1.0))
+    return compute_f_score_score(value)
 
 
 def _score_from_pe(value) -> float | None:

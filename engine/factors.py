@@ -22,6 +22,7 @@ from typing import Any
 import numpy as np
 
 import config
+from engine.canonical_scores import compute_fcf_yield_score, compute_gpa_score
 
 
 def cross_sectional_zscore(values: list[float] | np.ndarray, clip: float = 3.0) -> np.ndarray:
@@ -650,7 +651,9 @@ def compute_factor_scores_from_result(result: dict) -> dict[str, float | None]:
 
     fcf_yield = _first_valid(result.get("fcf_yield"))
     if fcf_yield is not None:
-        value_components.append(float(np.clip((fcf_yield - 0.03) / 0.08, -1.0, 1.0)))
+        score = compute_fcf_yield_score(fcf_yield)
+        if score is not None:
+            value_components.append(score)
 
     # Extended value: P/B and P/S (Fama-French 1993, Lakonishok et al. 1994)
     pb_score = _first_valid(result.get("pb_score"), result.get("_pb_score"))
@@ -720,7 +723,7 @@ def compute_factor_scores_from_result(result: dict) -> dict[str, float | None]:
             if gp_anchor == gpa_score:
                 profitability = float(np.clip(gp_anchor, -1.0, 1.0))
             else:
-                profitability = float(np.clip((gp_anchor - 0.30) / 0.20, -1.0, 1.0))
+                profitability = compute_gpa_score(gp_anchor)
 
         safety_vals = [
             _first_valid(result.get("earnings_stability"), result.get("_earnings_stability")),

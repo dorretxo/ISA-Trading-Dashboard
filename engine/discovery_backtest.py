@@ -24,6 +24,7 @@ import pandas as pd
 import yfinance as yf
 
 import config
+from engine.canonical_scores import compute_f_score_score, compute_gpa_score
 from engine.factors import compute_factor_scores_from_result
 from engine.pillar_weighting import (
     PILLARS as _WEIGHT_PILLARS,
@@ -1260,12 +1261,12 @@ def record_discovery_picks(candidates: list) -> int:
 
             if f_score_score_val is None and f_score_val is not None:
                 try:
-                    f_score_score_val = float(np.clip((float(f_score_val) - 4.5) / 3.0, -1.0, 1.0))
+                    f_score_score_val = compute_f_score_score(f_score_val)
                 except (TypeError, ValueError):
                     f_score_score_val = None
             if gpa_score_val is None and gpa_val is not None:
                 try:
-                    gpa_score_val = float(np.clip((float(gpa_val) - 0.30) / 0.20, -1.0, 1.0))
+                    gpa_score_val = compute_gpa_score(gpa_val)
                 except (TypeError, ValueError):
                     gpa_score_val = None
 

@@ -29,7 +29,7 @@ from engine.ml_ranker import FEATURE_COLS
 from engine.paper_trading import _connect
 from utils.atomic_io import atomic_write_json
 from utils.global_universe import resolve_yahoo_ticker
-from utils.replay_live_parity import comparable_fields, compare_parity_rows
+from utils.replay_live_parity import comparable_fields, compare_parity_rows, finite_float
 from utils.replay_parity_refresh import latest_discovery_cohort
 
 
@@ -55,6 +55,12 @@ _QUALITY_PARITY_FIELDS = (
     "f_score_coverage",
     "gpa",
     "gpa_score",
+    "ev_ebit_score",
+)
+_COMPONENT_PARITY_FIELDS = (
+    "gpa",
+    "f_score_score",
+    "fcf_yield",
     "ev_ebit_score",
 )
 _F_SCORE_THRESHOLD_AUDIT_FILES = (
@@ -289,6 +295,44 @@ def _field_breakdown(comparisons: list[dict]) -> tuple[list[str], list[str], lis
     return live_missing, replay_missing, both_missing, drifted
 
 
+def _quality_score_source(row: Mapping | None) -> str:
+    if not row:
+        return "missing_row"
+    quality = finite_float(row.get("quality_score_fundamental"))
+    if quality is None:
+        return "none"
+
+    component_keys = (
+        "gpa",
+        "gpa_score",
+        "gross_profitability",
+        "fcf_to_assets",
+        "earnings_stability",
+        "roe",
+    )
+    component_count = sum(1 for key in component_keys if finite_float(row.get(key)) is not None)
+    if component_count:
+        pit_source = str(row.get("pit_source") or row.get("_pit_source") or "unknown")
+        return f"{pit_source}_component_backed_{component_count}"
+
+    if quality == 0.0:
+        return "legacy_zero_without_components"
+    if abs(quality - 0.85) <= 1e-9:
+        return "live_info_fallback_without_components"
+    return "opaque_without_components"
+
+
+def _quality_source_family(source: str) -> str:
+    if "_component_backed_" not in source:
+        return source
+    provider = source.split("_component_backed_", 1)[0]
+    if provider.startswith("yfinance"):
+        return "yfinance_component_backed"
+    if provider in {"fmp", "unknown"}:
+        return "pit_component_backed"
+    return f"{provider}_component_backed"
+
+
 def _priority(row: dict, *, critical_fields: set[str]) -> float:
     replay_missing = set(row.get("replay_missing_fields") or [])
     drifted = set(row.get("drift_fields") or [])
@@ -405,9 +449,11 @@ def build_blocker_breakdown(*, top_n: int | None = None) -> dict:
 
     ticker_rows: list[dict] = []
     field_summary: dict[str, Counter] = defaultdict(Counter)
+    component_summary: dict[str, Counter] = defaultdict(Counter)
     category_counts: Counter = Counter()
     bucket_counts: Counter = Counter()
     evidence_class_counts: Counter = Counter()
+    quality_source_counts: Counter = Counter()
     region_summary: dict[str, dict] = {}
     source_summary: dict[str, dict] = {}
     threshold_audit = _threshold_audit_sites()
@@ -419,7 +465,8 @@ def build_blocker_breakdown(*, top_n: int | None = None) -> dict:
             "action_gate_ceiling", "action_gate_flags_json",
             "f_score", "f_score_coverage", "gpa", "gpa_score", "gross_profitability",
             "earnings_stability", "qmj_factor_score", "qmj_component_count",
-            "pit_source", "_pit_source",
+            "quality_score_fundamental", "fcf_yield", "ev_ebit", "ev_ebit_score",
+            "ebit_yield", "fcf_to_assets", "roe", "pit_source", "_pit_source",
         }
         select_fields = sorted((set(fields) | extra_fields) & valid)
         holdings_discovery_parity = _build_holdings_discovery_parity(
@@ -487,6 +534,18 @@ def build_blocker_breakdown(*, top_n: int | None = None) -> dict:
                 default_tolerance=float(getattr(config, "REPLAY_LIVE_PARITY_TOLERANCE", 0.15)),
             )
             live_missing, replay_missing, both_missing, drifted = _field_breakdown(compared["comparisons"])
+            component_compared = compare_parity_rows(
+                live,
+                replay,
+                _COMPONENT_PARITY_FIELDS,
+                default_tolerance=float(getattr(config, "REPLAY_LIVE_PARITY_TOLERANCE", 0.15)),
+            )
+            (
+                component_live_missing,
+                component_replay_missing,
+                component_both_missing,
+                component_drifted,
+            ) = _field_breakdown(component_compared["comparisons"])
             for field in live_missing:
                 field_summary[field]["live_missing"] += 1
             for field in replay_missing:
@@ -495,6 +554,14 @@ def build_blocker_breakdown(*, top_n: int | None = None) -> dict:
                 field_summary[field]["both_missing"] += 1
             for field in drifted:
                 field_summary[field]["drifted"] += 1
+            for field in component_live_missing:
+                component_summary[field]["live_missing"] += 1
+            for field in component_replay_missing:
+                component_summary[field]["replay_missing"] += 1
+            for field in component_both_missing:
+                component_summary[field]["both_missing"] += 1
+            for field in component_drifted:
+                component_summary[field]["drifted"] += 1
 
             blockers = set(live_missing) | set(replay_missing) | set(both_missing) | set(drifted)
             if blockers:
@@ -526,6 +593,12 @@ def build_blocker_breakdown(*, top_n: int | None = None) -> dict:
                 buckets.append("qmj_component_count_lt_2")
             if replay_qmj_components < int(getattr(config, "QMJ_LITE_MIN_COMPONENTS", 2)):
                 buckets.append("replay_qmj_component_count_lt_2")
+            live_quality_source = _quality_score_source(live)
+            replay_quality_source = _quality_score_source(replay)
+            source_pair = f"{live_quality_source} -> {replay_quality_source}"
+            quality_source_counts[source_pair] += 1
+            if _quality_source_family(live_quality_source) != _quality_source_family(replay_quality_source):
+                buckets.append("quality_source_drift")
             row_pit_source = candidate_pit_source or live.get("pit_source") or live.get("_pit_source")
             evidence_class = classify_evidence(
                 ticker=ticker,
@@ -552,6 +625,14 @@ def build_blocker_breakdown(*, top_n: int | None = None) -> dict:
                 "blocker_buckets": buckets,
                 "live_qmj_component_count": live_qmj_components,
                 "replay_qmj_component_count": replay_qmj_components,
+                "component_live_missing_fields": component_live_missing,
+                "component_replay_missing_fields": component_replay_missing,
+                "component_both_missing_fields": component_both_missing,
+                "component_drift_fields": component_drifted,
+                "quality_score_fundamental_source": {
+                    "live": live_quality_source,
+                    "replay": replay_quality_source,
+                },
                 "fmp_statement_candidate": fmp_candidate,
                 "non_us": non_us,
                 "queued": bool(queue_item),
@@ -583,6 +664,19 @@ def build_blocker_breakdown(*, top_n: int | None = None) -> dict:
             "critical": field in critical_fields,
         })
     field_rows.sort(key=lambda row: (row["critical"], row["total"]), reverse=True)
+
+    component_rows = []
+    for field, counts in component_summary.items():
+        total = sum(counts.values())
+        component_rows.append({
+            "field": field,
+            "total": total,
+            "live_missing": counts.get("live_missing", 0),
+            "replay_missing": counts.get("replay_missing", 0),
+            "both_missing": counts.get("both_missing", 0),
+            "drifted": counts.get("drifted", 0),
+        })
+    component_rows.sort(key=lambda row: row["total"], reverse=True)
 
     fmp_targets = [
         row for row in ticker_rows
@@ -616,6 +710,8 @@ def build_blocker_breakdown(*, top_n: int | None = None) -> dict:
         "holdings_discovery_parity": holdings_discovery_parity if "holdings_discovery_parity" in locals() else {},
         "critical_fields": sorted(critical_fields),
         "field_summary": field_rows,
+        "component_summary": component_rows,
+        "quality_score_fundamental_source_summary": dict(quality_source_counts),
         "fmp_targets": fmp_targets[:80],
         "non_us_blocked": non_us_blocked[:80],
         "ticker_rows": sorted(ticker_rows, key=lambda row: row.get("priority", 0), reverse=True),
@@ -642,6 +738,8 @@ def main() -> None:
         "categories": payload.get("categories"),
         "evidence_class_summary": payload.get("evidence_class_summary"),
         "top_fields": payload.get("field_summary", [])[:10],
+        "component_summary": payload.get("component_summary", [])[:10],
+        "quality_score_fundamental_source_summary": payload.get("quality_score_fundamental_source_summary"),
         "top_fmp_targets": [
             {
                 "ticker": row.get("ticker"),

@@ -30,6 +30,12 @@ import pandas as pd
 import yfinance as yf
 
 import config
+from engine.canonical_scores import (
+    compute_ev_ebit_score,
+    compute_f_score_score,
+    compute_fcf_yield_score,
+    compute_gpa_score,
+)
 from engine.factor_momentum import (
     calculate_network_momentum,
     compute_factor_returns,
@@ -536,6 +542,7 @@ _PIT_RESULT_OVERRIDE_MAP = {
     "pe_ratio": "_pe_ratio",
     "market_cap": "_market_cap",
     "quality_score_fundamental": "_pit_quality_score",
+    "quality_factor_score": "_pit_quality_score",
 }
 
 
@@ -581,6 +588,7 @@ def _apply_replay_like_stage2_features(out: dict, features: dict) -> None:
         "pe_ratio": "_pe_ratio",
         "market_cap": "_market_cap",
         "quality_score_fundamental": "_pit_quality_score",
+        "quality_factor_score": "_pit_quality_score",
         "value_factor_score": "_pit_value_score",
     }
     for public_key, private_key in mapping.items():
@@ -608,19 +616,67 @@ def _apply_pit_factor_overrides(result: dict, candidate: dict) -> dict:
 
     f_score = safe_float(result.get("f_score"), default=None)
     if f_score is not None:
-        result["f_score_score"] = float(np.clip((f_score - 4.5) / 3.0, -1.0, 1.0))
+        result["f_score_score"] = compute_f_score_score(f_score)
         result["f_score_gate"] = bool(f_score >= 6)
 
     gpa = safe_float(result.get("gpa"), default=None)
     if gpa is not None:
         result["gross_profitability"] = gpa
         result["_gross_profitability"] = gpa
-        result["gpa_score"] = float(np.clip((gpa - 0.30) / 0.20, -1.0, 1.0))
+        result["gpa_score"] = compute_gpa_score(gpa)
 
     ebit_yield = safe_float(result.get("ebit_yield"), default=None)
     if ebit_yield is not None:
-        result["ev_ebit_score"] = float(np.clip((ebit_yield - 0.10) / 0.10, -1.0, 1.0))
+        result["ev_ebit_score"] = compute_ev_ebit_score(ebit_yield)
     return result
+
+
+def _drop_live_only_factor_fallbacks(result: dict, candidate: dict) -> None:
+    """Keep discovery factor inputs PIT-aligned when no replay-like surrogate exists.
+
+    Stage 6 can still use live metadata inside the holding analyser, but the
+    persisted factor fields feed replay parity, adaptive weights, and ML
+    training. If Stage 2 did not produce a PIT-safe quality/value surrogate,
+    avoid carrying yfinance/.info-only fundamentals into those factor slots.
+    """
+    if candidate.get("_pit_quality_score") is None:
+        for key in (
+            "quality_score_fundamental",
+            "quality_factor_score",
+            "_quality_score_fundamental",
+            "_quality_score",
+            "gross_profitability",
+            "_gross_profitability",
+            "fcf_to_assets",
+            "_fcf_to_assets",
+            "earnings_stability",
+            "_earnings_stability",
+            "eps_growth_variance_5y",
+            "_eps_growth_variance_5y",
+            "gpa",
+            "gpa_score",
+            "f_score",
+            "f_score_coverage",
+            "f_score_score",
+            "f_score_gate",
+        ):
+            result[key] = None
+
+    if candidate.get("_pit_value_score") is None:
+        for key in (
+            "value_factor_score",
+            "pe_ratio",
+            "_pe_ratio",
+            "fcf_yield",
+            "_fcf_yield",
+            "ev_ebit",
+            "_ev_ebit",
+            "ebit_yield",
+            "_pit_ebit_yield",
+            "ev_ebit_score",
+            "_ev_ebit_score",
+        ):
+            result[key] = None
 
 
 def _pit_snapshot_to_info(
@@ -706,19 +762,25 @@ def _compute_stage2_factor_metrics(ticker: str, candidate: dict, momentum_metric
         f_score = safe_float(f.get("f_score"), default=None)
         f_cov = normalize_f_score_coverage(f.get("f_score_coverage"))
         if is_f_score_actionable(f_score, f_cov, config_module=config):
-            quality_components.append(float(np.clip((f_score - 4.5) / 3.0, -1.0, 1.0)))
+            f_score_score = compute_f_score_score(f_score)
+            if f_score_score is not None:
+                quality_components.append(f_score_score)
             coverage += 0.25 * (f_cov or 0.0)
             out["_f_score"] = int(f_score)
             out["_f_score_coverage"] = f_cov
+            out["_f_score_score"] = f_score_score
 
         gp = safe_float(latest.get("gross_profit"), default=None)
         assets = safe_float(latest.get("total_assets"), default=None)
         if gp is not None and assets and assets > 0:
             gpa = gp / assets
-            quality_components.append(float(np.clip((gpa - 0.25) / 0.20, -1.0, 1.0)))
+            gpa_score = compute_gpa_score(gpa)
+            if gpa_score is not None:
+                quality_components.append(gpa_score)
             coverage += 0.20
             out["_gpa"] = gpa
             out["_gross_profitability"] = gpa
+            out["_gpa_score"] = gpa_score
 
         fcf = _free_cashflow_from_pit(latest)
         if fcf is not None and assets and assets > 0:
@@ -756,16 +818,21 @@ def _compute_stage2_factor_metrics(ticker: str, candidate: dict, momentum_metric
                 out["_pit_earnings_yield"] = ey
             if fcf is not None and fcf > 0:
                 fcf_yield = fcf / mcap
-                value_components.append(float(np.clip((fcf_yield - 0.04) / 0.08, -1.0, 1.0)))
+                fcf_yield_score = compute_fcf_yield_score(fcf_yield)
+                if fcf_yield_score is not None:
+                    value_components.append(fcf_yield_score)
                 out["_fcf_yield"] = fcf_yield
             ebit = safe_float(latest.get("ebit"), default=None)
             debt_for_ev = safe_float(latest.get("total_debt"), default=debt or 0.0)
             ev = mcap + max(debt_for_ev or 0.0, 0.0) - max(cash or 0.0, 0.0)
             if ebit is not None and ebit > 0 and ev > 0:
                 ebit_yield = ebit / ev
-                value_components.append(float(np.clip((ebit_yield - 0.06) / 0.08, -1.0, 1.0)))
+                ev_ebit_score = compute_ev_ebit_score(ebit_yield)
+                if ev_ebit_score is not None:
+                    value_components.append(ev_ebit_score)
                 out["_pit_ebit_yield"] = ebit_yield
                 out["_ev_ebit"] = ev / ebit
+                out["_ev_ebit_score"] = ev_ebit_score
 
     if quality_components:
         out["_pit_quality_score"] = float(np.clip(np.mean(quality_components), -1.0, 1.0))
@@ -4967,6 +5034,7 @@ def _stage_full_scoring(
         # use the same as-of definitions; Stage 6 still fills fields with no
         # PIT surrogate.
         _apply_pit_factor_overrides(result, c)
+        _drop_live_only_factor_fallbacks(result, c)
         return result
 
     def _fallback_scored_item(item: dict, reason: str) -> dict:

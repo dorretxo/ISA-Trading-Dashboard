@@ -5,9 +5,8 @@ from __future__ import annotations
 import math
 from typing import Iterable, Mapping
 
-import numpy as np
-
 import config
+from engine.canonical_scores import compute_ev_ebit_score, compute_f_score_score, compute_gpa_score
 from engine.factors import compute_factor_scores_from_result
 
 
@@ -19,10 +18,6 @@ def finite_float(value) -> float | None:
         return out if math.isfinite(out) else None
     except (TypeError, ValueError):
         return None
-
-
-def _clip(value: float) -> float:
-    return float(np.clip(value, -1.0, 1.0))
 
 
 def comparable_fields(fields: Iterable[str], valid_columns: set[str] | None = None) -> list[str]:
@@ -75,12 +70,20 @@ def canonicalize_parity_row(row: Mapping) -> dict:
 
     f_score = finite_float(out.get("f_score"))
     if f_score is not None and finite_float(out.get("f_score_score")) is None:
-        out["f_score_score"] = _clip((f_score - 4.5) / 3.0)
+        out["f_score_score"] = compute_f_score_score(f_score)
         out["f_score_gate"] = bool(f_score >= 6)
 
     gpa = finite_float(out.get("gpa"))
     if gpa is not None and finite_float(out.get("gpa_score")) is None:
-        out["gpa_score"] = _clip((gpa - 0.30) / 0.20)
+        out["gpa_score"] = compute_gpa_score(gpa)
+
+    if finite_float(out.get("ev_ebit_score")) is None:
+        ebit_yield = finite_float(out.get("ebit_yield"))
+        ev_ebit = finite_float(out.get("ev_ebit"))
+        if ebit_yield is None and ev_ebit is not None and ev_ebit > 0:
+            ebit_yield = 1.0 / ev_ebit
+        if ebit_yield is not None:
+            out["ev_ebit_score"] = compute_ev_ebit_score(ebit_yield)
 
     try:
         factor_scores = compute_factor_scores_from_result(out)

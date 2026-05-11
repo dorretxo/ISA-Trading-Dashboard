@@ -79,6 +79,27 @@ def test_evidence_classification_distinguishes_yfinance_balance_only():
     ) == "fmp_partial"
 
 
+def test_quality_score_source_flags_opaque_live_fallbacks():
+    assert breakdown._quality_score_source({"quality_score_fundamental": 0.85}) == (
+        "live_info_fallback_without_components"
+    )
+    assert breakdown._quality_score_source({
+        "quality_score_fundamental": 0.2,
+        "gpa": 0.34,
+        "pit_source": "fmp",
+    }) == "fmp_component_backed_1"
+    assert breakdown._quality_score_source({"quality_score_fundamental": None}) == "none"
+
+
+def test_quality_source_family_ignores_component_count_noise():
+    assert breakdown._quality_source_family("fmp_component_backed_6") == "pit_component_backed"
+    assert breakdown._quality_source_family("unknown_component_backed_4") == "pit_component_backed"
+    assert breakdown._quality_source_family("yfinance_quarterly_component_backed_4") == (
+        "yfinance_component_backed"
+    )
+    assert breakdown._quality_source_family("none") == "none"
+
+
 def test_region_bucket_uses_suffix_and_us_default():
     assert breakdown._region_bucket("BHP.AX") == "Australia"
     assert breakdown._region_bucket("AAPL") == "US"

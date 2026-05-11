@@ -21,6 +21,7 @@ import numpy as np
 import pandas as pd
 
 import config
+from engine.canonical_scores import compute_ev_ebit_score, compute_gpa_score
 from engine.discovery_backtest import _connect, init_backtest_db
 from engine.enterprise_factors import compute_piotroski_f_score
 from engine.factors import compute_factor_scores_from_result, compute_fundamental_quality_metrics
@@ -481,7 +482,7 @@ def _fundamental_features(ticker: str, as_of: pd.Timestamp, *, signal_price: flo
     try:
         if total_assets and gross_profit is not None:
             gpa = gross_profit / total_assets
-            gpa_score = float(np.clip((gpa - 0.30) / 0.20, -1.0, 1.0))
+            gpa_score = compute_gpa_score(gpa)
     except Exception:
         pass
     revenue = _finite(latest.get("revenue"))
@@ -513,7 +514,7 @@ def _fundamental_features(ticker: str, as_of: pd.Timestamp, *, signal_price: flo
     ev_ebit = enterprise_value / ebit if enterprise_value and ebit and ebit > 0 else None
     ev_ebitda = enterprise_value / ebitda if enterprise_value and ebitda and ebitda > 0 else None
     ebit_yield = ebit / enterprise_value if enterprise_value and ebit and ebit > 0 else None
-    ev_ebit_score = _clip((ebit_yield - 0.10) / 0.10) if ebit_yield is not None else None
+    ev_ebit_score = compute_ev_ebit_score(ebit_yield)
     pe_ratio = price / eps if price and eps and eps > 0 else None
 
     fcf = None
@@ -549,7 +550,7 @@ def _fundamental_features(ticker: str, as_of: pd.Timestamp, *, signal_price: flo
     quality_score = quality_metrics.get("quality_score")
     if quality_metrics.get("gross_profitability") is not None:
         gpa = quality_metrics.get("gross_profitability")
-        gpa_score = float(np.clip((gpa - 0.30) / 0.20, -1.0, 1.0))
+        gpa_score = compute_gpa_score(gpa)
     if quality_metrics.get("fcf_to_assets") is not None:
         fcf_to_assets = quality_metrics.get("fcf_to_assets")
 
@@ -563,7 +564,7 @@ def _fundamental_features(ticker: str, as_of: pd.Timestamp, *, signal_price: flo
         else None
     )
 
-    return {
+    fields = {
         "pit_source": str(latest.get("_source") or "unknown"),
         "f_score": f_result.get("f_score"),
         "f_score_coverage": f_result.get("f_score_coverage"),
@@ -585,8 +586,6 @@ def _fundamental_features(ticker: str, as_of: pd.Timestamp, *, signal_price: flo
         "fcf_yield": fcf_yield,
         "ev_ebit": ev_ebit,
         "ev_ebit_score": ev_ebit_score,
-        "quality_factor_score": gpa_score,
-        "qmj_factor_score": gpa_score,
         "quality_score_fundamental": quality_score,
         "fundamental_score": fundamental_score,
         "ttm_source": ttm.get("ttm_source") if ttm else None,
@@ -596,6 +595,23 @@ def _fundamental_features(ticker: str, as_of: pd.Timestamp, *, signal_price: flo
         "ev_ebitda": ev_ebitda,
         "ebit_yield": ebit_yield,
     }
+    try:
+        factor_scores = compute_factor_scores_from_result(fields)
+        if any(fields.get(k) is not None for k in ("quality_score_fundamental", "gpa_score", "f_score_score", "gpa", "f_score")):
+            for key in ("quality_factor_score", "gpa_factor_score", "f_score_factor_score"):
+                if factor_scores.get(key) is not None:
+                    fields[key] = factor_scores[key]
+        if any(fields.get(k) is not None for k in ("gpa_score", "gpa", "gross_profitability", "f_score_score", "earnings_stability")):
+            for key in ("qmj_factor_score", "qmj_component_count"):
+                if factor_scores.get(key) is not None:
+                    fields[key] = factor_scores[key]
+        if any(fields.get(k) is not None for k in ("pe_ratio", "peg_ratio", "fcf_yield", "ev_ebit_score", "pb_score", "ps_score")):
+            fields["value_factor_score"] = factor_scores.get("value_factor_score")
+            if factor_scores.get("ev_ebit_factor_score") is not None:
+                fields["ev_ebit_factor_score"] = factor_scores["ev_ebit_factor_score"]
+    except Exception:
+        logger.debug("Replay fundamental factor derivation failed for %s %s", ticker, as_of.date())
+    return fields
 
 
 def _forward_labels(frame: pd.DataFrame, as_of: pd.Timestamp, price: float, atr: float | None) -> dict:

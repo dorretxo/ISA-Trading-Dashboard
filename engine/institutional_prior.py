@@ -15,6 +15,7 @@ from typing import Iterable, Mapping
 import numpy as np
 
 import config
+from engine.canonical_scores import compute_f_score_score
 from engine.fscore_utils import is_f_score_actionable
 
 
@@ -138,7 +139,7 @@ def _component_scores(row: Mapping) -> tuple[dict[str, float | None], float]:
     f_score = _float(row.get("f_score"))
     f_cov = row.get("f_score_coverage")
     if is_f_score_actionable(f_score, f_cov, config_module=config):
-        f_score_norm = _clip((f_score - 4.5) / 4.5)
+        f_score_norm = compute_f_score_score(f_score)
     else:
         f_score_norm = None
 
