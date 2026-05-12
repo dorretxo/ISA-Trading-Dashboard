@@ -445,14 +445,13 @@ def _pit_factor_snapshot(ticker: str, run_date: str, signal_price: float | None)
     total_debt = _finite(latest.get("total_debt")) or 0.0
     cash = _finite(latest.get("cash")) or 0.0
     market_cap = price * shares if price and price > 0 and shares and shares > 0 else None
-    if market_cap and market_cap > 0:
-        net_income = _finite(latest.get("net_income"))
-        if net_income and net_income > 0:
-            # PIT-safe trailing P/E so replay rows feed the same value-factor
-            # component basis as live.  Replay was previously NULL on pe_ratio
-            # which left value_factor_score in canonicalizer recompute missing
-            # the pe contribution that live had.
-            fields["pe_ratio"] = market_cap / net_income
+    # NOTE: do NOT derive pe_ratio = market_cap / net_income here.  The PIT
+    # snapshot's net_income is a single-quarter value while live's pe_ratio
+    # (yfinance trailing P/E) is TTM-based.  Naive division creates ~4x basis
+    # drift in the parity comparator (see PARR/BVS/REPX drilldown).  Correct
+    # PIT pe_ratio needs TTM aggregation across 4 quarters — separate change.
+    # Until then we leave replay's pe_ratio NULL so the comparator records
+    # 'missing' (not 'drift') for value_factor_score recompute.
     if operating_cashflow is not None:
         if capex is None:
             fcf = operating_cashflow
