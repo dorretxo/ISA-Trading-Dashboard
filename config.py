@@ -365,6 +365,21 @@ REPLAY_LIVE_PARITY_LIVE_ONLY_INPUTS_FOR_DERIVED = [
     # for canonicalizer recompute.
     "roe",
 ]
+# Stored aggregate fields whose live computation incorporates inputs that
+# replay cannot supply structurally (earnings_stability needs 5y annual EPS;
+# roe needs TTM aggregation).  The canonicalizer does NOT recompute these
+# (they are not factor scores derived inside compute_factor_scores_from_result),
+# so the drift cannot be neutralised by nulling inputs.  Reported separately
+# from actionable drift via structural_drift_summary so the gate signal stays
+# clean while transparency is preserved.  Remove an entry once replay can
+# supply the underlying inputs.  Verified 2026-05-13: 45/45 fmp_full drifters
+# on these fields have the live-only-input pattern; zero non-structural cases.
+REPLAY_LIVE_PARITY_STRUCTURAL_DRIFT_FIELDS = [
+    "fundamental_score",
+    "institutional_prior_score",
+    "institutional_prior_percentile",
+    "quality_score_fundamental",
+]
 REPLAY_LIVE_PARITY_FIELD_TOLERANCES = {
     "quality_factor_score": 0.35,
     "value_factor_score": 0.35,

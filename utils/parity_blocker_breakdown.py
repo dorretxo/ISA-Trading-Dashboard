@@ -397,10 +397,29 @@ def _non_actionable_evidence_classes(config_module=None) -> set[str]:
     return {str(item) for item in (raw or [])}
 
 
+def _structural_drift_fields(config_module=None) -> set[str]:
+    """Fields whose drift is explained by known live-only structural inputs.
+
+    See `REPLAY_LIVE_PARITY_STRUCTURAL_DRIFT_FIELDS` in config.py.  These are
+    stored aggregates the canonicalizer does not recompute, so the per-input
+    null-list trick cannot reach them.  Drift on these fields is reported in
+    `structural_drift_summary` rather than `actionable_drift_summary`.
+    """
+    cfg = config_module or config
+    raw = getattr(cfg, "REPLAY_LIVE_PARITY_STRUCTURAL_DRIFT_FIELDS", [])
+    return {str(item) for item in (raw or [])}
+
+
 def _actionable_drift(rows: list[dict], *, config_module=None) -> dict[str, int]:
     non_actionable = _non_actionable_evidence_classes(config_module)
+    structural = _structural_drift_fields(config_module)
     out: dict[str, int] = {}
     for row in rows:
+        field = str(row.get("field"))
+        if field in structural:
+            # Drift on this field is known-structural; routed to
+            # structural_drift_summary, never to actionable.
+            continue
         by_evidence = row.get("drifted_by_evidence", {}) or {}
         actionable = sum(
             int(count)
@@ -408,7 +427,33 @@ def _actionable_drift(rows: list[dict], *, config_module=None) -> dict[str, int]
             if str(evidence_class) not in non_actionable
         )
         if actionable:
-            out[str(row.get("field"))] = actionable
+            out[field] = actionable
+    return dict(sorted(out.items(), key=lambda item: item[1], reverse=True))
+
+
+def _structural_drift(rows: list[dict], *, config_module=None) -> dict[str, int]:
+    """Drift counts on `REPLAY_LIVE_PARITY_STRUCTURAL_DRIFT_FIELDS` only.
+
+    Returns the same evidence-class-filtered count shape as `_actionable_drift`
+    but restricted to fields tagged as structural.  Lets the operator see
+    *how much* known-structural drift exists without it polluting the
+    actionable gate signal.
+    """
+    non_actionable = _non_actionable_evidence_classes(config_module)
+    structural = _structural_drift_fields(config_module)
+    out: dict[str, int] = {}
+    for row in rows:
+        field = str(row.get("field"))
+        if field not in structural:
+            continue
+        by_evidence = row.get("drifted_by_evidence", {}) or {}
+        count = sum(
+            int(c)
+            for evidence_class, c in by_evidence.items()
+            if str(evidence_class) not in non_actionable
+        )
+        if count:
+            out[field] = count
     return dict(sorted(out.items(), key=lambda item: item[1], reverse=True))
 
 
@@ -788,10 +833,17 @@ def build_blocker_breakdown(*, top_n: int | None = None) -> dict:
     component_rows.sort(key=lambda row: row["total"], reverse=True)
 
     non_actionable = _non_actionable_evidence_classes(config)
+    structural_fields = _structural_drift_fields(config)
     actionable_drift_summary = {
         "field": _actionable_drift(field_rows, config_module=config),
         "component": _actionable_drift(component_rows, config_module=config),
         "non_actionable_classes": sorted(non_actionable),
+        "structural_fields_excluded": sorted(structural_fields),
+    }
+    structural_drift_summary = {
+        "field": _structural_drift(field_rows, config_module=config),
+        "component": _structural_drift(component_rows, config_module=config),
+        "structural_fields": sorted(structural_fields),
     }
 
     fmp_targets = [
@@ -835,6 +887,7 @@ def build_blocker_breakdown(*, top_n: int | None = None) -> dict:
         "field_summary": field_rows,
         "component_summary": component_rows,
         "actionable_drift_summary": actionable_drift_summary,
+        "structural_drift_summary": structural_drift_summary,
         "value_factor_drift_drilldown": value_factor_drift_rows[:80],
         "quality_score_fundamental_source_summary": dict(quality_source_counts),
         "fmp_targets": fmp_targets[:80],
@@ -865,6 +918,7 @@ def main() -> None:
         "top_fields": payload.get("field_summary", [])[:10],
         "component_summary": payload.get("component_summary", [])[:10],
         "actionable_drift_summary": payload.get("actionable_drift_summary"),
+        "structural_drift_summary": payload.get("structural_drift_summary"),
         "value_factor_drift_drilldown": payload.get("value_factor_drift_drilldown", [])[:10],
         "quality_score_fundamental_source_summary": payload.get("quality_score_fundamental_source_summary"),
         "top_fmp_targets": [

@@ -108,6 +108,7 @@ def test_actionable_drift_excludes_configured_evidence_classes(monkeypatch):
             "yfinance_balance_only",
             "no_data",
         ]
+        REPLAY_LIVE_PARITY_STRUCTURAL_DRIFT_FIELDS = []
 
     rows = [
         {
@@ -137,6 +138,83 @@ def test_non_actionable_evidence_classes_default_when_missing():
     assert breakdown._non_actionable_evidence_classes(EmptyConfig) == {
         "yfinance_balance_only",
         "no_data",
+    }
+
+
+def test_structural_drift_fields_default_empty_when_missing():
+    """No structural fields configured -> empty set; actionable behaviour
+    unchanged for legacy configs."""
+    class EmptyConfig:
+        pass
+
+    assert breakdown._structural_drift_fields(EmptyConfig) == set()
+
+
+def test_actionable_drift_excludes_structural_fields():
+    """Fields tagged as structural must NOT contribute to actionable counts
+    even when they have actionable-class drift.  Routed instead to
+    structural_drift_summary."""
+    class DummyConfig:
+        REPLAY_LIVE_PARITY_NON_ACTIONABLE_EVIDENCE_CLASSES = ["yfinance_balance_only"]
+        REPLAY_LIVE_PARITY_STRUCTURAL_DRIFT_FIELDS = [
+            "fundamental_score",
+            "institutional_prior_score",
+        ]
+
+    rows = [
+        {
+            "field": "qmj_factor_score",
+            "drifted_by_evidence": {"fmp_full": 3, "yfinance_balance_only": 40},
+        },
+        {
+            "field": "fundamental_score",
+            "drifted_by_evidence": {"fmp_full": 38},
+        },
+        {
+            "field": "institutional_prior_score",
+            "drifted_by_evidence": {"fmp_full": 17},
+        },
+    ]
+
+    # Only qmj_factor_score's fmp_full count survives in actionable.
+    assert breakdown._actionable_drift(rows, config_module=DummyConfig) == {
+        "qmj_factor_score": 3,
+    }
+
+
+def test_structural_drift_separates_known_structural_fields():
+    """`_structural_drift` returns only the drift on structural-tagged fields,
+    using the same evidence-class filter as `_actionable_drift`."""
+    class DummyConfig:
+        REPLAY_LIVE_PARITY_NON_ACTIONABLE_EVIDENCE_CLASSES = ["yfinance_balance_only"]
+        REPLAY_LIVE_PARITY_STRUCTURAL_DRIFT_FIELDS = [
+            "fundamental_score",
+            "institutional_prior_score",
+        ]
+
+    rows = [
+        {
+            "field": "qmj_factor_score",
+            "drifted_by_evidence": {"fmp_full": 3},
+        },
+        {
+            "field": "fundamental_score",
+            "drifted_by_evidence": {"fmp_full": 38, "yfinance_balance_only": 25},
+        },
+        {
+            "field": "institutional_prior_score",
+            "drifted_by_evidence": {"fmp_full": 17},
+        },
+        {
+            "field": "institutional_prior_percentile",  # not in structural list
+            "drifted_by_evidence": {"fmp_full": 10},
+        },
+    ]
+
+    # fmp_full counts on structural fields only; yfinance_balance_only filtered.
+    assert breakdown._structural_drift(rows, config_module=DummyConfig) == {
+        "fundamental_score": 38,
+        "institutional_prior_score": 17,
     }
 
 
