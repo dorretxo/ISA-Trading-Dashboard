@@ -349,7 +349,22 @@ REPLAY_LIVE_PARITY_ZERO_AS_MISSING_FIELDS = ["pe_ratio", "peg_ratio", "roe", "sh
 # rows feed `compute_factor_scores_from_result` on the same component basis.
 # They remain in REPLAY_LIVE_PARITY_EXCLUDED_FIELDS so they are also never
 # field-on-field compared.  Remove an entry only once replay can supply it.
-REPLAY_LIVE_PARITY_LIVE_ONLY_INPUTS_FOR_DERIVED = ["peg_ratio"]
+REPLAY_LIVE_PARITY_LIVE_ONLY_INPUTS_FOR_DERIVED = [
+    # PEG ratio is yfinance-.info-only; no PIT analog (needs forward analyst growth).
+    "peg_ratio",
+    # Earnings stability requires 5y annual EPS series via FMP; replay's PIT
+    # store only carries quarterly snapshots so it stays NULL on replay.
+    # Leaving it in derived recompute creates systematic qmj_factor_score and
+    # fundamental_score drift on fmp_full rows (observed on CBOE/STX/MYRG/REPX
+    # 2026-05-13: live qmj component_count=3 incl. safety, replay=2 missing it).
+    "earnings_stability",
+    # Return-on-equity on the live path is yfinance .info trailing-TTM.  Naive
+    # PIT-derivation (net_income / equity_proxy) would use single-quarter net
+    # income — same TTM-vs-quarterly basis trap that bit pe_ratio.  Until a
+    # TTM helper exists, replay leaves roe NULL and this nulls it on live too
+    # for canonicalizer recompute.
+    "roe",
+]
 REPLAY_LIVE_PARITY_FIELD_TOLERANCES = {
     "quality_factor_score": 0.35,
     "value_factor_score": 0.35,
