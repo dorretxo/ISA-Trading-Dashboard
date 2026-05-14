@@ -1731,6 +1731,24 @@ def save_discovery_results(disc_result, state: dict) -> int:
         _write_final_strong_buy_veto_report(state["cached_discovery"])
     except Exception as e:
         logger.warning("Failed to write final STRONG BUY veto report: %s", e)
+    # Auto-chain: refresh replay rows on today's discovery cohort BEFORE writing
+    # the parity report.  Without this, today's live rows (computed at the
+    # orchestrator run time, often before US market close when the price cache
+    # is one day stale) get compared against replay rows from a previous day
+    # that ran with a fresher cache.  The timing gap produces phantom drift on
+    # technical_score, momentum, and return fields — fields that are noisier
+    # the further apart the live and replay price-cache endpoints are.
+    # Observed 2026-05-14: pre-refresh parity showed 43.1% actionable drift;
+    # after running this refresh manually, drift dropped to 20.6% on the same
+    # cohort.  Auto-chaining ensures the orchestrator's daily parity report is
+    # always cohort-aligned without manual intervention.
+    if bool(getattr(config, "ORCHESTRATOR_AUTO_REPLAY_REFRESH", True)):
+        try:
+            from utils.replay_parity_refresh import refresh_replay_parity
+            refresh_replay_parity(refresh_existing=True)
+            logger.info("Auto-chained replay refresh complete.")
+        except Exception as e:
+            logger.warning("Auto-chained replay refresh failed (non-fatal): %s", e)
     try:
         _write_replay_live_parity_report(state["cached_discovery"])
     except Exception as e:

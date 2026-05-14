@@ -325,6 +325,14 @@ READY_STRONG_BUY_VETO_REPORT_PATH = "feature_cache/final_strong_buy_veto_report.
 DISCOVERY_LIVE_SANITY_REPORT_PATH = "feature_cache/live_run_sanity.json"
 DISCOVERY_SWAPS_REQUIRE_ENTRY_READY = True
 REPLAY_LIVE_PARITY_REPORT_PATH = "feature_cache/replay_live_parity_report.json"
+# When True (default), the daily orchestrator chains a replay refresh on the
+# fresh discovery cohort before writing the replay/live parity report.  This
+# keeps the parity comparison cohort-aligned (same day on both sides) and
+# avoids phantom drift on price-derived fields caused by live and replay using
+# different price-cache endpoints.  See daily_orchestrator.py around the call
+# to _write_replay_live_parity_report for the rationale.  Flip to False to
+# disable the refresh (e.g. if it adds unacceptable wall time).
+ORCHESTRATOR_AUTO_REPLAY_REFRESH = True
 REPLAY_LIVE_PARITY_TOLERANCE = 0.15
 REPLAY_LIVE_PARITY_MAX_DATE_GAP_DAYS = 7
 REPLAY_LIVE_PARITY_EXCLUDED_FIELDS = [
