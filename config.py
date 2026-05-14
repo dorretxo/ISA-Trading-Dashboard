@@ -379,6 +379,18 @@ REPLAY_LIVE_PARITY_STRUCTURAL_DRIFT_FIELDS = [
     "institutional_prior_score",
     "institutional_prior_percentile",
     "quality_score_fundamental",
+    # revenue_growth lives on two different bases between live and replay:
+    #   live (engine.fundamental.analyse): info.get("revenueGrowth") from
+    #     yfinance .info, which is yfinance's own TTM-YoY calculation.
+    #   replay (engine.historical_replay._fundamental_features): single-quarter
+    #     over single-quarter via revenue / prior_revenue - 1.0 from PIT
+    #     quarterly snapshots.
+    # Same TTM-vs-quarterly basis mismatch class as the pe_ratio bug.  Drift
+    # is structural until PIT TTM aggregation lands.  14 actionable drifters
+    # observed 2026-05-13 with values diverging in both directions (LOGN.SW
+    # 0.06 vs 2.56, LQDA 30.55 vs 10.31, BATRK 0.18 vs 1.27, JHG 0.61 vs 0.25)
+    # — direction-mixed pattern confirms it's basis mismatch, not noise.
+    "revenue_growth",
 ]
 REPLAY_LIVE_PARITY_FIELD_TOLERANCES = {
     "quality_factor_score": 0.35,
