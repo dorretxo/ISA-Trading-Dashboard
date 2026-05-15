@@ -969,6 +969,16 @@ ML_RANKER_PARITY_CRITICAL_FIELDS = [
     "return_10d_prior", "return_30d_prior", "return_90d_prior", "vol_20d",
     "f_score", "gpa", "institutional_prior_score",
 ]
+# When True (default), the parity gate prefers the actionable-segmented drift
+# counts (actionable_drifted_tickers / actionable_available_pairs) over the
+# raw drifted_tickers count.  Actionable excludes yfinance_balance_only and
+# no_data evidence classes (noise we already gate downstream via source-aware
+# caps) and ignores drift on REPLAY_LIVE_PARITY_STRUCTURAL_DRIFT_FIELDS
+# (drift explained by live-only inputs replay cannot supply structurally).
+# Falls back to raw counts when the report lacks the actionable fields, so
+# stale parity reports do not crash the gate.  Flip to False to force raw
+# legacy behaviour for rollback.
+ML_RANKER_PARITY_USE_ACTIONABLE_DRIFT = True
 ML_RANKER_EMBARGO_DAYS = 30                 # Purge overlapping 30d target windows
 ML_RANKER_MIN_TRAIN_SAMPLES = 80
 ML_RANKER_MODEL_CACHE_FILE = "feature_cache/ml_ranker_model.pkl"

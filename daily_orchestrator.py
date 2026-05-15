@@ -574,6 +574,7 @@ def _write_replay_live_parity_report(candidates: list[dict]) -> None:
 
         init_backtest_db()
         from utils.replay_live_parity import adaptive_weight_fields, comparable_fields, compare_parity_rows
+        from engine.coverage_evidence import classify_evidence, qmj_usable_components
 
         with _connect() as conn:
             valid = {str(row[1]) for row in conn.execute("PRAGMA table_info(signal_backtest)").fetchall()}
@@ -666,9 +667,18 @@ def _write_replay_live_parity_report(candidates: list[dict]) -> None:
                     readiness_fields,
                     default_tolerance=tolerance,
                 )
+                # Classify evidence so the ML gate can consume actionable
+                # (non-noise) drift counts in preference to raw drifted_tickers.
+                # Same classifier as parity_blocker_breakdown.py for consistency.
+                evidence_class = classify_evidence(
+                    ticker=ticker,
+                    pit_source=live_d.get("pit_source") or live_d.get("_pit_source"),
+                    qmj_components=qmj_usable_components(live_d, config_module=config),
+                )
                 rows_out.append({
                     "ticker": ticker,
                     "available": True,
+                    "evidence_class": evidence_class,
                     "latest_discovery_run": live_d.get("run_date"),
                     "latest_replay_run": replay_d.get("run_date"),
                     "date_gap_days": date_gap_days,
@@ -764,6 +774,48 @@ def _write_replay_live_parity_report(candidates: list[dict]) -> None:
         "live_missing_field_counts": dict(readiness_live_missing_counts),
         "replay_missing_field_counts": dict(readiness_replay_missing_counts),
     }
+    # Actionable counts exclude rows whose evidence class is known-noisy
+    # (yfinance_balance_only, no_data) AND ignore drift on fields that are
+    # structurally explained by live-only inputs replay cannot supply.  See
+    # config.REPLAY_LIVE_PARITY_NON_ACTIONABLE_EVIDENCE_CLASSES and
+    # REPLAY_LIVE_PARITY_STRUCTURAL_DRIFT_FIELDS.  The ML ranker gate
+    # consumes these instead of raw drifted_tickers when
+    # ML_RANKER_PARITY_USE_ACTIONABLE_DRIFT is True, so the gate fires on
+    # genuine divergence rather than data noise.
+    non_actionable_classes = set(getattr(
+        config, "REPLAY_LIVE_PARITY_NON_ACTIONABLE_EVIDENCE_CLASSES",
+        ["yfinance_balance_only", "no_data"],
+    ) or [])
+    structural_drift_fields = set(getattr(
+        config, "REPLAY_LIVE_PARITY_STRUCTURAL_DRIFT_FIELDS", []) or [])
+    actionable_available_pairs = 0
+    actionable_drifted_tickers = 0
+    actionable_replay_missing_counts: Counter[str] = Counter()
+    actionable_evidence_class_counts: Counter[str] = Counter()
+    for row in available_rows:
+        cls = row.get("evidence_class") or "no_data"
+        actionable_evidence_class_counts[cls] += 1
+        if cls in non_actionable_classes:
+            continue
+        actionable_available_pairs += 1
+        if set(row.get("drift_fields") or []) - structural_drift_fields:
+            actionable_drifted_tickers += 1
+        # Pure replay-missing: live has a value but replay does not.  Avoids
+        # over-counting both-missing rows (where both live and replay are
+        # None — a coverage gap, not a replay-side bug).  compare_parity_rows
+        # populates both live_missing_fields AND replay_missing_fields when
+        # both sides are None, so reading row.get("replay_missing_fields")
+        # directly inflates the actionable critical-missingness rate.
+        for comp in row.get("comparisons") or []:
+            if comp.get("status") != "missing":
+                continue
+            if comp.get("live") is None or comp.get("replay") is not None:
+                continue
+            f = comp.get("field")
+            if not f or f in structural_drift_fields:
+                continue
+            actionable_replay_missing_counts[f] += 1
+
     payload = {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "available": True,
@@ -780,6 +832,12 @@ def _write_replay_live_parity_report(candidates: list[dict]) -> None:
         "missing_field_counts": dict(missing_counts),
         "live_missing_field_counts": dict(live_missing_counts),
         "replay_missing_field_counts": dict(replay_missing_counts),
+        "actionable_available_pairs": actionable_available_pairs,
+        "actionable_drifted_tickers": actionable_drifted_tickers,
+        "actionable_replay_missing_field_counts": dict(actionable_replay_missing_counts),
+        "actionable_evidence_class_counts": dict(actionable_evidence_class_counts),
+        "actionable_non_actionable_classes": sorted(non_actionable_classes),
+        "actionable_structural_fields_excluded": sorted(structural_drift_fields),
         "adaptive_weight_parity": adaptive_weight_parity,
         "readiness_parity": readiness_parity,
         "top_drifted": sorted(

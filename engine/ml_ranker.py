@@ -141,7 +141,30 @@ def _replay_live_parity_gate(report: dict | None = None) -> tuple[bool, list[str
     available_ratio = available_pairs / max(denominator, 1)
     missing_ratio = missing_replay / max(denominator, 1)
     stale_ratio = stale_replay / max(denominator, 1)
-    drifted_pair_ratio = drifted_tickers / pair_denominator
+
+    # Actionable mode: when the report carries evidence-class-segmented counts
+    # AND the config flag is True, prefer those for drift/missingness checks.
+    # The raw drifted_tickers count is dominated by yfinance_balance_only noise
+    # we already gate downstream via source-aware caps, and structural-only
+    # drift on fundamental_score / institutional_prior / etc is explained by
+    # live-only inputs replay cannot supply.  Reading the actionable counts
+    # lets the gate fire only on genuine code/data divergence.
+    use_actionable = (
+        bool(getattr(config, "ML_RANKER_PARITY_USE_ACTIONABLE_DRIFT", True))
+        and report.get("actionable_drifted_tickers") is not None
+        and report.get("actionable_available_pairs") is not None
+    )
+    if use_actionable:
+        gate_drifted = _safe_int(report.get("actionable_drifted_tickers"), 0)
+        gate_drift_denominator = max(_safe_int(report.get("actionable_available_pairs"), 0), 1)
+        gate_replay_missing = report.get("actionable_replay_missing_field_counts") or {}
+        gate_critical_denominator = gate_drift_denominator
+    else:
+        gate_drifted = drifted_tickers
+        gate_drift_denominator = pair_denominator
+        gate_replay_missing = report.get("replay_missing_field_counts") or {}
+        gate_critical_denominator = pair_denominator
+    drifted_pair_ratio = gate_drifted / max(gate_drift_denominator, 1)
 
     min_available = float(getattr(config, "ML_RANKER_PARITY_MIN_AVAILABLE_RATIO", 0.70))
     max_missing = float(getattr(config, "ML_RANKER_PARITY_MAX_MISSING_REPLAY_RATIO", 0.20))
@@ -156,7 +179,8 @@ def _replay_live_parity_gate(report: dict | None = None) -> tuple[bool, list[str
     if stale_ratio > max_stale:
         blockers.append(f"stale_replay_ratio={stale_ratio:.0%}>{max_stale:.0%}")
     if drifted_pair_ratio > max_drifted:
-        blockers.append(f"drifted_pair_ratio={drifted_pair_ratio:.0%}>{max_drifted:.0%}")
+        label = "actionable_drifted_pair_ratio" if use_actionable else "drifted_pair_ratio"
+        blockers.append(f"{label}={drifted_pair_ratio:.0%}>{max_drifted:.0%}")
 
     generated_at = report.get("generated_at")
     max_age_hours = _safe_float(getattr(config, "ML_RANKER_PARITY_MAX_AGE_HOURS", 48), 48.0)
@@ -174,17 +198,17 @@ def _replay_live_parity_gate(report: dict | None = None) -> tuple[bool, list[str
         blockers.append("parity report generated_at missing")
 
     critical_fields = list(getattr(config, "ML_RANKER_PARITY_CRITICAL_FIELDS", []) or [])
-    replay_missing = report.get("replay_missing_field_counts") or {}
     critical_missing: dict[str, float] = {}
     max_critical_missing = float(getattr(config, "ML_RANKER_PARITY_MAX_CRITICAL_MISSING_RATIO", 0.15))
     for field in critical_fields:
-        missing_count = _safe_int(replay_missing.get(field), 0)
-        ratio = missing_count / pair_denominator
+        missing_count = _safe_int(gate_replay_missing.get(field), 0)
+        ratio = missing_count / max(gate_critical_denominator, 1)
         if ratio > max_critical_missing:
             critical_missing[field] = ratio
     if critical_missing:
         top = ", ".join(f"{field}={ratio:.0%}" for field, ratio in list(critical_missing.items())[:5])
-        blockers.append(f"critical replay missingness too high: {top}")
+        prefix = "critical actionable replay missingness" if use_actionable else "critical replay missingness"
+        blockers.append(f"{prefix} too high: {top}")
 
     summary = {
         "enabled": True,
@@ -195,6 +219,10 @@ def _replay_live_parity_gate(report: dict | None = None) -> tuple[bool, list[str
         "missing_replay_ratio": round(missing_ratio, 4),
         "stale_replay_ratio": round(stale_ratio, 4),
         "drifted_pair_ratio": round(drifted_pair_ratio, 4),
+        "drifted_tickers_raw": drifted_tickers,
+        "drift_mode": "actionable" if use_actionable else "raw",
+        "actionable_drifted_tickers": _safe_int(report.get("actionable_drifted_tickers"), 0) if use_actionable else None,
+        "actionable_available_pairs": _safe_int(report.get("actionable_available_pairs"), 0) if use_actionable else None,
         "age_hours": None if age_hours is None else round(age_hours, 2),
         "critical_missing": {k: round(v, 4) for k, v in critical_missing.items()},
         "blockers": blockers,
