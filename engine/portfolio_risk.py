@@ -70,7 +70,7 @@ def calculate_correlation_matrix(tickers: list[str]) -> pd.DataFrame:
         df = get_price_history(ticker)
         if df is not None and not df.empty and len(df) > 20:
             closes = df["Close"].tail(90)
-            daily_returns = closes.pct_change().dropna()
+            daily_returns = closes.pct_change(fill_method=None).dropna()
             if len(daily_returns) >= 15:
                 returns_dict[ticker] = daily_returns.values[-min(len(daily_returns), 60):]
 

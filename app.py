@@ -3229,10 +3229,15 @@ with tab_analytics:
                 if ticker_select:
                     ticker_mae = mae_df[ticker_select].dropna().sort_values()
 
+                    mae_plot_df = pd.DataFrame({
+                        "Model": ticker_mae.index,
+                        "MAE": ticker_mae.values,
+                    })
                     fig_mae = px.bar(
-                        x=ticker_mae.values, y=ticker_mae.index,
+                        mae_plot_df,
+                        x="MAE", y="Model",
                         orientation="h",
-                        color=ticker_mae.values,
+                        color="MAE",
                         color_continuous_scale=[[0, "#10b981"], [0.5, "#fbbf24"], [1, "#ef4444"]],
                     )
                     fig_mae.update_layout(
@@ -3286,9 +3291,14 @@ with tab_analytics:
                     w_series = weight_df[ticker_select_w].dropna().sort_values(ascending=False)
 
                     # Bar chart
+                    weights_plot_df = pd.DataFrame({
+                        "Model": w_series.index,
+                        "Influence": w_series.values,
+                    })
                     fig_w = px.bar(
-                        x=w_series.index, y=w_series.values,
-                        color=w_series.values,
+                        weights_plot_df,
+                        x="Model", y="Influence",
+                        color="Influence",
                         color_continuous_scale=[[0, "#6b7280"], [1, "#3b82f6"]],
                     )
                     fig_w.update_layout(
