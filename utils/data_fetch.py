@@ -117,32 +117,53 @@ def record_sale(
 
 
 def get_price_history(ticker: str) -> pd.DataFrame:
-    """Fetch price history with caching. Returns OHLCV DataFrame."""
+    """Fetch price history with caching. Returns OHLCV DataFrame.
+
+    Delegates to ``utils.price_store`` so live discovery scoring and offline
+    replay read from the same on-disk backing store.  Before this change the
+    live path hit yfinance directly while replay read pickled cache files,
+    producing systematic drift on price-derived factor scores
+    (technical_score, turnover_cost_score, return_*_prior, momentum_*) when
+    the two side data sources diverged.
+
+    Behaviour: checks ``feature_cache/price_history/<TICKER>.pkl`` first;
+    triggers a yfinance fetch only when the cached frame is missing or its
+    most recent bar is more than ~3 days stale.  The fetch always writes
+    back through to the on-disk cache so subsequent replay reads see the
+    same series.  Failures return an empty frame, matching the prior contract.
+    """
     if ticker in _price_cache:
         return _price_cache[ticker]
 
-    period = f"{config.PRICE_HISTORY_DAYS}d"
+    df = pd.DataFrame()
     try:
-        df = yf.download(ticker, period=period, progress=False, auto_adjust=True, timeout=30)
-        if df.empty:
-            _price_cache[ticker] = pd.DataFrame()
-            return pd.DataFrame()
-        df = _normalise_price_frame(df, ticker)
-        # Drop trailing rows with NaN Close (yfinance returns today's row with
-        # NaN when the market is still open or data isn't available yet).
-        # This prevents downstream ZeroDivisionError / NaN propagation.
-        if "Close" in df.columns:
+        # Local import to avoid a circular dependency at module load time.
+        from utils import price_store
+
+        today = pd.Timestamp.today().normalize()
+        period_days = int(getattr(config, "PRICE_HISTORY_DAYS", 365))
+        start = (today - pd.Timedelta(days=period_days)).date().isoformat()
+        end = (today + pd.Timedelta(days=1)).date().isoformat()
+
+        # ensure_price_history checks cache freshness inside download_price_history
+        # and only triggers a yfinance batch when the cache is missing or stale.
+        df = price_store.ensure_price_history(ticker, start=start, end=end)
+
+        # Preserve the prior normalisation: drop trailing NaN-Close rows so
+        # downstream technical analysis doesn't divide by NaN.
+        if isinstance(df, pd.DataFrame) and not df.empty and "Close" in df.columns:
             close = _close_series(df)
-            _last_valid = close.last_valid_index()
-            if _last_valid is not None:
-                df = df.loc[:_last_valid]
+            last_valid = close.last_valid_index()
+            if last_valid is not None:
+                df = df.loc[:last_valid]
             else:
                 df = pd.DataFrame()
-        _price_cache[ticker] = df
-    except Exception:
-        _price_cache[ticker] = pd.DataFrame()
+    except Exception as exc:
+        logger.debug("get_price_history(%s) failed: %s", ticker, exc)
+        df = pd.DataFrame()
 
-    return _price_cache[ticker]
+    _price_cache[ticker] = df
+    return df
 
 
 def reset_ticker_info_stats() -> None:
