@@ -119,6 +119,7 @@ def _apply_core_ready_stretch_override(candidate: Any, result, *, stretch: float
 class GateContext:
     """Pre-computed batch-level context shared across candidates."""
     sector_median_ev_ebit: dict = field(default_factory=dict)
+    sector_median_revenue_growth: dict = field(default_factory=dict)
     qmj_percentiles: dict = field(default_factory=dict)        # ticker -> percentile [0,1]
     gpa_percentiles: dict = field(default_factory=dict)
 
@@ -237,6 +238,39 @@ def _sector_aware_percentiles(
     return out
 
 
+def _sector_median_any(
+    rows: list[dict],
+    *,
+    key: str,
+    sector_key: str = "sector",
+    min_n: int = 3,
+) -> dict[str, float]:
+    """Return sector medians for signed metrics such as revenue growth."""
+    buckets: dict[str, list[float]] = {}
+    for row in rows:
+        val = _f(row.get(key))
+        if val is None:
+            continue
+        sector = str(row.get(sector_key) or "Unknown")
+        buckets.setdefault(sector, []).append(val)
+    all_values = [v for values in buckets.values() for v in values]
+    if all_values:
+        all_values.sort()
+        mid = len(all_values) // 2
+        global_median = all_values[mid] if len(all_values) % 2 else 0.5 * (all_values[mid - 1] + all_values[mid])
+    else:
+        global_median = None
+    out: dict[str, float] = {}
+    for sector, values in buckets.items():
+        if len(values) >= min_n:
+            values.sort()
+            mid = len(values) // 2
+            out[sector] = values[mid] if len(values) % 2 else 0.5 * (values[mid - 1] + values[mid])
+        elif global_median is not None:
+            out[sector] = global_median
+    return out
+
+
 def build_context(candidates: Iterable[Any], *, config_module=None) -> GateContext:
     """One-shot scan over the batch to build sector medians and percentiles."""
     rows: list[dict] = []
@@ -249,7 +283,12 @@ def build_context(candidates: Iterable[Any], *, config_module=None) -> GateConte
         ticker = str(getattr(c, "ticker", "") or "")
         sector = str(getattr(c, "sector", "") or "Unknown")
         ev_ebit = _f(getattr(c, "ev_ebit", None))
-        rows.append({"ticker": ticker, "sector": sector, "ev_ebit": ev_ebit})
+        rows.append({
+            "ticker": ticker,
+            "sector": sector,
+            "ev_ebit": ev_ebit,
+            "revenue_growth": _f(getattr(c, "revenue_growth", None)),
+        })
         qmj_values.append(_f(getattr(c, "qmj_factor_score", None)))
         # Use gpa as proxy when gpa_score isn't present
         gpa_score = _f(getattr(c, "gpa_score", None))
@@ -258,6 +297,7 @@ def build_context(candidates: Iterable[Any], *, config_module=None) -> GateConte
         sectors.append(sector)
 
     sec_med = compute_sector_medians(rows, key="ev_ebit", sector_key="sector")
+    rev_med = _sector_median_any(rows, key="revenue_growth", sector_key="sector")
     qmj_pcts = _sector_aware_percentiles(
         tickers=tickers, sectors=sectors, values=qmj_values, config_module=config_module,
     )
@@ -267,6 +307,7 @@ def build_context(candidates: Iterable[Any], *, config_module=None) -> GateConte
 
     return GateContext(
         sector_median_ev_ebit=sec_med,
+        sector_median_revenue_growth=rev_med,
         qmj_percentiles=qmj_pcts,
         gpa_percentiles=gpa_pcts,
     )
@@ -289,6 +330,7 @@ def evaluate_candidate(candidate: Any, *, context: GateContext, config_module=No
     qmj_pct = context.qmj_percentiles.get(ticker)
     gpa_pct = context.gpa_percentiles.get(ticker)
     sec_med_ev_ebit = context.sector_median_ev_ebit.get(sector)
+    sec_med_revenue_growth = context.sector_median_revenue_growth.get(sector)
 
     # Tier 1
     t1 = evaluate_distress_gates(
@@ -313,7 +355,10 @@ def evaluate_candidate(candidate: Any, *, context: GateContext, config_module=No
         pe_forward=pe_forward,
         eps_growth_3y_cagr=_f(getattr(candidate, "eps_growth_3y_cagr", None)),
         sector_median_ev_ebit=sec_med_ev_ebit,
+        revenue_growth=_f(getattr(candidate, "revenue_growth", None)),
+        sector_median_revenue_growth=sec_med_revenue_growth,
         qmj_percentile=qmj_pct,
+        f_score=_f(getattr(candidate, "f_score", None)),
         config_module=cfg,
     )
 

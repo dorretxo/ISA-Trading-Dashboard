@@ -90,6 +90,11 @@ _FINAL_STRONG_BUY_VETO_REPORT = ROOT / getattr(
     "READY_STRONG_BUY_VETO_REPORT_PATH",
     "feature_cache/final_strong_buy_veto_report.json",
 )
+_VALUE_CAP_SHADOW_REPORT = ROOT / getattr(
+    config,
+    "VALUE_CAP_SHADOW_REPORT_PATH",
+    "feature_cache/value_cap_shadow_report.json",
+)
 _LIVE_RUN_SANITY_REPORT = ROOT / getattr(
     config,
     "DISCOVERY_LIVE_SANITY_REPORT_PATH",
@@ -360,6 +365,16 @@ def _write_final_strong_buy_veto_report(candidates: list[dict]) -> None:
         "candidates": rows,
     }
     atomic_write_json(_FINAL_STRONG_BUY_VETO_REPORT, payload, indent=2)
+
+
+def _write_value_cap_shadow_report(candidates: list[dict]) -> None:
+    """Persist shadow-only valuation/prior counterfactual diagnostics."""
+    if not bool(getattr(config, "VALUE_CAP_SHADOW_REPORT_ENABLED", True)):
+        return
+    from engine.value_cap_shadow import build_value_cap_shadow_report
+
+    payload = build_value_cap_shadow_report(candidates, config_module=config)
+    atomic_write_json(_VALUE_CAP_SHADOW_REPORT, payload, indent=2)
 
 
 def _strong_buy_rows(candidates: list[dict]) -> list[dict]:
@@ -1757,6 +1772,7 @@ def save_discovery_results(disc_result, state: dict) -> int:
             "f_score_gate": getattr(c, "f_score_gate", False),
             "f_score_score": getattr(c, "f_score_score", None),
             "f_score_coverage": getattr(c, "f_score_coverage", None),
+            "qmj_factor_score": getattr(c, "qmj_factor_score", None),
             "qmj_component_count": getattr(c, "qmj_component_count", None),
             "pit_source": getattr(c, "pit_source", None),
             # Day-1 quality / self-learning diagnostics
@@ -1836,6 +1852,10 @@ def save_discovery_results(disc_result, state: dict) -> int:
         _write_final_strong_buy_veto_report(state["cached_discovery"])
     except Exception as e:
         logger.warning("Failed to write final STRONG BUY veto report: %s", e)
+    try:
+        _write_value_cap_shadow_report(state["cached_discovery"])
+    except Exception as e:
+        logger.warning("Failed to write value-cap shadow report: %s", e)
     # Auto-chain: refresh replay rows on today's discovery cohort BEFORE writing
     # the parity report.  Without this, today's live rows (computed at the
     # orchestrator run time, often before US market close when the price cache

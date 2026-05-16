@@ -1013,6 +1013,18 @@ def _apply_replay_readiness_fields(rows: dict[str, dict]) -> None:
         row["strong_buy_eligible"] = 1 if status == "PASS" else 0
         row["strong_buy_blockers"] = _json_or_none([] if status == "PASS" else reasons)
 
+    try:
+        from engine.value_cap_shadow import annotate_value_cap_shadow
+
+        annotations = annotate_value_cap_shadow(list(rows.values()), config_module=config)
+        for ann in annotations:
+            ticker = str(ann.get("ticker") or "").upper()
+            if ticker in rows:
+                rows[ticker]["value_cap_shadow_bucket"] = ann.get("primary_bucket")
+                rows[ticker]["value_cap_shadow_json"] = _json_or_none(ann)
+    except Exception as exc:
+        logger.debug("Replay value-cap shadow annotation failed: %s", exc)
+
 
 def _insert_replay_row(
     ticker: str,

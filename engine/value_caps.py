@@ -43,6 +43,61 @@ def _f(value: Any) -> float | None:
     return num if math.isfinite(num) else None
 
 
+def _quality_growth_override_allowed(
+    *,
+    qmj_percentile: float | None,
+    f_score: float | None,
+    revenue_growth: float | None,
+    sector_median_revenue_growth: float | None,
+    config_module,
+) -> tuple[bool, list[str]]:
+    """Return whether a rich multiple earns the shadowable quality-growth waiver."""
+    cfg = config_module
+    if not getattr(cfg, "STRONG_BUY_VALUATION_QUALITY_OVERRIDE_ENABLED", False):
+        return False, ["quality-growth valuation override disabled"]
+
+    reasons: list[str] = []
+    qmj = _f(qmj_percentile)
+    qmj_floor = float(getattr(cfg, "STRONG_BUY_VALUATION_OVERRIDE_QMJ_FLOOR", 0.80))
+    if qmj is None or qmj < qmj_floor:
+        reasons.append(
+            "QMJ pctile missing"
+            if qmj is None
+            else f"QMJ pctile {qmj:.0%} below override floor ({qmj_floor:.0%})"
+        )
+
+    fs = _f(f_score)
+    min_f = float(getattr(cfg, "STRONG_BUY_VALUATION_OVERRIDE_MIN_F_SCORE", 7))
+    if fs is None or fs < min_f:
+        reasons.append(
+            "F-score missing"
+            if fs is None
+            else f"F-score {fs:.0f}/9 below override floor ({min_f:.0f})"
+        )
+
+    growth = _f(revenue_growth)
+    min_growth = float(getattr(cfg, "STRONG_BUY_VALUATION_OVERRIDE_MIN_REVENUE_GROWTH", 0.0))
+    if growth is None or growth < min_growth:
+        reasons.append(
+            "Revenue growth missing"
+            if growth is None
+            else f"Revenue growth {growth:.0%} below override floor ({min_growth:.0%})"
+        )
+
+    if getattr(cfg, "STRONG_BUY_VALUATION_OVERRIDE_REQUIRE_SECTOR_GROWTH", True):
+        sector_growth = _f(sector_median_revenue_growth)
+        if sector_growth is None:
+            reasons.append("Sector median revenue growth missing")
+        elif growth is None or growth < sector_growth:
+            reasons.append(
+                "Revenue growth missing"
+                if growth is None
+                else f"Revenue growth {growth:.0%} below sector median ({sector_growth:.0%})"
+            )
+
+    return not reasons, reasons
+
+
 # ---------------------------------------------------------------------------
 # Tier 2 — value caps
 # ---------------------------------------------------------------------------
@@ -54,7 +109,10 @@ def evaluate_value_caps(
     pe_forward: float | None,
     eps_growth_3y_cagr: float | None = None,
     sector_median_ev_ebit: float | None = None,
+    revenue_growth: float | None = None,
+    sector_median_revenue_growth: float | None = None,
     qmj_percentile: float | None = None,
+    f_score: float | None = None,
     config_module=None,
 ) -> ValueQualityGateResult:
     """Apply EV/EBIT, EV/Sales and forward-P/E caps.
@@ -85,11 +143,30 @@ def evaluate_value_caps(
                 result.reasons.append(f"EV/EBIT {v:.1f}x above absolute ceiling ({global_buy:.0f}x)")
                 result.flags["ev_ebit"] = "fail"
             elif v > cap_strong:
-                result.action_ceiling = _cap(result.action_ceiling, "BUY")
-                msg = f"EV/EBIT {v:.1f}x above STRONG-BUY cap ({cap_strong:.0f}x"
-                msg += " sector-relative)" if sector_strong is not None and sector_strong < global_strong else ")"
-                result.reasons.append(msg)
-                result.flags["ev_ebit"] = "borderline"
+                override_max = float(getattr(cfg, "STRONG_BUY_VALUATION_OVERRIDE_MAX_EV_EBIT", 35.0))
+                override_enabled = bool(getattr(cfg, "STRONG_BUY_VALUATION_QUALITY_OVERRIDE_ENABLED", False))
+                override_ok, override_blockers = _quality_growth_override_allowed(
+                    qmj_percentile=qmj_percentile,
+                    f_score=f_score,
+                    revenue_growth=revenue_growth,
+                    sector_median_revenue_growth=sector_median_revenue_growth,
+                    config_module=cfg,
+                )
+                if v <= override_max and override_ok:
+                    result.flags["ev_ebit"] = "pass-quality-growth-override"
+                    result.reasons.append(
+                        f"EV/EBIT {v:.1f}x above {cap_strong:.0f}x but clears quality-growth override"
+                    )
+                else:
+                    result.action_ceiling = _cap(result.action_ceiling, "BUY")
+                    msg = f"EV/EBIT {v:.1f}x above STRONG-BUY cap ({cap_strong:.0f}x"
+                    msg += " sector-relative)" if sector_strong is not None and sector_strong < global_strong else ")"
+                    if v > override_max:
+                        msg += f"; above override ceiling ({override_max:.0f}x)"
+                    elif override_enabled and override_blockers:
+                        msg += f"; override blocked: {'; '.join(override_blockers[:3])}"
+                    result.reasons.append(msg)
+                    result.flags["ev_ebit"] = "borderline"
             else:
                 result.flags["ev_ebit"] = "pass"
         else:
@@ -129,9 +206,29 @@ def evaluate_value_caps(
                     f"Fwd P/E {v:.1f}x above {cap:.0f}x but EPS CAGR {growth:.0%} clears override"
                 )
             else:
-                result.action_ceiling = _cap(result.action_ceiling, "BUY")
-                result.reasons.append(f"Fwd P/E {v:.1f}x above STRONG-BUY cap ({cap:.0f}x)")
-                result.flags["pe_forward"] = "fail"
+                override_max = float(getattr(cfg, "STRONG_BUY_VALUATION_OVERRIDE_MAX_PE_FORWARD", 40.0))
+                override_enabled = bool(getattr(cfg, "STRONG_BUY_VALUATION_QUALITY_OVERRIDE_ENABLED", False))
+                override_ok, override_blockers = _quality_growth_override_allowed(
+                    qmj_percentile=qmj_percentile,
+                    f_score=f_score,
+                    revenue_growth=revenue_growth,
+                    sector_median_revenue_growth=sector_median_revenue_growth,
+                    config_module=cfg,
+                )
+                if v <= override_max and override_ok:
+                    result.flags["pe_forward"] = "pass-quality-growth-override"
+                    result.reasons.append(
+                        f"Fwd P/E {v:.1f}x above {cap:.0f}x but clears quality-growth override"
+                    )
+                else:
+                    result.action_ceiling = _cap(result.action_ceiling, "BUY")
+                    msg = f"Fwd P/E {v:.1f}x above STRONG-BUY cap ({cap:.0f}x)"
+                    if v > override_max:
+                        msg += f"; above override ceiling ({override_max:.0f}x)"
+                    elif override_enabled and override_blockers:
+                        msg += f"; override blocked: {'; '.join(override_blockers[:3])}"
+                    result.reasons.append(msg)
+                    result.flags["pe_forward"] = "fail"
         else:
             result.flags["pe_forward"] = "pass"
     else:

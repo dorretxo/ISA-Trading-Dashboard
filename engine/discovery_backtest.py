@@ -351,6 +351,8 @@ _FEATURE_STORE_COLUMNS = [
     ("action_gate_reasons", "TEXT"),
     ("action_gate_flags_json", "TEXT"),
     ("threshold_profile", "TEXT"),
+    ("value_cap_shadow_bucket", "TEXT"),
+    ("value_cap_shadow_json", "TEXT"),
     # Exit-action smoother fields (Constantinides 1986; Davis-Norman 1990; Wald 1947)
     ("smoothed_action", "TEXT"),
     ("smoothing_reason", "TEXT"),
@@ -1068,6 +1070,18 @@ def record_discovery_picks(candidates: list) -> int:
     now = datetime.now().isoformat(timespec="seconds")
     today = now[:10]
     count = 0
+    try:
+        from engine.value_cap_shadow import annotate_value_cap_shadow
+
+        shadow_annotations = annotate_value_cap_shadow(candidates, config_module=config)
+        value_cap_shadow_by_ticker = {
+            str(row.get("ticker") or "").upper(): row
+            for row in shadow_annotations
+            if row.get("ticker")
+        }
+    except Exception as exc:
+        logger.debug("Value-cap shadow annotation failed for discovery picks: %s", exc)
+        value_cap_shadow_by_ticker = {}
 
     with _connect() as conn:
         for c in candidates:
@@ -1296,6 +1310,8 @@ def record_discovery_picks(candidates: list) -> int:
             if signal_price <= 0:
                 continue
 
+            value_cap_shadow = value_cap_shadow_by_ticker.get(str(ticker or "").upper())
+            value_cap_shadow_json = json.dumps(value_cap_shadow, default=str) if value_cap_shadow else None
             existing = conn.execute(
                 "SELECT id FROM signal_backtest WHERE ticker=? AND source='discovery' AND run_date LIKE ?",
                 (ticker, today + "%"),
@@ -1463,6 +1479,10 @@ def record_discovery_picks(candidates: list) -> int:
                     getattr(c, "threshold_profile", None) if hasattr(c, "threshold_profile")
                     else c.get("threshold_profile")
                 ),
+                "value_cap_shadow_bucket": (
+                    value_cap_shadow.get("primary_bucket") if value_cap_shadow else None
+                ),
+                "value_cap_shadow_json": value_cap_shadow_json,
             }
             columns = ", ".join(payload.keys())
             placeholders = ", ".join("?" for _ in payload)

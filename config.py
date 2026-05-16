@@ -486,6 +486,17 @@ EV_SALES_QMJ_OVERRIDE_PCTILE = 0.80      # QMJ percentile that lifts EV/Sales ca
 PE_FORWARD_STRONG_BUY_MAX = 30.0
 PE_FORWARD_GROWTH_OVERRIDE_CAGR = 0.25   # Override P/E cap if 3y EPS CAGR > this
 DEEP_VALUE_SPREAD_PCTILE = 0.80          # Up-weight value when E/P spread > this
+VALUE_CAP_SHADOW_REPORT_ENABLED = True
+VALUE_CAP_SHADOW_REPORT_PATH = "feature_cache/value_cap_shadow_report.json"
+STRONG_BUY_VALUATION_QUALITY_OVERRIDE_ENABLED = False  # Live-off; evaluated only by the shadow report unless flipped.
+STRONG_BUY_VALUATION_QUALITY_OVERRIDE_SHADOW = True
+STRONG_BUY_VALUATION_OVERRIDE_QMJ_FLOOR = 0.80          # Top-quintile QMJ required to override rich multiples.
+STRONG_BUY_VALUATION_OVERRIDE_MIN_F_SCORE = 7
+STRONG_BUY_VALUATION_OVERRIDE_MIN_REVENUE_GROWTH = 0.0
+STRONG_BUY_VALUATION_OVERRIDE_REQUIRE_SECTOR_GROWTH = True
+STRONG_BUY_VALUATION_OVERRIDE_MAX_EV_EBIT = 35.0
+STRONG_BUY_VALUATION_OVERRIDE_MAX_PE_FORWARD = 40.0
+INSTITUTIONAL_PRIOR_MIN_COVERAGE_SHADOW = 0.42
 
 # Tier 3 — quality floors (Novy-Marx 2013; Damodaran cost-of-capital;
 # Asness-Frazzini-Pedersen 2019 QMJ; Bartov-Givoly-Hayn 2002).

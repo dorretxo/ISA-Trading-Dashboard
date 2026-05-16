@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from engine.value_caps import (
@@ -57,6 +59,84 @@ def test_value_caps_pe_lifted_by_high_growth():
     )
     assert res.action_ceiling == "STRONG BUY"
     assert res.flags["pe_forward"] == "pass-growth-override"
+
+
+def _valuation_override_cfg(**overrides):
+    base = {
+        "ACTION_GATES_ENABLED": True,
+        "EV_EBIT_GATE_ENABLED": True,
+        "EV_EBIT_STRONG_BUY_MAX": 25.0,
+        "EV_EBIT_BUY_MAX": 50.0,
+        "EV_SALES_STRONG_BUY_MAX": 8.0,
+        "EV_SALES_QMJ_OVERRIDE_PCTILE": 0.80,
+        "PE_FORWARD_STRONG_BUY_MAX": 30.0,
+        "PE_FORWARD_GROWTH_OVERRIDE_CAGR": 0.25,
+        "STRONG_BUY_VALUATION_QUALITY_OVERRIDE_ENABLED": False,
+        "STRONG_BUY_VALUATION_OVERRIDE_QMJ_FLOOR": 0.80,
+        "STRONG_BUY_VALUATION_OVERRIDE_MIN_F_SCORE": 7,
+        "STRONG_BUY_VALUATION_OVERRIDE_MIN_REVENUE_GROWTH": 0.0,
+        "STRONG_BUY_VALUATION_OVERRIDE_REQUIRE_SECTOR_GROWTH": True,
+        "STRONG_BUY_VALUATION_OVERRIDE_MAX_EV_EBIT": 35.0,
+        "STRONG_BUY_VALUATION_OVERRIDE_MAX_PE_FORWARD": 40.0,
+    }
+    base.update(overrides)
+    return SimpleNamespace(**base)
+
+
+def test_value_caps_quality_growth_override_is_live_off_by_default():
+    cfg = _valuation_override_cfg()
+    res = evaluate_value_caps(
+        ev_ebit=29.0,
+        ev_sales=3.0,
+        pe_forward=33.0,
+        eps_growth_3y_cagr=0.10,
+        sector_median_ev_ebit=18.0,
+        revenue_growth=0.20,
+        sector_median_revenue_growth=0.10,
+        qmj_percentile=0.90,
+        f_score=8,
+        config_module=cfg,
+    )
+    assert res.action_ceiling == "BUY"
+    assert res.flags["ev_ebit"] == "borderline"
+    assert res.flags["pe_forward"] == "fail"
+
+
+def test_value_caps_quality_growth_override_lifts_joint_ev_ebit_and_pe_caps():
+    cfg = _valuation_override_cfg(STRONG_BUY_VALUATION_QUALITY_OVERRIDE_ENABLED=True)
+    res = evaluate_value_caps(
+        ev_ebit=29.0,
+        ev_sales=3.0,
+        pe_forward=33.0,
+        eps_growth_3y_cagr=0.10,
+        sector_median_ev_ebit=18.0,
+        revenue_growth=0.20,
+        sector_median_revenue_growth=0.10,
+        qmj_percentile=0.90,
+        f_score=8,
+        config_module=cfg,
+    )
+    assert res.action_ceiling == "STRONG BUY"
+    assert res.flags["ev_ebit"] == "pass-quality-growth-override"
+    assert res.flags["pe_forward"] == "pass-quality-growth-override"
+
+
+def test_value_caps_quality_growth_override_keeps_absolute_ceiling():
+    cfg = _valuation_override_cfg(STRONG_BUY_VALUATION_QUALITY_OVERRIDE_ENABLED=True)
+    res = evaluate_value_caps(
+        ev_ebit=48.0,
+        ev_sales=3.0,
+        pe_forward=53.0,
+        eps_growth_3y_cagr=0.10,
+        sector_median_ev_ebit=18.0,
+        revenue_growth=0.20,
+        sector_median_revenue_growth=0.10,
+        qmj_percentile=0.90,
+        f_score=8,
+        config_module=cfg,
+    )
+    assert res.action_ceiling == "BUY"
+    assert any("above override ceiling" in reason for reason in res.reasons)
 
 
 def test_value_caps_skip_on_missing_data():
