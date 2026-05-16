@@ -86,13 +86,19 @@ def _quality_growth_override_allowed(
 
     if getattr(cfg, "STRONG_BUY_VALUATION_OVERRIDE_REQUIRE_SECTOR_GROWTH", True):
         sector_growth = _f(sector_median_revenue_growth)
+        sector_growth_multiplier = float(
+            getattr(cfg, "STRONG_BUY_VALUATION_OVERRIDE_SECTOR_GROWTH_MULTIPLIER", 1.0)
+        )
         if sector_growth is None:
             reasons.append("Sector median revenue growth missing")
-        elif growth is None or growth < sector_growth:
+        elif growth is None or growth < sector_growth * sector_growth_multiplier:
+            required = sector_growth * sector_growth_multiplier
             reasons.append(
                 "Revenue growth missing"
-                if growth is None
-                else f"Revenue growth {growth:.0%} below sector median ({sector_growth:.0%})"
+                if growth is None else (
+                    f"Revenue growth {growth:.0%} below sector median "
+                    f"x{sector_growth_multiplier:.2g} ({required:.0%})"
+                )
             )
 
     return not reasons, reasons

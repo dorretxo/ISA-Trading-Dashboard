@@ -371,9 +371,15 @@ def _write_value_cap_shadow_report(candidates: list[dict]) -> None:
     """Persist shadow-only valuation/prior counterfactual diagnostics."""
     if not bool(getattr(config, "VALUE_CAP_SHADOW_REPORT_ENABLED", True)):
         return
-    from engine.value_cap_shadow import build_value_cap_shadow_report
+    from engine.value_cap_shadow import (
+        attach_shadow_event_summary,
+        build_value_cap_shadow_report,
+        record_value_cap_shadow_events,
+    )
 
     payload = build_value_cap_shadow_report(candidates, config_module=config)
+    ledger_summary = record_value_cap_shadow_events(payload, config_module=config)
+    attach_shadow_event_summary(payload, ledger_summary=ledger_summary, config_module=config)
     atomic_write_json(_VALUE_CAP_SHADOW_REPORT, payload, indent=2)
 
 

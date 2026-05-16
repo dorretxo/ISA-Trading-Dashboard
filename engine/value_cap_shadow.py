@@ -7,6 +7,7 @@ and how mature replay/discovery labels have behaved in the same buckets.
 
 from __future__ import annotations
 
+import json
 from collections import Counter, defaultdict
 from datetime import datetime
 from types import SimpleNamespace
@@ -199,6 +200,8 @@ def annotate_value_cap_shadow(
             "source": _get(raw, "source"),
             "action": _get(raw, "action"),
             "sector": sector,
+            "exchange": _get(raw, "exchange"),
+            "pit_source": _get(raw, "pit_source", _get(raw, "_pit_source")),
             "threshold_profile": profile,
             "final_rank": _get(raw, "final_rank"),
             "aggregate_score": _get(raw, "aggregate_score"),
@@ -206,12 +209,17 @@ def annotate_value_cap_shadow(
             "ready_contract_core_status": _get(raw, "ready_contract_core_status"),
             "ready_contract_status": _get(raw, "ready_contract_status"),
             "entry_stance": _get(raw, "entry_stance"),
+            "entry_price": _get(raw, "entry_price"),
+            "stop_loss": _get(raw, "stop_loss"),
+            "take_profit": _get(raw, "take_profit"),
+            "r_r_ratio": _get(raw, "r_r_ratio"),
             "ev_ebit": _get(raw, "ev_ebit"),
             "pe_forward": _get(raw, "pe_forward", _get(raw, "pe_ratio")),
             "revenue_growth": _get(raw, "revenue_growth"),
             "sector_median_revenue_growth": current_ctx.sector_median_revenue_growth.get(sector),
             "f_score": _get(raw, "f_score"),
             "qmj_factor_score": _get(obj, "qmj_factor_score", _get(raw, "qmj_factor_score")),
+            "qmj_component_count": _get(obj, "qmj_component_count", _get(raw, "qmj_component_count")),
             "qmj_shadow_recomputed": bool(_get(obj, "_qmj_shadow_recomputed", False)),
             "qmj_percentile": qmj_pct,
             "gpa_percentile": gpa_pct,
@@ -259,6 +267,55 @@ def _summarise_annotations(rows: list[dict]) -> dict:
         "valuation_gate_gains": sum(1 for r in rows if r.get("valuation_would_clear_gate")),
         "prior_coverage_gains": sum(1 for r in rows if r.get("prior_coverage_gain")),
         "combined_gains": sum(1 for r in rows if r.get("combined_gain")),
+    }
+
+
+def _region_bucket(row: dict) -> str:
+    ticker = str(row.get("ticker") or "").upper()
+    exchange = str(row.get("exchange") or "").upper()
+    if "." in ticker:
+        return "non_us"
+    if exchange and exchange not in {"NASDAQ", "NYSE", "NYSEARCA", "AMEX", "CBOE", "US"}:
+        return "non_us"
+    return "us"
+
+
+def _rate_payload(total: int, nulls: int) -> dict:
+    return {
+        "total": total,
+        "qmj_null": nulls,
+        "qmj_null_rate": round(nulls / total, 4) if total else None,
+    }
+
+
+def _fresh_qmj_health(rows: list[dict]) -> dict:
+    by_region: dict[str, Counter] = defaultdict(Counter)
+    by_pit_source: dict[str, Counter] = defaultdict(Counter)
+    component_zero = 0
+    for row in rows:
+        is_null = _finite(row.get("qmj_factor_score")) is None
+        if is_null:
+            component_zero += int((_finite(row.get("qmj_component_count")) or 0.0) <= 0.0)
+        region = _region_bucket(row)
+        pit_source = str(row.get("pit_source") or "unknown")
+        by_region[region]["total"] += 1
+        by_pit_source[pit_source]["total"] += 1
+        if is_null:
+            by_region[region]["null"] += 1
+            by_pit_source[pit_source]["null"] += 1
+    total = len(rows)
+    nulls = sum(1 for row in rows if _finite(row.get("qmj_factor_score")) is None)
+    return {
+        **_rate_payload(total, nulls),
+        "qmj_null_with_zero_components": component_zero,
+        "by_region": {
+            key: _rate_payload(int(counter["total"]), int(counter["null"]))
+            for key, counter in sorted(by_region.items())
+        },
+        "by_pit_source": {
+            key: _rate_payload(int(counter["total"]), int(counter["null"]))
+            for key, counter in sorted(by_pit_source.items())
+        },
     }
 
 
@@ -327,7 +384,7 @@ def _historical_shadow_outcomes(cfg: Any) -> dict:
                 "aggregate_score", "ev_ebit", "pe_ratio", "revenue_growth",
                 "f_score", "qmj_factor_score", "gpa_score",
                 "institutional_prior_percentile", "institutional_prior_confidence",
-                "institutional_prior_coverage", "ready_contract_status",
+                "institutional_prior_coverage", "institutional_prior_coverage_source", "ready_contract_status",
                 "ready_contract_core_status", "entry_stance", "action_gate_ceiling",
                 "threshold_profile", "tb_label", "tb_return", "stop_hit", "target_hit",
             ]
@@ -381,6 +438,14 @@ def _historical_shadow_outcomes(cfg: Any) -> dict:
             "combined_a_b_gain" if ann.get("combined_gain")
             else "combined_a_b_no_gain"
         )
+        if ann.get("valuation_would_clear_gate") and ann.get("prior_coverage_gain"):
+            merged["independent_knob_bucket"] = "combined_valuation_and_prior_gain"
+        elif ann.get("valuation_would_clear_gate"):
+            merged["independent_knob_bucket"] = "valuation_a_only_gain"
+        elif ann.get("prior_coverage_gain"):
+            merged["independent_knob_bucket"] = "prior_b_only_gain"
+        else:
+            merged["independent_knob_bucket"] = "no_shadow_gain"
         enriched.append(merged)
 
     return {
@@ -390,11 +455,12 @@ def _historical_shadow_outcomes(cfg: Any) -> dict:
         "by_primary_bucket": _outcome_summary(enriched, "primary_bucket"),
         "by_valuation_a": _outcome_summary(enriched, "valuation_a_bucket"),
         "by_prior_b": _outcome_summary(enriched, "prior_b_bucket"),
+        "by_independent_knob": _outcome_summary(enriched, "independent_knob_bucket"),
         "by_combined_a_b": _outcome_summary(enriched, "combined_a_b_bucket"),
     }
 
 
-def _historical_shadow_rows(cfg: Any, *, limit: int = 5000) -> list[dict]:
+def _load_historical_shadow_source_rows(*, limit: int = 5000) -> list[dict]:
     try:
         from engine.discovery_backtest import init_backtest_db
         from engine.paper_trading import _connect
@@ -430,7 +496,10 @@ def _historical_shadow_rows(cfg: Any, *, limit: int = 5000) -> list[dict]:
             ]
     except Exception:
         return []
+    return rows
 
+
+def _annotate_historical_source_rows(rows: list[dict], cfg: Any) -> list[dict]:
     grouped: dict[tuple[str, str], list[dict]] = defaultdict(list)
     for row in rows:
         grouped[(str(row.get("source") or ""), str(row.get("run_date") or "")[:10])].append(row)
@@ -448,6 +517,10 @@ def _historical_shadow_rows(cfg: Any, *, limit: int = 5000) -> list[dict]:
             ), {})
             annotations.append({**source_row, **ann})
     return annotations
+
+
+def _historical_shadow_rows(cfg: Any, *, limit: int = 5000) -> list[dict]:
+    return _annotate_historical_source_rows(_load_historical_shadow_source_rows(limit=limit), cfg)
 
 
 def _summarise_analogue_rows(rows: list[dict]) -> dict:
@@ -494,68 +567,418 @@ def _summarise_analogue_rows(rows: list[dict]) -> dict:
     }
 
 
-def _valuation_analogue_slices(targets: list[dict], cfg: Any) -> list[dict]:
-    historical = _historical_shadow_rows(cfg)
-    if not historical:
-        return []
+def _analogue_variants(cfg: Any) -> list[dict]:
+    return [
+        {
+            "id": "strict",
+            "description": "All override conditions as configured",
+            "overrides": {},
+        },
+        {
+            "id": "f_score_min_6",
+            "description": "Relax F-score floor from 7 to 6, holding other conditions fixed",
+            "overrides": {"STRONG_BUY_VALUATION_OVERRIDE_MIN_F_SCORE": 6},
+        },
+        {
+            "id": "growth_half_sector_median",
+            "description": "Relax revenue growth floor to 0.5x sector median, holding other conditions fixed",
+            "overrides": {"STRONG_BUY_VALUATION_OVERRIDE_SECTOR_GROWTH_MULTIPLIER": 0.5},
+        },
+        {
+            "id": "qmj_floor_0_70",
+            "description": "Relax QMJ percentile floor from 0.80 to 0.70, holding other conditions fixed",
+            "overrides": {"STRONG_BUY_VALUATION_OVERRIDE_QMJ_FLOOR": 0.70},
+        },
+        {
+            "id": "pe_forward_max_50",
+            "description": "Relax forward P/E override ceiling from 40x to 50x, holding other conditions fixed",
+            "overrides": {"STRONG_BUY_VALUATION_OVERRIDE_MAX_PE_FORWARD": 50.0},
+        },
+    ]
+
+
+def _analogue_rows_for_target(target: dict, historical: list[dict], cfg: Any) -> list[dict]:
     pe_cap = float(getattr(cfg, "PE_FORWARD_STRONG_BUY_MAX", 30.0))
     pe_max = float(getattr(cfg, "STRONG_BUY_VALUATION_OVERRIDE_MAX_PE_FORWARD", 40.0))
     ev_cap = float(getattr(cfg, "EV_EBIT_STRONG_BUY_MAX", 30.0))
     ev_max = float(getattr(cfg, "STRONG_BUY_VALUATION_OVERRIDE_MAX_EV_EBIT", 35.0))
+    ticker = str(target.get("ticker") or "").upper()
+    target_pe = _finite(target.get("pe_forward"))
+    target_ev = _finite(target.get("ev_ebit"))
+    rows: list[dict] = []
+    for row in historical:
+        if str(row.get("ticker") or "").upper() == ticker:
+            continue
+        if not row.get("valuation_would_clear_gate"):
+            continue
+        pe = _finite(row.get("pe_forward"))
+        ev = _finite(row.get("ev_ebit"))
+        comparable_pe = (
+            target_pe is None
+            or target_pe <= pe_cap
+            or (pe is not None and pe_cap < pe <= pe_max)
+        )
+        comparable_ev = (
+            target_ev is None
+            or target_ev <= ev_cap
+            or (ev is not None and ev_cap < ev <= ev_max)
+        )
+        if comparable_pe and comparable_ev:
+            rows.append(row)
+    rows.sort(key=lambda row: str(row.get("run_date") or ""), reverse=True)
+    return rows
+
+
+def _analogue_examples(rows: list[dict], *, limit: int = 20) -> list[dict]:
+    return [
+        {
+            "ticker": row.get("ticker"),
+            "run_date": row.get("run_date"),
+            "source": row.get("source"),
+            "sector": row.get("sector"),
+            "pe_forward": row.get("pe_forward"),
+            "ev_ebit": row.get("ev_ebit"),
+            "qmj_percentile": row.get("qmj_percentile"),
+            "f_score": row.get("f_score"),
+            "revenue_growth": row.get("revenue_growth"),
+            "tb_label": row.get("tb_label"),
+            "tb_return": row.get("tb_return"),
+        }
+        for row in rows[:limit]
+    ]
+
+
+def _binding_sensitivity(sensitivity: list[dict]) -> dict:
+    strict_n = 0
+    for item in sensitivity:
+        if item.get("variant") == "strict":
+            strict_n = int(item.get("summary", {}).get("n") or 0)
+            break
+    relaxed = [item for item in sensitivity if item.get("variant") != "strict"]
+    if not relaxed:
+        return {"strict_n": strict_n, "largest_incremental_variant": None}
+    best = max(
+        relaxed,
+        key=lambda item: int(item.get("summary", {}).get("n") or 0) - strict_n,
+    )
+    best_n = int(best.get("summary", {}).get("n") or 0)
+    return {
+        "strict_n": strict_n,
+        "largest_incremental_variant": best.get("variant"),
+        "largest_incremental_n": best_n - strict_n,
+        "largest_variant_n": best_n,
+        "diagnosis": (
+            "single_relaxation_reaches_minimum_sample"
+            if best_n >= 20 else "no_single_relaxation_reaches_minimum_sample"
+        ),
+    }
+
+
+def _valuation_analogue_slices(targets: list[dict], cfg: Any) -> list[dict]:
+    source_rows = _load_historical_shadow_source_rows(
+        limit=int(getattr(cfg, "VALUE_CAP_SHADOW_ANALOGUE_HISTORY_LIMIT", 5000))
+    )
+    if not source_rows:
+        return []
+    variants = _analogue_variants(cfg)
+    annotated_by_variant = {
+        variant["id"]: _annotate_historical_source_rows(
+            source_rows,
+            _ConfigOverlay(cfg, {
+                "STRONG_BUY_VALUATION_QUALITY_OVERRIDE_ENABLED": True,
+                **variant["overrides"],
+            }),
+        )
+        for variant in variants
+    }
     out: list[dict] = []
+    base_pe_cap = float(getattr(cfg, "PE_FORWARD_STRONG_BUY_MAX", 30.0))
+    base_pe_max = float(getattr(cfg, "STRONG_BUY_VALUATION_OVERRIDE_MAX_PE_FORWARD", 40.0))
+    base_ev_cap = float(getattr(cfg, "EV_EBIT_STRONG_BUY_MAX", 30.0))
+    base_ev_max = float(getattr(cfg, "STRONG_BUY_VALUATION_OVERRIDE_MAX_EV_EBIT", 35.0))
     for target in targets[:10]:
         ticker = str(target.get("ticker") or "").upper()
         target_pe = _finite(target.get("pe_forward"))
         target_ev = _finite(target.get("ev_ebit"))
-        rows: list[dict] = []
-        for row in historical:
-            if str(row.get("ticker") or "").upper() == ticker:
-                continue
-            if not row.get("valuation_would_clear_gate"):
-                continue
-            pe = _finite(row.get("pe_forward"))
-            ev = _finite(row.get("ev_ebit"))
-            comparable_pe = (
-                target_pe is None
-                or target_pe <= pe_cap
-                or (pe is not None and pe_cap < pe <= pe_max)
-            )
-            comparable_ev = (
-                target_ev is None
-                or target_ev <= ev_cap
-                or (ev is not None and ev_cap < ev <= ev_max)
-            )
-            if comparable_pe and comparable_ev:
-                rows.append(row)
-        rows.sort(key=lambda row: str(row.get("run_date") or ""), reverse=True)
+        sensitivity: list[dict] = []
+        strict_rows: list[dict] = []
+        for variant in variants:
+            variant_cfg = _ConfigOverlay(cfg, {
+                "STRONG_BUY_VALUATION_QUALITY_OVERRIDE_ENABLED": True,
+                **variant["overrides"],
+            })
+            rows = _analogue_rows_for_target(target, annotated_by_variant[variant["id"]], variant_cfg)
+            if variant["id"] == "strict":
+                strict_rows = rows
+            sensitivity.append({
+                "variant": variant["id"],
+                "description": variant["description"],
+                "overrides": dict(variant["overrides"]),
+                "summary": _summarise_analogue_rows(rows),
+                "examples": _analogue_examples(rows, limit=10),
+            })
         out.append({
             "ticker": ticker,
             "criteria": {
                 "exclude_target_ticker": True,
                 "uses_historical_asof_features": True,
                 "requires_valuation_a_gain": True,
-                "pe_forward_range": [pe_cap, pe_max] if target_pe and target_pe > pe_cap else None,
-                "ev_ebit_range": [ev_cap, ev_max] if target_ev and target_ev > ev_cap else None,
+                "pe_forward_range": [base_pe_cap, base_pe_max] if target_pe and target_pe > base_pe_cap else None,
+                "ev_ebit_range": [base_ev_cap, base_ev_max] if target_ev and target_ev > base_ev_cap else None,
             },
-            "summary": _summarise_analogue_rows(rows),
-            "examples": [
-                {
-                    "ticker": row.get("ticker"),
-                    "run_date": row.get("run_date"),
-                    "source": row.get("source"),
-                    "sector": row.get("sector"),
-                    "pe_forward": row.get("pe_forward"),
-                    "ev_ebit": row.get("ev_ebit"),
-                    "qmj_percentile": row.get("qmj_percentile"),
-                    "f_score": row.get("f_score"),
-                    "revenue_growth": row.get("revenue_growth"),
-                    "tb_label": row.get("tb_label"),
-                    "tb_return": row.get("tb_return"),
-                }
-                for row in rows[:20]
-            ],
+            "summary": _summarise_analogue_rows(strict_rows),
+            "examples": _analogue_examples(strict_rows),
+            "sensitivity": sensitivity,
+            "binding_sensitivity": _binding_sensitivity(sensitivity),
         })
     return out
+
+
+def _json_dump(value: Any) -> str | None:
+    try:
+        return json.dumps(value, default=str)
+    except (TypeError, ValueError):
+        return None
+
+
+def _event_rows_from_report(payload: Mapping[str, Any]) -> list[dict]:
+    rows = []
+    for row in payload.get("changed_candidates", []) or []:
+        if not (row.get("valuation_would_clear_gate") or row.get("prior_coverage_gain")):
+            continue
+        rows.append(dict(row))
+    return rows
+
+
+def _reconcile_value_cap_shadow_event_outcomes(conn) -> int:
+    events = conn.execute(
+        """
+        SELECT id, event_date, ticker
+        FROM value_cap_shadow_events
+        WHERE COALESCE(evaluated_90d, 0) = 0
+           OR tb_label IS NULL
+        """
+    ).fetchall()
+    updated = 0
+    now = datetime.now().isoformat(timespec="seconds")
+    for event in events:
+        signal = conn.execute(
+            """
+            SELECT evaluated_30d, evaluated_60d, evaluated_90d,
+                   return_30d, return_60d, return_90d,
+                   tb_label, tb_return, stop_hit, target_hit
+            FROM signal_backtest
+            WHERE ticker=? AND source='discovery' AND run_date LIKE ?
+            ORDER BY run_date DESC
+            LIMIT 1
+            """,
+            (event["ticker"], str(event["event_date"])[:10] + "%"),
+        ).fetchone()
+        if not signal:
+            continue
+        conn.execute(
+            """
+            UPDATE value_cap_shadow_events
+               SET evaluated_30d=?,
+                   evaluated_60d=?,
+                   evaluated_90d=?,
+                   return_30d=?,
+                   return_60d=?,
+                   return_90d=?,
+                   tb_label=?,
+                   tb_return=?,
+                   stop_hit=?,
+                   target_hit=?,
+                   outcome_updated_at=?
+             WHERE id=?
+            """,
+            (
+                signal["evaluated_30d"], signal["evaluated_60d"], signal["evaluated_90d"],
+                signal["return_30d"], signal["return_60d"], signal["return_90d"],
+                signal["tb_label"], signal["tb_return"], signal["stop_hit"], signal["target_hit"],
+                now, event["id"],
+            ),
+        )
+        updated += 1
+    return updated
+
+
+def _event_summary_from_rows(rows: list[Mapping[str, Any]]) -> dict:
+    by_bucket: dict[str, Counter] = defaultdict(Counter)
+    total = 0
+    for row in rows:
+        bucket = str(row.get("primary_bucket") or "unknown")
+        total += 1
+        by_bucket[bucket]["total"] += 1
+        if int(row.get("valuation_would_clear_gate") or 0):
+            by_bucket[bucket]["valuation_a"] += 1
+        if int(row.get("prior_coverage_gain") or 0):
+            by_bucket[bucket]["prior_b"] += 1
+        for horizon in ("30d", "60d", "90d"):
+            if int(row.get(f"evaluated_{horizon}") or 0):
+                by_bucket[bucket][f"evaluated_{horizon}"] += 1
+    return {
+        "available": True,
+        "total_events": total,
+        "by_primary_bucket": {bucket: dict(counter) for bucket, counter in sorted(by_bucket.items())},
+        "valuation_a_events": sum(int(row.get("valuation_would_clear_gate") or 0) for row in rows),
+        "prior_b_events": sum(int(row.get("prior_coverage_gain") or 0) for row in rows),
+        "prior_b_only_events": sum(
+            1 for row in rows
+            if int(row.get("prior_coverage_gain") or 0)
+            and not int(row.get("valuation_would_clear_gate") or 0)
+        ),
+        "evaluated_30d": sum(int(row.get("evaluated_30d") or 0) for row in rows),
+        "evaluated_60d": sum(int(row.get("evaluated_60d") or 0) for row in rows),
+        "evaluated_90d": sum(int(row.get("evaluated_90d") or 0) for row in rows),
+    }
+
+
+def shadow_event_ledger_summary() -> dict:
+    try:
+        from engine.paper_trading import _connect
+
+        with _connect() as conn:
+            exists = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='value_cap_shadow_events'"
+            ).fetchone()
+            if not exists:
+                return {"available": False, "reason": "value_cap_shadow_events table missing"}
+            rows = [dict(row) for row in conn.execute("SELECT * FROM value_cap_shadow_events").fetchall()]
+    except Exception as exc:
+        return {"available": False, "reason": str(exc)}
+    return _event_summary_from_rows(rows)
+
+
+def _promotion_framework(payload: Mapping[str, Any], ledger_summary: Mapping[str, Any], cfg: Any) -> dict:
+    min_live_n = int(getattr(cfg, "VALUE_CAP_SHADOW_PROMOTION_MIN_LIVE_N", 25))
+    strict_ns = [
+        int(item.get("summary", {}).get("n") or 0)
+        for item in payload.get("valuation_analogue_slices", []) or []
+    ]
+    strict_historical_n = max(strict_ns) if strict_ns else 0
+    live_n = int(ledger_summary.get("valuation_a_events") or 0) if ledger_summary.get("available") else 0
+    ready_for_gate = live_n >= min_live_n
+    return {
+        "mode": "strict_min_live_n_with_bayesian_advisory",
+        "valuation_a": {
+            "promotion_allowed_now": False,
+            "reason": (
+                "ready_for_formal_live_gate_evaluation"
+                if ready_for_gate else "shadow_until_minimum_live_firings"
+            ),
+            "strict_historical_analogue_n": strict_historical_n,
+            "prospective_live_firings": live_n,
+            "minimum_live_firings": min_live_n,
+            "bayesian_monitoring": "advisory_only_until_minimum_live_n",
+        },
+        "prior_b": {
+            "promotion_allowed_now": False,
+            "reason": "evaluate_prior_coverage_bucket_independently_in_pit_replay",
+            "prospective_live_firings": int(ledger_summary.get("prior_b_only_events") or 0)
+            if ledger_summary.get("available") else 0,
+        },
+    }
+
+
+def attach_shadow_event_summary(
+    payload: dict,
+    *,
+    ledger_summary: Mapping[str, Any] | None = None,
+    config_module=None,
+) -> dict:
+    cfg = config_module or default_config
+    summary = dict(ledger_summary or shadow_event_ledger_summary())
+    payload["prospective_event_ledger"] = summary
+    payload["promotion_framework"] = _promotion_framework(payload, summary, cfg)
+    return payload
+
+
+def record_value_cap_shadow_events(payload: Mapping[str, Any], *, config_module=None) -> dict:
+    cfg = config_module or default_config
+    if not bool(getattr(cfg, "VALUE_CAP_SHADOW_EVENT_LEDGER_ENABLED", True)):
+        return {"available": False, "reason": "event ledger disabled"}
+    rows = _event_rows_from_report(payload)
+    now = datetime.now().isoformat(timespec="seconds")
+    event_date = str(payload.get("generated_at") or now)[:10]
+    try:
+        from engine.discovery_backtest import init_backtest_db
+        from engine.paper_trading import _connect
+
+        init_backtest_db()
+        inserted_or_updated = 0
+        with _connect() as conn:
+            for row in rows:
+                current = row.get("current") or {}
+                valuation = row.get("valuation_a") or {}
+                criteria = {
+                    "knobs": payload.get("knobs"),
+                    "mode": payload.get("mode"),
+                    "live_impact": payload.get("live_impact"),
+                }
+                values = {
+                    "event_date": event_date,
+                    "recorded_at": now,
+                    "last_seen_at": now,
+                    "ticker": row.get("ticker"),
+                    "source": row.get("source") or "discovery",
+                    "primary_bucket": row.get("primary_bucket") or "unknown",
+                    "valuation_would_clear_gate": 1 if row.get("valuation_would_clear_gate") else 0,
+                    "prior_coverage_gain": 1 if row.get("prior_coverage_gain") else 0,
+                    "combined_gain": 1 if row.get("combined_gain") else 0,
+                    "action": row.get("action"),
+                    "sector": row.get("sector"),
+                    "threshold_profile": row.get("threshold_profile"),
+                    "final_rank": row.get("final_rank"),
+                    "aggregate_score": row.get("aggregate_score"),
+                    "sb_score": row.get("sb_score"),
+                    "entry_price": row.get("entry_price"),
+                    "stop_loss": row.get("stop_loss"),
+                    "take_profit": row.get("take_profit"),
+                    "r_r_ratio": row.get("r_r_ratio"),
+                    "ev_ebit": row.get("ev_ebit"),
+                    "pe_forward": row.get("pe_forward"),
+                    "revenue_growth": row.get("revenue_growth"),
+                    "sector_median_revenue_growth": row.get("sector_median_revenue_growth"),
+                    "f_score": row.get("f_score"),
+                    "qmj_factor_score": row.get("qmj_factor_score"),
+                    "qmj_percentile": row.get("qmj_percentile"),
+                    "gpa_percentile": row.get("gpa_percentile"),
+                    "institutional_prior_percentile": row.get("institutional_prior_percentile"),
+                    "institutional_prior_confidence": row.get("institutional_prior_confidence"),
+                    "institutional_prior_coverage": row.get("institutional_prior_coverage"),
+                    "institutional_prior_coverage_source": row.get("institutional_prior_coverage_source"),
+                    "current_ceiling": current.get("ceiling"),
+                    "valuation_a_ceiling": valuation.get("ceiling"),
+                    "current_reasons_json": _json_dump(current.get("reasons")),
+                    "valuation_a_reasons_json": _json_dump(valuation.get("reasons")),
+                    "criteria_json": _json_dump(criteria),
+                }
+                columns = list(values)
+                placeholders = ", ".join("?" for _ in columns)
+                assignments = ", ".join(
+                    f"{column}=excluded.{column}"
+                    for column in columns
+                    if column not in {"event_date", "ticker", "primary_bucket", "recorded_at"}
+                )
+                conn.execute(
+                    f"""
+                    INSERT INTO value_cap_shadow_events ({', '.join(columns)})
+                    VALUES ({placeholders})
+                    ON CONFLICT(event_date, ticker, primary_bucket)
+                    DO UPDATE SET {assignments}
+                    """,
+                    [values[column] for column in columns],
+                )
+                inserted_or_updated += 1
+            reconciled = _reconcile_value_cap_shadow_event_outcomes(conn)
+            ledger_rows = [dict(row) for row in conn.execute("SELECT * FROM value_cap_shadow_events").fetchall()]
+    except Exception as exc:
+        return {"available": False, "reason": str(exc), "events_attempted": len(rows)}
+    summary = _event_summary_from_rows(ledger_rows)
+    summary["events_recorded_or_updated"] = inserted_or_updated
+    summary["outcomes_reconciled"] = reconciled
+    return summary
 
 
 def build_value_cap_shadow_report(
@@ -604,6 +1027,7 @@ def build_value_cap_shadow_report(
             },
         },
         "summary": _summarise_annotations(annotations),
+        "fresh_qmj_health": _fresh_qmj_health(annotations),
         "changed_candidates": changed[:80],
         "valuation_a_candidates": valuation_rows[:80],
         "valuation_blocked_candidates": valuation_blocked_rows[:80],
@@ -612,4 +1036,5 @@ def build_value_cap_shadow_report(
     if include_historical:
         payload["historical_matured_outcomes"] = _historical_shadow_outcomes(cfg)
         payload["valuation_analogue_slices"] = _valuation_analogue_slices(valuation_rows, cfg)
+        attach_shadow_event_summary(payload, config_module=cfg)
     return payload

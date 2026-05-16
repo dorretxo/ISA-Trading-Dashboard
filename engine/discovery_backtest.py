@@ -253,6 +253,62 @@ CREATE INDEX IF NOT EXISTS idx_sb_source ON signal_backtest(source);
 CREATE INDEX IF NOT EXISTS idx_sb_run_date ON signal_backtest(run_date);
 CREATE INDEX IF NOT EXISTS idx_sb_evaluated ON signal_backtest(evaluated_90d);
 
+-- Prospective shadow-event ledger for rare valuation/prior overrides.
+CREATE TABLE IF NOT EXISTS value_cap_shadow_events (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_date          TEXT    NOT NULL,
+    recorded_at         TEXT    NOT NULL,
+    last_seen_at        TEXT,
+    ticker              TEXT    NOT NULL,
+    source              TEXT,
+    primary_bucket      TEXT    NOT NULL,
+    valuation_would_clear_gate INTEGER,
+    prior_coverage_gain INTEGER,
+    combined_gain       INTEGER,
+    action              TEXT,
+    sector              TEXT,
+    threshold_profile   TEXT,
+    final_rank          REAL,
+    aggregate_score     REAL,
+    sb_score            REAL,
+    entry_price         REAL,
+    stop_loss           REAL,
+    take_profit         REAL,
+    r_r_ratio           REAL,
+    ev_ebit             REAL,
+    pe_forward          REAL,
+    revenue_growth      REAL,
+    sector_median_revenue_growth REAL,
+    f_score             REAL,
+    qmj_factor_score    REAL,
+    qmj_percentile      REAL,
+    gpa_percentile      REAL,
+    institutional_prior_percentile REAL,
+    institutional_prior_confidence REAL,
+    institutional_prior_coverage REAL,
+    institutional_prior_coverage_source TEXT,
+    current_ceiling     TEXT,
+    valuation_a_ceiling TEXT,
+    current_reasons_json TEXT,
+    valuation_a_reasons_json TEXT,
+    criteria_json       TEXT,
+    evaluated_30d       INTEGER,
+    evaluated_60d       INTEGER,
+    evaluated_90d       INTEGER,
+    return_30d          REAL,
+    return_60d          REAL,
+    return_90d          REAL,
+    tb_label            INTEGER,
+    tb_return           REAL,
+    stop_hit            INTEGER,
+    target_hit          INTEGER,
+    outcome_updated_at  TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_vc_shadow_event_unique
+    ON value_cap_shadow_events(event_date, ticker, primary_bucket);
+CREATE INDEX IF NOT EXISTS idx_vc_shadow_event_ticker ON value_cap_shadow_events(ticker);
+CREATE INDEX IF NOT EXISTS idx_vc_shadow_event_date ON value_cap_shadow_events(event_date);
+
 -- Keep legacy tables for backward compatibility
 CREATE TABLE IF NOT EXISTS discovery_picks AS SELECT * FROM signal_backtest WHERE 0;
 CREATE TABLE IF NOT EXISTS discovery_pillar_stats AS SELECT * FROM pillar_effectiveness WHERE 0;

@@ -3,7 +3,12 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import config
-from engine.value_cap_shadow import annotate_value_cap_shadow, build_value_cap_shadow_report
+from engine import paper_trading
+from engine.value_cap_shadow import (
+    annotate_value_cap_shadow,
+    build_value_cap_shadow_report,
+    record_value_cap_shadow_events,
+)
 
 
 def _candidate(ticker: str, **overrides):
@@ -128,6 +133,7 @@ def test_value_cap_shadow_report_schema_is_stable(monkeypatch):
     assert "valuation_a_candidates" in report
     assert "valuation_blocked_candidates" in report
     assert "prior_b_candidates" in report
+    assert "fresh_qmj_health" in report
     for key in (
         "valuation_rank_gains",
         "valuation_gate_gains",
@@ -189,3 +195,59 @@ def test_value_cap_shadow_recomputes_missing_serialized_qmj(monkeypatch):
 
     assert ann["qmj_shadow_recomputed"] is True
     assert ann["qmj_factor_score"] is not None
+
+
+def test_value_cap_shadow_report_tracks_fresh_qmj_health(monkeypatch):
+    monkeypatch.setattr(config, "STRONG_BUY_VALUATION_QUALITY_OVERRIDE_ENABLED", False)
+    candidates = [
+        _candidate("US", qmj_factor_score=0.8, exchange="NASDAQ"),
+        _candidate("NONUS.L", qmj_factor_score=None, qmj_component_count=0, exchange="LSE"),
+    ]
+
+    report = build_value_cap_shadow_report(candidates, config_module=config, include_historical=False)
+
+    assert report["fresh_qmj_health"]["total"] == 2
+    assert report["fresh_qmj_health"]["qmj_null"] == 1
+    assert report["fresh_qmj_health"]["by_region"]["non_us"]["qmj_null"] == 1
+
+
+def test_value_cap_shadow_event_ledger_records_firings(tmp_path, monkeypatch):
+    monkeypatch.setattr(paper_trading, "DB_PATH", tmp_path / "paper_trading.db")
+    monkeypatch.setattr(config, "STRONG_BUY_VALUATION_QUALITY_OVERRIDE_ENABLED", False)
+    report = build_value_cap_shadow_report(
+        [
+            _candidate(
+                "VAL",
+                ev_ebit=29.0,
+                pe_forward=33.0,
+                pe_ratio=33.0,
+                revenue_growth=0.20,
+                qmj_factor_score=0.95,
+                entry_price=20.0,
+                stop_loss=18.0,
+                take_profit=25.0,
+                r_r_ratio=2.5,
+            ),
+            _candidate("MID", qmj_factor_score=0.50),
+            _candidate("LOW", qmj_factor_score=0.10),
+        ],
+        config_module=config,
+        include_historical=False,
+    )
+
+    summary = record_value_cap_shadow_events(report, config_module=config)
+
+    assert summary["available"] is True
+    assert summary["events_recorded_or_updated"] == 1
+    with paper_trading._connect() as conn:
+        row = conn.execute(
+            "SELECT ticker, primary_bucket, entry_price, stop_loss, take_profit "
+            "FROM value_cap_shadow_events"
+        ).fetchone()
+    assert dict(row) == {
+        "ticker": "VAL",
+        "primary_bucket": "valuation_gate_gain",
+        "entry_price": 20.0,
+        "stop_loss": 18.0,
+        "take_profit": 25.0,
+    }
