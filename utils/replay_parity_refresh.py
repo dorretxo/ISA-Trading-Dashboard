@@ -12,6 +12,7 @@ import argparse
 import json
 import logging
 import sys
+from collections import Counter
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Mapping
@@ -58,6 +59,25 @@ _FUNDAMENTAL_REFRESH_FIELDS = tuple(getattr(
         "f_score", "f_score_coverage", "gpa", "gpa_score",
     ),
 ))
+_SIGNAL_QUALITY_BACKFILL_REPORT = ROOT / getattr(
+    config,
+    "SIGNAL_QUALITY_BACKFILL_REPORT_PATH",
+    "feature_cache/signal_quality_backfill_report.json",
+)
+_QUALITY_BACKFILL_SOURCES = ("discovery", "replay_pit_v1")
+_PRIOR_COVERAGE_RECONSTRUCT_FIELDS = (
+    "quality_factor_score", "quality_score_fundamental", "gpa_score",
+    "gross_profitability", "fcf_to_assets", "roe", "qmj_factor_score",
+    "f_score", "f_score_coverage", "value_factor_score", "ev_ebit_score",
+    "fcf_yield", "pe_ratio", "peg_ratio", "momentum_factor_score",
+    "return_90d_prior", "return_30d_prior", "above_sma200", "sma50_slope",
+    "volatility_factor_score", "beta_90d", "vol_20d", "debt_equity",
+    "short_pct", "bab_factor_score", "idiosyncratic_vol_score",
+    "current_ratio", "cash_to_debt", "net_debt_ebitda",
+    "eps_growth_variance_5y", "earnings_stability", "pead_factor_score",
+    "sue_score", "revision_momentum_3m", "avg_dollar_volume",
+    "market_cap", "turnover_cost_score",
+)
 
 
 def _coerce_date(value) -> date | None:
@@ -263,6 +283,182 @@ def _latest_replay_fundamental_missing(
     except Exception as exc:
         logger.warning("Could not inspect replay fundamental missingness: %s", exc)
     return out
+
+
+def _row_has_any(row: Mapping, fields: tuple[str, ...]) -> bool:
+    return any(_finite(row.get(field)) is not None for field in fields)
+
+
+def _source_filter_sql(sources: tuple[str, ...]) -> tuple[str, list[str]]:
+    clean = tuple(str(source) for source in sources if str(source or "").strip())
+    if not clean:
+        return "1=1", []
+    return f"source IN ({', '.join('?' for _ in clean)})", list(clean)
+
+
+def _quality_backfill_decision(null_rate: float | None) -> str:
+    if null_rate is None:
+        return "no_recent_sample"
+    if null_rate > 0.20:
+        return "full_backfill"
+    if null_rate < 0.05:
+        return "targeted_null_backfill"
+    return "inspect_date_source_clustering"
+
+
+def backfill_signal_quality_fields(
+    *,
+    since: str | None = None,
+    recent_since: str = "2025-01-01",
+    sources: tuple[str, ...] = _QUALITY_BACKFILL_SOURCES,
+    dry_run: bool = False,
+    limit: int | None = None,
+    report_path: str | Path | None = None,
+) -> dict:
+    """Backfill institutional-prior coverage provenance and stale/null QMJ.
+
+    Coverage is reconstructed from signal-time fields when possible. Rows that
+    predate usable signal-time factor fields get ``institutional_prior_coverage``
+    left NULL and ``institutional_prior_coverage_source='null_pre_fix'`` so
+    downstream analysis does not confuse structural absence with valid zero.
+    """
+    from engine.discovery_backtest import init_backtest_db
+    from engine.factors import compute_factor_scores_from_result
+    from engine.institutional_prior import _component_scores
+    from engine.paper_trading import _connect
+
+    init_backtest_db()
+    where_sql, params = _source_filter_sql(sources)
+    if since:
+        where_sql += " AND run_date >= ?"
+        params.append(str(since))
+    sql = f"SELECT * FROM signal_backtest WHERE {where_sql} ORDER BY run_date DESC, id DESC"
+    if limit:
+        sql += f" LIMIT {int(limit)}"
+
+    report_counts: Counter[str] = Counter()
+    source_counts: Counter[str] = Counter()
+    qmj_null_recent: Counter[str] = Counter()
+    qmj_total_recent: Counter[str] = Counter()
+    date_buckets: Counter[str] = Counter()
+    updates: list[tuple] = []
+    examples: list[dict] = []
+
+    with _connect() as conn:
+        rows = [dict(row) for row in conn.execute(sql, params).fetchall()]
+        valid = {str(row[1]) for row in conn.execute("PRAGMA table_info(signal_backtest)").fetchall()}
+        has_coverage_source = "institutional_prior_coverage_source" in valid
+        for row in rows:
+            row_id = row.get("id")
+            source = str(row.get("source") or "UNKNOWN")
+            source_counts[source] += 1
+            run_date = str(row.get("run_date") or "")
+            if run_date >= recent_since:
+                qmj_total_recent[source] += 1
+                if _finite(row.get("qmj_factor_score")) is None:
+                    qmj_null_recent[source] += 1
+                date_buckets[run_date[:7] or "unknown"] += 1
+
+            qmj_current = _finite(row.get("qmj_factor_score"))
+            try:
+                factor_scores = compute_factor_scores_from_result(row)
+            except Exception:
+                factor_scores = {}
+            qmj_computed = _finite(factor_scores.get("qmj_factor_score"))
+            qmj_count_computed = factor_scores.get("qmj_component_count")
+            qmj_update = None
+            qmj_count_update = None
+            if qmj_computed is not None:
+                if qmj_current is None:
+                    qmj_update = qmj_computed
+                    qmj_count_update = qmj_count_computed
+                    report_counts["qmj_null_backfilled"] += 1
+                elif abs(qmj_current - qmj_computed) > 1e-9:
+                    qmj_update = qmj_computed
+                    qmj_count_update = qmj_count_computed
+                    report_counts["qmj_stale_backfilled"] += 1
+
+            coverage_current = _finite(row.get("institutional_prior_coverage"))
+            source_current = row.get("institutional_prior_coverage_source")
+            coverage_update = coverage_current
+            source_update = source_current
+            if coverage_current is None or not source_current:
+                reconstructable = _row_has_any(row, _PRIOR_COVERAGE_RECONSTRUCT_FIELDS)
+                if reconstructable:
+                    try:
+                        _components, coverage = _component_scores(row)
+                        coverage_update = coverage
+                        source_update = "backfilled_from_features"
+                        report_counts["coverage_backfilled_from_features"] += 1
+                    except Exception:
+                        coverage_update = None
+                        source_update = "unavailable"
+                        report_counts["coverage_unavailable"] += 1
+                else:
+                    coverage_update = None
+                    source_update = "null_pre_fix"
+                    report_counts["coverage_null_pre_fix"] += 1
+
+            if qmj_update is not None or coverage_update != coverage_current or source_update != source_current:
+                updates.append((
+                    qmj_update if qmj_update is not None else qmj_current,
+                    qmj_count_update if qmj_count_update is not None else row.get("qmj_component_count"),
+                    coverage_update,
+                    source_update,
+                    row_id,
+                ))
+                if len(examples) < 25:
+                    examples.append({
+                        "id": row_id,
+                        "ticker": row.get("ticker"),
+                        "source": source,
+                        "run_date": run_date,
+                        "qmj_before": qmj_current,
+                        "qmj_after": qmj_update if qmj_update is not None else qmj_current,
+                        "coverage_before": coverage_current,
+                        "coverage_after": coverage_update,
+                        "coverage_source": source_update,
+                    })
+
+        if updates and not dry_run:
+            conn.executemany(
+                """
+                UPDATE signal_backtest
+                   SET qmj_factor_score=?,
+                       qmj_component_count=?,
+                       institutional_prior_coverage=?,
+                       institutional_prior_coverage_source=?
+                 WHERE id=?
+                """,
+                updates,
+            )
+
+    recent_total = sum(qmj_total_recent.values())
+    recent_null = sum(qmj_null_recent.values())
+    recent_null_rate = (recent_null / recent_total) if recent_total else None
+    payload = {
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "dry_run": bool(dry_run),
+        "sources": list(sources),
+        "since": since,
+        "recent_since": recent_since,
+        "rows_scanned": len(rows),
+        "rows_updated": 0 if dry_run else len(updates),
+        "rows_would_update": len(updates),
+        "counts": dict(report_counts),
+        "source_counts": dict(source_counts),
+        "qmj_recent_null_rate": recent_null_rate,
+        "qmj_recent_nulls": dict(qmj_null_recent),
+        "qmj_recent_totals": dict(qmj_total_recent),
+        "qmj_backfill_decision": _quality_backfill_decision(recent_null_rate),
+        "recent_month_buckets": dict(date_buckets),
+        "coverage_source_column_present": has_coverage_source,
+        "examples": examples,
+    }
+    out_path = Path(report_path or _SIGNAL_QUALITY_BACKFILL_REPORT)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(out_path, payload, indent=2)
+    return payload
 
 
 def build_fundamental_refresh_queue(
@@ -512,6 +708,7 @@ def refresh_replay_parity(
     fundamental_queue_path: str | Path | None = None,
     fundamental_attempt_ledger_path: str | Path | None = None,
     skip_recent_fundamental_attempts: bool = True,
+    backfill_quality_fields: bool = False,
 ) -> dict:
     """Run fresh offline replay for the latest discovery cohort and write parity."""
     if days is None:
@@ -548,6 +745,9 @@ def refresh_replay_parity(
             attempted,
             ledger_path=fundamental_attempt_ledger_path,
         )
+    quality_backfill_payload = None
+    if backfill_quality_fields:
+        quality_backfill_payload = backfill_signal_quality_fields()
 
     parity_payload: dict | None = None
     try:
@@ -569,6 +769,7 @@ def refresh_replay_parity(
         "include_forward_labels": include_forward_labels,
         "refresh_existing": refresh_existing,
         "fundamental_refresh": fundamental_refresh_payload,
+        "quality_field_backfill": quality_backfill_payload,
         "requested_tickers": len(tickers),
         "tickers": tickers,
         "replay_stats": stats.__dict__,
@@ -657,6 +858,11 @@ def main() -> None:
         action="store_true",
         help="Allow yfinance quarterly fallback for the pre-replay PIT refresh. Off by default.",
     )
+    parser.add_argument(
+        "--backfill-quality-fields",
+        action="store_true",
+        help="Backfill institutional-prior coverage provenance and stale/null QMJ fields after replay.",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s - %(message)s")
@@ -675,10 +881,12 @@ def main() -> None:
         fundamental_queue_path=args.fundamental_queue_path,
         fundamental_attempt_ledger_path=args.fundamental_attempt_ledger_path,
         skip_recent_fundamental_attempts=not args.include_recent_fundamental_attempts,
+        backfill_quality_fields=args.backfill_quality_fields,
     )
     print(json.dumps({
         "requested_tickers": payload["requested_tickers"],
         "fundamental_refresh": payload["fundamental_refresh"],
+        "quality_field_backfill": payload["quality_field_backfill"],
         "replay_stats": payload["replay_stats"],
         "parity_summary": payload["parity_summary"],
         "report": str(_REFRESH_REPORT),

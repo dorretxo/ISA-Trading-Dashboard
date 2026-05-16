@@ -2810,6 +2810,7 @@ class ScoredCandidate:
     institutional_prior_percentile: float = 0.0
     institutional_prior_confidence: float = 0.0
     institutional_prior_coverage: float = 0.0
+    institutional_prior_coverage_source: str = ""
     institutional_prior_components: dict = field(default_factory=dict)
     institutional_prior_rank: float = 0.0
     ready_contract_core_status: str = "FAIL"
@@ -6238,6 +6239,7 @@ def _stage_final_ranking(
             institutional_prior_percentile=prior.percentile,
             institutional_prior_confidence=prior.confidence,
             institutional_prior_coverage=prior.coverage,
+            institutional_prior_coverage_source="live_prior_pipeline",
             institutional_prior_components=prior.components,
             institutional_prior_rank=round(institutional_prior_rank, 3),
             ready_contract_core_status=_ready_contract_core_status,

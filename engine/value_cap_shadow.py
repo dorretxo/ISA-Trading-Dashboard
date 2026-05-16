@@ -113,6 +113,15 @@ def _prior_passes(candidate: Any, cfg: Any, *, coverage_min: float | None = None
     )
 
 
+def _coverage_source(row: Any) -> str:
+    source = str(_get(row, "institutional_prior_coverage_source") or "").strip()
+    if source:
+        return source
+    if _finite(_get(row, "institutional_prior_coverage")) is not None:
+        return "legacy_cached_prior_pipeline"
+    return "unavailable"
+
+
 def _serialize_eval(ev: dict) -> dict:
     return {
         "ceiling": ev.get("ceiling"),
@@ -211,6 +220,10 @@ def annotate_value_cap_shadow(
             "valuation_a": _serialize_eval(valuation_eval),
             "current_prior_pass": current_prior_pass,
             "coverage_b_prior_pass": coverage_prior_pass,
+            "institutional_prior_percentile": _get(raw, "institutional_prior_percentile"),
+            "institutional_prior_confidence": _get(raw, "institutional_prior_confidence"),
+            "institutional_prior_coverage": _get(raw, "institutional_prior_coverage"),
+            "institutional_prior_coverage_source": _coverage_source(raw),
             "current_gate_prior_clear": current_gate_prior_clear,
             "valuation_a_gate_prior_clear": valuation_a_clear,
             "prior_b_gate_prior_clear": prior_b_clear,
@@ -381,6 +394,170 @@ def _historical_shadow_outcomes(cfg: Any) -> dict:
     }
 
 
+def _historical_shadow_rows(cfg: Any, *, limit: int = 5000) -> list[dict]:
+    try:
+        from engine.discovery_backtest import init_backtest_db
+        from engine.paper_trading import _connect
+
+        init_backtest_db()
+        with _connect() as conn:
+            valid = {str(row[1]) for row in conn.execute("PRAGMA table_info(signal_backtest)").fetchall()}
+            wanted = [
+                "ticker", "run_date", "source", "action", "sector", "final_rank",
+                "aggregate_score", "ev_ebit", "pe_ratio", "revenue_growth",
+                "f_score", "qmj_factor_score", "gpa_score",
+                "institutional_prior_percentile", "institutional_prior_confidence",
+                "institutional_prior_coverage", "institutional_prior_coverage_source",
+                "ready_contract_status", "ready_contract_core_status", "entry_stance",
+                "action_gate_ceiling", "threshold_profile", "tb_label", "tb_return",
+                "stop_hit", "target_hit",
+            ]
+            columns = [c for c in wanted if c in valid]
+            if "tb_label" not in columns:
+                return []
+            rows = [
+                dict(zip(columns, tuple(row)))
+                for row in conn.execute(
+                    f"""
+                    SELECT {', '.join(columns)}
+                    FROM signal_backtest
+                    WHERE source IN ('discovery', 'replay_pit_v1')
+                      AND tb_label IS NOT NULL
+                    ORDER BY run_date DESC
+                    LIMIT {int(limit)}
+                    """
+                ).fetchall()
+            ]
+    except Exception:
+        return []
+
+    grouped: dict[tuple[str, str], list[dict]] = defaultdict(list)
+    for row in rows:
+        grouped[(str(row.get("source") or ""), str(row.get("run_date") or "")[:10])].append(row)
+    annotations: list[dict] = []
+    by_key = {
+        (str(row.get("ticker") or "").upper(), str(row.get("source") or ""), str(row.get("run_date") or "")): row
+        for row in rows
+    }
+    for group_rows in grouped.values():
+        for ann in annotate_value_cap_shadow(group_rows, config_module=cfg):
+            source_row = by_key.get((
+                str(ann.get("ticker") or "").upper(),
+                str(ann.get("source") or ""),
+                str(ann.get("run_date") or ""),
+            ), {})
+            annotations.append({**source_row, **ann})
+    return annotations
+
+
+def _summarise_analogue_rows(rows: list[dict]) -> dict:
+    returns = [_finite(row.get("tb_return")) for row in rows]
+    returns = [ret for ret in returns if ret is not None]
+    wins = 0
+    losses = 0
+    flats = 0
+    sectors: Counter[str] = Counter()
+    for row in rows:
+        label = int(_finite(row.get("tb_label")) or 0)
+        if label > 0:
+            wins += 1
+        elif label < 0:
+            losses += 1
+        else:
+            flats += 1
+        sectors[str(row.get("sector") or "Unknown")] += 1
+    decisive = wins + losses
+    ordered_returns = sorted(returns)
+    median_return = None
+    if ordered_returns:
+        mid = len(ordered_returns) // 2
+        median_return = (
+            ordered_returns[mid]
+            if len(ordered_returns) % 2
+            else 0.5 * (ordered_returns[mid - 1] + ordered_returns[mid])
+        )
+    top_sector = sectors.most_common(1)
+    return {
+        "n": len(rows),
+        "wins": wins,
+        "losses": losses,
+        "flats": flats,
+        "hit_rate": round(wins / decisive, 4) if decisive else None,
+        "mean_return": round(sum(returns) / len(returns), 4) if returns else None,
+        "median_return": round(median_return, 4) if median_return is not None else None,
+        "worst_return": round(min(returns), 4) if returns else None,
+        "max_drawdown_proxy": round(min(returns), 4) if returns else None,
+        "top_sector": top_sector[0][0] if top_sector else None,
+        "top_sector_share": round(top_sector[0][1] / len(rows), 4) if top_sector and rows else None,
+        "directional_only": len(rows) < 20,
+        "drawdown_note": "max_drawdown_proxy uses worst mature triple-barrier return; intraperiod path drawdown is not stored.",
+    }
+
+
+def _valuation_analogue_slices(targets: list[dict], cfg: Any) -> list[dict]:
+    historical = _historical_shadow_rows(cfg)
+    if not historical:
+        return []
+    pe_cap = float(getattr(cfg, "PE_FORWARD_STRONG_BUY_MAX", 30.0))
+    pe_max = float(getattr(cfg, "STRONG_BUY_VALUATION_OVERRIDE_MAX_PE_FORWARD", 40.0))
+    ev_cap = float(getattr(cfg, "EV_EBIT_STRONG_BUY_MAX", 30.0))
+    ev_max = float(getattr(cfg, "STRONG_BUY_VALUATION_OVERRIDE_MAX_EV_EBIT", 35.0))
+    out: list[dict] = []
+    for target in targets[:10]:
+        ticker = str(target.get("ticker") or "").upper()
+        target_pe = _finite(target.get("pe_forward"))
+        target_ev = _finite(target.get("ev_ebit"))
+        rows: list[dict] = []
+        for row in historical:
+            if str(row.get("ticker") or "").upper() == ticker:
+                continue
+            if not row.get("valuation_would_clear_gate"):
+                continue
+            pe = _finite(row.get("pe_forward"))
+            ev = _finite(row.get("ev_ebit"))
+            comparable_pe = (
+                target_pe is None
+                or target_pe <= pe_cap
+                or (pe is not None and pe_cap < pe <= pe_max)
+            )
+            comparable_ev = (
+                target_ev is None
+                or target_ev <= ev_cap
+                or (ev is not None and ev_cap < ev <= ev_max)
+            )
+            if comparable_pe and comparable_ev:
+                rows.append(row)
+        rows.sort(key=lambda row: str(row.get("run_date") or ""), reverse=True)
+        out.append({
+            "ticker": ticker,
+            "criteria": {
+                "exclude_target_ticker": True,
+                "uses_historical_asof_features": True,
+                "requires_valuation_a_gain": True,
+                "pe_forward_range": [pe_cap, pe_max] if target_pe and target_pe > pe_cap else None,
+                "ev_ebit_range": [ev_cap, ev_max] if target_ev and target_ev > ev_cap else None,
+            },
+            "summary": _summarise_analogue_rows(rows),
+            "examples": [
+                {
+                    "ticker": row.get("ticker"),
+                    "run_date": row.get("run_date"),
+                    "source": row.get("source"),
+                    "sector": row.get("sector"),
+                    "pe_forward": row.get("pe_forward"),
+                    "ev_ebit": row.get("ev_ebit"),
+                    "qmj_percentile": row.get("qmj_percentile"),
+                    "f_score": row.get("f_score"),
+                    "revenue_growth": row.get("revenue_growth"),
+                    "tb_label": row.get("tb_label"),
+                    "tb_return": row.get("tb_return"),
+                }
+                for row in rows[:20]
+            ],
+        })
+    return out
+
+
 def build_value_cap_shadow_report(
     candidates: Iterable[Any],
     *,
@@ -434,4 +611,5 @@ def build_value_cap_shadow_report(
     }
     if include_historical:
         payload["historical_matured_outcomes"] = _historical_shadow_outcomes(cfg)
+        payload["valuation_analogue_slices"] = _valuation_analogue_slices(valuation_rows, cfg)
     return payload

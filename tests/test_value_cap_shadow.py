@@ -44,6 +44,7 @@ def _candidate(ticker: str, **overrides):
         "institutional_prior_percentile": 0.95,
         "institutional_prior_confidence": 0.80,
         "institutional_prior_coverage": 0.60,
+        "institutional_prior_coverage_source": "live_prior_pipeline",
     }
     base.update(overrides)
     return SimpleNamespace(**base)
@@ -135,6 +136,37 @@ def test_value_cap_shadow_report_schema_is_stable(monkeypatch):
     ):
         assert isinstance(report["summary"][key], int)
         assert report["summary"][key] >= 0
+
+
+def test_value_cap_shadow_prior_rows_include_coverage_attribution(monkeypatch):
+    monkeypatch.setattr(config, "INSTITUTIONAL_PRIOR_MIN_COVERAGE", 0.45)
+    monkeypatch.setattr(config, "INSTITUTIONAL_PRIOR_MIN_COVERAGE_SHADOW", 0.42)
+    candidate = _candidate(
+        "PRIOR",
+        institutional_prior_coverage=0.42,
+        institutional_prior_coverage_source="backfilled_from_features",
+    )
+
+    row = annotate_value_cap_shadow([candidate], config_module=config)[0]
+
+    assert row["prior_coverage_gain"] is True
+    assert row["institutional_prior_coverage"] == 0.42
+    assert row["institutional_prior_coverage_source"] == "backfilled_from_features"
+
+
+def test_value_cap_shadow_prior_rows_fallback_legacy_coverage_source(monkeypatch):
+    monkeypatch.setattr(config, "INSTITUTIONAL_PRIOR_MIN_COVERAGE", 0.45)
+    monkeypatch.setattr(config, "INSTITUTIONAL_PRIOR_MIN_COVERAGE_SHADOW", 0.42)
+    candidate = _candidate(
+        "PRIOR",
+        institutional_prior_coverage=0.42,
+        institutional_prior_coverage_source=None,
+    )
+
+    row = build_value_cap_shadow_report([candidate], config_module=config, include_historical=False)["prior_b_candidates"][0]
+
+    assert row["prior_coverage_gain"] is True
+    assert row["institutional_prior_coverage_source"] == "legacy_cached_prior_pipeline"
 
 
 def test_value_cap_shadow_recomputes_missing_serialized_qmj(monkeypatch):

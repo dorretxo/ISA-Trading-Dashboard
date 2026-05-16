@@ -1780,6 +1780,7 @@ def save_discovery_results(disc_result, state: dict) -> int:
             "institutional_prior_percentile": getattr(c, "institutional_prior_percentile", None),
             "institutional_prior_confidence": getattr(c, "institutional_prior_confidence", None),
             "institutional_prior_coverage": getattr(c, "institutional_prior_coverage", None),
+            "institutional_prior_coverage_source": getattr(c, "institutional_prior_coverage_source", None),
             "institutional_prior_rank": getattr(c, "institutional_prior_rank", None),
             "strong_buy_eligible": getattr(c, "strong_buy_eligible", None),
             "ready_lane_score": getattr(c, "ready_lane_score", None),

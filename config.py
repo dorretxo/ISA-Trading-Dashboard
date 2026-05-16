@@ -488,6 +488,7 @@ PE_FORWARD_GROWTH_OVERRIDE_CAGR = 0.25   # Override P/E cap if 3y EPS CAGR > thi
 DEEP_VALUE_SPREAD_PCTILE = 0.80          # Up-weight value when E/P spread > this
 VALUE_CAP_SHADOW_REPORT_ENABLED = True
 VALUE_CAP_SHADOW_REPORT_PATH = "feature_cache/value_cap_shadow_report.json"
+SIGNAL_QUALITY_BACKFILL_REPORT_PATH = "feature_cache/signal_quality_backfill_report.json"
 STRONG_BUY_VALUATION_QUALITY_OVERRIDE_ENABLED = False  # Live-off; evaluated only by the shadow report unless flipped.
 STRONG_BUY_VALUATION_QUALITY_OVERRIDE_SHADOW = True
 STRONG_BUY_VALUATION_OVERRIDE_QMJ_FLOOR = 0.80          # Top-quintile QMJ required to override rich multiples.

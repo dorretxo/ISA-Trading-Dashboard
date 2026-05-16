@@ -116,6 +116,8 @@ CREATE TABLE IF NOT EXISTS signal_backtest (
     institutional_prior_score REAL,
     institutional_prior_percentile REAL,
     institutional_prior_confidence REAL,
+    institutional_prior_coverage REAL,
+    institutional_prior_coverage_source TEXT,
     institutional_prior_components TEXT,
     ready_contract_status TEXT,
     ready_contract_reasons TEXT,
@@ -312,6 +314,8 @@ _FEATURE_STORE_COLUMNS = [
     ("institutional_prior_score", "REAL"),
     ("institutional_prior_percentile", "REAL"),
     ("institutional_prior_confidence", "REAL"),
+    ("institutional_prior_coverage", "REAL"),
+    ("institutional_prior_coverage_source", "TEXT"),
     ("institutional_prior_components", "TEXT"),
     ("ready_contract_status", "TEXT"),
     ("ready_contract_reasons", "TEXT"),
@@ -1130,6 +1134,8 @@ def record_discovery_picks(candidates: list) -> int:
                 institutional_prior_score = getattr(c, "institutional_prior_score", None)
                 institutional_prior_percentile = getattr(c, "institutional_prior_percentile", None)
                 institutional_prior_confidence = getattr(c, "institutional_prior_confidence", None)
+                institutional_prior_coverage = getattr(c, "institutional_prior_coverage", None)
+                institutional_prior_coverage_source = getattr(c, "institutional_prior_coverage_source", None)
                 institutional_prior_components = getattr(c, "institutional_prior_components", None)
                 ready_contract_status = getattr(c, "ready_contract_status", None)
                 ready_contract_reasons = getattr(c, "ready_contract_reasons", None)
@@ -1195,6 +1201,8 @@ def record_discovery_picks(candidates: list) -> int:
                 institutional_prior_score = c.get("institutional_prior_score")
                 institutional_prior_percentile = c.get("institutional_prior_percentile")
                 institutional_prior_confidence = c.get("institutional_prior_confidence")
+                institutional_prior_coverage = c.get("institutional_prior_coverage")
+                institutional_prior_coverage_source = c.get("institutional_prior_coverage_source")
                 institutional_prior_components = c.get("institutional_prior_components")
                 ready_contract_status = c.get("ready_contract_status")
                 ready_contract_reasons = c.get("ready_contract_reasons")
@@ -1399,6 +1407,11 @@ def record_discovery_picks(candidates: list) -> int:
                 "institutional_prior_score": institutional_prior_score,
                 "institutional_prior_percentile": institutional_prior_percentile,
                 "institutional_prior_confidence": institutional_prior_confidence,
+                "institutional_prior_coverage": institutional_prior_coverage,
+                "institutional_prior_coverage_source": (
+                    institutional_prior_coverage_source
+                    or ("live_prior_pipeline" if institutional_prior_coverage is not None else "unavailable")
+                ),
                 "institutional_prior_components": institutional_prior_components_payload,
                 "ready_contract_status": ready_contract_status,
                 "ready_contract_reasons": ready_contract_reasons_payload,

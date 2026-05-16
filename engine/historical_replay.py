@@ -933,6 +933,8 @@ def _apply_replay_readiness_fields(rows: dict[str, dict]) -> None:
             "institutional_prior_score": prior.score,
             "institutional_prior_percentile": prior.percentile,
             "institutional_prior_confidence": prior.confidence,
+            "institutional_prior_coverage": prior.coverage,
+            "institutional_prior_coverage_source": "replay_recomputed",
             "institutional_prior_components": _json_or_none(prior.components),
         })
         payload = dict(row)
