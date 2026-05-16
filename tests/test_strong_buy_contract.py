@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 
 import engine.discovery as discovery
 
@@ -113,3 +114,88 @@ def test_meta_floor_remains_load_bearing_for_strong_buy(monkeypatch):
     assert candidate.action == "BUY"
     assert candidate.ready_contract_status == "FAIL"
     assert any("Meta-label confidence" in reason for reason in candidate.strong_buy_blockers)
+
+
+def test_drift_active_conservative_profile_still_allows_clean_strong_buy(monkeypatch, tmp_path):
+    _configure_percentile_contract(monkeypatch)
+    monkeypatch.setattr(discovery.config, "THRESHOLD_LEARNER_ENABLED", True, raising=False)
+    monkeypatch.setattr(discovery.config, "ACTION_GATES_ENABLED", True, raising=False)
+    monkeypatch.setattr(
+        discovery.config,
+        "THRESHOLD_LEARNER_STATE_FILE",
+        str(tmp_path / "threshold_state.json"),
+        raising=False,
+    )
+
+    from engine.threshold_learner import ThresholdLearnerState, save_state
+
+    state = ThresholdLearnerState()
+    state.drift_active = True
+    state.posteriors["aggressive"].update(successes=100, failures=10)
+    save_state(state, config_module=discovery.config)
+
+    candidate = SimpleNamespace(
+        ticker="CLEANCON",
+        action="NEUTRAL",
+        aggregate_score=0.9,
+        f_score=9,
+        f_score_coverage=1.0,
+        trap_safeguard_triggered=False,
+        gate_v2_status="PASS",
+        sb_score=1.5,
+        strong_buy_eligible=True,
+        institutional_prior_percentile=0.95,
+        institutional_prior_confidence=0.90,
+        institutional_prior_coverage=0.90,
+        ready_contract_core_status="PASS",
+        ready_contract_status="PASS",
+        ready_contract_reasons=[],
+        strong_buy_blockers=[],
+        meta_success_prob=0.90,
+        action_gate_ceiling="STRONG BUY",
+        action_gate_reasons=[],
+        entry_stance="Ready",
+        entry_price=100.0,
+        stop_loss=92.0,
+        take_profit=120.0,
+        r_r_ratio=2.5,
+        position_weight=0.02,
+        effective_data_confidence=0.95,
+        scorecard_override=False,
+        scorecard_override_blockers=[],
+        sector="Technology",
+        altman_z=5.0,
+        beneish_m=-3.0,
+        accruals_factor_score=0.50,
+        investment_factor_score=0.30,
+        net_debt_ebitda=0.2,
+        ev_ebit=16.0,
+        ev_sales=3.5,
+        pe_ratio=20.0,
+        pe_forward=20.0,
+        eps_growth_3y_cagr=0.18,
+        qmj_factor_score=0.95,
+        qmj_component_count=3,
+        gpa=0.85,
+        gpa_score=0.90,
+        roic=0.28,
+        wacc=0.10,
+        op_margin_yoy_delta=0.04,
+        rsi=58,
+        price_vs_sma200_stretch=0.12,
+        realized_vol_pctile=0.30,
+        ready_contract_score=1.0,
+        pit_source="fmp_full",
+        current_price=100.0,
+        sma_200=90.0,
+        support_levels={},
+        atr=2.0,
+    )
+
+    discovery._assign_percentile_actions([candidate])
+
+    assert candidate.threshold_profile == "conservative"
+    assert candidate.action_gate_ceiling == "STRONG BUY"
+    assert candidate.action == "STRONG BUY"
+    assert candidate.strong_buy_eligible is True
+    assert candidate.strong_buy_blockers == []

@@ -86,6 +86,19 @@ def test_select_profile_drift_forces_conservative():
     assert profile == "conservative"
 
 
+def test_select_profile_persisted_drift_forces_conservative():
+    class _Cfg:
+        DRIFT_FORCE_CONSERVATIVE = True
+
+    state = ThresholdLearnerState()
+    state.drift_active = True
+    state.posteriors["aggressive"].update(successes=100, failures=10)
+
+    profile = select_profile(state, drift_alert=False, config_module=_Cfg)
+
+    assert profile == "conservative"
+
+
 def test_select_profile_picks_higher_posterior_in_expectation():
     """Thompson is stochastic but the better profile wins in expectation."""
     class _Cfg:

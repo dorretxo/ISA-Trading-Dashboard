@@ -3,6 +3,7 @@ from __future__ import annotations
 import sqlite3
 
 import pandas as pd
+import pytest
 
 from engine import historical_replay as replay
 from engine.factors import compute_factor_scores_from_result
@@ -339,6 +340,28 @@ def test_replay_readiness_backfill_blocks_overbought_rows():
     assert hot["ready_contract_status"] == "FAIL"
     assert hot["strong_buy_eligible"] == 0
     assert "action gate ceiling" in (hot["strong_buy_blockers"] or "")
+
+
+def test_replay_readiness_preserves_precomputed_execution_fields():
+    rows = {
+        "LOWRR": _ready_replay_row(
+            entry_price=99.0,
+            fill_probability=0.8,
+            stop_loss=90.0,
+            take_profit=103.0,
+        ),
+        "GOOD": _ready_replay_row(quality_factor_score=0.7, qmj_factor_score=0.7),
+        "WEAK": _ready_replay_row(quality_factor_score=-0.5, qmj_factor_score=-0.5, f_score=3),
+    }
+
+    replay._apply_replay_readiness_fields(rows)
+
+    lowrr = rows["LOWRR"]
+    assert lowrr["entry_price"] == 99.0
+    assert lowrr["fill_probability"] == 0.8
+    assert lowrr["r_r_ratio"] == pytest.approx(4.0 / 9.0)
+    assert lowrr["ready_contract_status"] == "FAIL"
+    assert "R/R below" in (lowrr["strong_buy_blockers"] or "")
 
 
 def test_insert_replay_row_can_refresh_existing_row():

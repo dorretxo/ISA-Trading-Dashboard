@@ -217,13 +217,16 @@ def select_profile(
     When ``drift_alert`` is True and the config flag
     ``DRIFT_FORCE_CONSERVATIVE`` is set, the conservative profile wins
     unconditionally — this is the safety mechanism that ratchets thresholds
-    in when the live model degrades.
+    in when the live model degrades. A persisted ``state.drift_active`` flag
+    is treated the same way so orchestrator-confirmed drift survives into the
+    next discovery run.
     """
     cfg = config_module
     if cfg is None:
         import config as cfg    # type: ignore[no-redef]
 
-    if drift_alert and bool(getattr(cfg, "DRIFT_FORCE_CONSERVATIVE", True)):
+    effective_drift_alert = bool(drift_alert or getattr(state, "drift_active", False))
+    if effective_drift_alert and bool(getattr(cfg, "DRIFT_FORCE_CONSERVATIVE", True)):
         return "conservative"
 
     rng = rng or random.Random()

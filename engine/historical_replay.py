@@ -15,7 +15,7 @@ import json
 import logging
 import math
 from types import SimpleNamespace
-from typing import Iterable
+from typing import Iterable, Mapping
 
 import numpy as np
 import pandas as pd
@@ -410,6 +410,7 @@ def _price_features(frame: pd.DataFrame, as_of: pd.Timestamp) -> dict | None:
         "atr": _finite(technical.get("atr")) or atr,
         "rsi": _finite(technical.get("rsi")),
         "adx": _finite(technical.get("adx")),
+        "bb_lower": _finite(technical.get("bb_lower")),
         "bb_pct": _finite(technical.get("bb_pct")),
         "return_10d_prior": ret_10,
         "return_30d_prior": ret_30,
@@ -696,6 +697,199 @@ def _replay_data_confidence(row: dict) -> float:
     return float(present / max(1, len(critical)))
 
 
+def _pit_stop_loss(row: Mapping, frame: pd.DataFrame | None) -> dict:
+    """PIT-safe support-confluence stop mirroring engine.stops."""
+    current_price = _finite(row.get("signal_price"))
+    if current_price is None or current_price <= 0:
+        return {"stop_loss": None, "method": "N/A"}
+
+    atr = _finite(row.get("atr"))
+    sma_200 = _finite(row.get("sma_200"))
+    sma_50 = _finite(row.get("sma_50"))
+    bb_lower = _finite(row.get("bb_lower"))
+    trail_low = float(getattr(config, "TRAIL_PCT_LOW_VOL", 0.08))
+    trail_high = float(getattr(config, "TRAIL_PCT_HIGH_VOL", 0.15))
+    vol_pct = 50.0
+    vix_pct = float(getattr(config, "HISTORICAL_REPLAY_VIX_PERCENTILE_DEFAULT", 50.0))
+    trail_pct = float(np.interp(vol_pct, [20, 80], [trail_low, trail_high]))
+    atr_mult = 2.5 * (1.0 + 0.5 * (vix_pct / 100.0))
+
+    hist = frame.copy() if frame is not None else pd.DataFrame()
+    if not hist.empty and "Close" in hist.columns:
+        hist = hist.dropna(subset=["Close"])
+    high = hist["High"].astype(float) if not hist.empty and "High" in hist.columns else pd.Series(dtype=float)
+    low = hist["Low"].astype(float) if not hist.empty and "Low" in hist.columns else pd.Series(dtype=float)
+
+    swing_low = None
+    try:
+        if len(low.dropna()) >= 20:
+            swing_low = float(low.dropna().tail(20).min())
+    except Exception:
+        swing_low = None
+
+    candidates: dict[str, tuple[float, float]] = {}
+    if atr is not None and atr > 0:
+        atr_stop = current_price - atr * atr_mult
+        if 0 < atr_stop < current_price:
+            candidates["atr"] = (atr_stop, 0.35)
+    if sma_200 is not None and 0.85 * current_price < sma_200 < current_price:
+        candidates["sma_200"] = (sma_200 * 0.97, 0.25)
+    if sma_50 is not None and 0.90 * current_price < sma_50 < current_price:
+        candidates["sma_50"] = (sma_50 * 0.98, 0.20)
+    if swing_low is not None and 0.85 * current_price < swing_low < current_price:
+        candidates["swing_low"] = (swing_low * 0.99, 0.15)
+    if bb_lower is not None and 0 < bb_lower < current_price:
+        candidates["bb_lower"] = (bb_lower, 0.05)
+
+    if candidates:
+        total_weight = sum(weight for _, weight in candidates.values())
+        weighted_avg = sum(price * weight for price, weight in candidates.values()) / total_weight
+        valid = {
+            key: (price, weight)
+            for key, (price, weight) in candidates.items()
+            if price <= weighted_avg * 1.02
+        }
+        if valid:
+            method = max(valid, key=lambda key: valid[key][0])
+            stop_price = valid[method][0]
+            method = f"{method} confluence"
+        else:
+            stop_price = weighted_avg
+            method = "weighted confluence"
+    else:
+        recent_high = None
+        try:
+            if len(high.dropna()) > 0:
+                recent_high = float(high.dropna().tail(63).max())
+        except Exception:
+            recent_high = None
+        reference = min(recent_high, current_price) if recent_high else current_price
+        stop_price = reference * (1.0 - trail_pct)
+        method = "pct_fallback"
+
+    if stop_price >= current_price:
+        stop_price = current_price * (1.0 - trail_pct)
+        method = "pct_fallback"
+    return {
+        "stop_loss": round(float(stop_price), 2),
+        "method": method,
+        "stop_distance_pct": round((current_price - float(stop_price)) / current_price * 100.0, 2),
+    }
+
+
+def _pit_take_profit(
+    row: Mapping,
+    frame: pd.DataFrame | None,
+    *,
+    stop_loss: float | None,
+    entry_price: float | None,
+    entry_lens: str | None,
+) -> dict:
+    """PIT-safe target using live target rules against as-of resistance."""
+    current_price = _finite(row.get("signal_price"))
+    reference_price = _finite(entry_price) or current_price
+    if reference_price is None or reference_price <= 0:
+        return {"take_profit": None, "method": "N/A"}
+
+    lens = str(entry_lens or "").strip()
+    if lens == "momentum":
+        rr_multiple = 2.5
+    elif lens in ("quality", "value"):
+        rr_multiple = 2.0
+    else:
+        rr_multiple = float(getattr(config, "RISK_REWARD_RATIO", 2.5))
+
+    targets: dict[str, float] = {}
+    stop = _finite(stop_loss)
+    if stop is not None and stop < reference_price:
+        targets["R/R ratio"] = reference_price + (reference_price - stop) * rr_multiple
+
+    high = pd.Series(dtype=float)
+    if frame is not None and not frame.empty and "High" in frame.columns:
+        high = frame["High"].astype(float).dropna()
+    resistance = None
+    if len(high) > 20:
+        high_6m = float(high.tail(126).max())
+        if high_6m > reference_price:
+            targets["resistance"] = high_6m
+            resistance = high_6m
+        high_52w = float(high.tail(min(252, len(high))).max())
+        if high_52w > reference_price and high_52w != high_6m:
+            targets["52w high"] = high_52w
+            if resistance is None:
+                resistance = high_52w
+
+    if not targets:
+        targets["default 15%"] = reference_price * 1.15
+
+    if "R/R ratio" in targets and resistance is not None and lens in ("momentum", "quality", "value"):
+        if lens == "value":
+            final_target = min(targets["R/R ratio"], resistance)
+            method = "value rr/resistance"
+        else:
+            final_target = max(targets["R/R ratio"], resistance)
+            method = f"{lens} rr/resistance"
+    else:
+        method = min(targets, key=targets.get)
+        final_target = targets[method]
+    return {"take_profit": round(float(final_target), 2), "method": method}
+
+
+def _replay_execution_fields(
+    *,
+    ticker: str,
+    frame: pd.DataFrame | None,
+    as_of: pd.Timestamp,
+    price_features: Mapping,
+    candidate_metadata: Mapping | None = None,
+) -> dict:
+    """Build PIT-safe execution fields, optionally lens-aligned to live."""
+    hist = frame.loc[frame.index <= as_of].copy() if frame is not None and not frame.empty else pd.DataFrame()
+    lens = None
+    if candidate_metadata:
+        lens = candidate_metadata.get("_entry_lens") or candidate_metadata.get("entry_lens")
+    lens = str(lens or "").strip() or None
+
+    try:
+        from engine.stops import calculate_entry_strategy
+
+        entry_data = calculate_entry_strategy(
+            _finite(price_features.get("signal_price")),
+            _finite(price_features.get("atr")),
+            sma_50=_finite(price_features.get("sma_50")),
+            bb_lower=_finite(price_features.get("bb_lower")),
+            vol_percentile=50.0,
+            entry_lens=lens or "momentum",
+        )
+    except Exception:
+        entry_data = {
+            "entry_price": price_features.get("signal_price"),
+            "entry_method": "replay_close",
+            "fill_probability": 1.0,
+        }
+
+    stop_data = _pit_stop_loss(price_features, hist)
+    target_data = _pit_take_profit(
+        price_features,
+        hist,
+        stop_loss=stop_data.get("stop_loss"),
+        entry_price=entry_data.get("entry_price"),
+        entry_lens=lens,
+    )
+    out = {
+        "entry_lens": lens,
+        "entry_price": entry_data.get("entry_price"),
+        "entry_method": entry_data.get("entry_method"),
+        "fill_probability": entry_data.get("fill_probability"),
+        "stop_loss": stop_data.get("stop_loss"),
+        "stop_method": stop_data.get("method"),
+        "stop_distance_pct": stop_data.get("stop_distance_pct"),
+        "take_profit": target_data.get("take_profit"),
+        "target_method": target_data.get("method"),
+    }
+    return out
+
+
 def _apply_replay_readiness_fields(rows: dict[str, dict]) -> None:
     """Populate PIT-safe action-gate and ready-contract fields on replay rows.
 
@@ -712,21 +906,25 @@ def _apply_replay_readiness_fields(rows: dict[str, dict]) -> None:
     candidates: list[SimpleNamespace] = []
     for ticker, row in rows.items():
         signal_price = _finite(row.get("signal_price"))
+        entry_price = _finite(row.get("entry_price")) or signal_price
         stop_loss = _finite(row.get("stop_loss"))
         take_profit = _finite(row.get("take_profit"))
         rr_ratio = None
-        if signal_price is not None and stop_loss is not None and take_profit is not None:
-            risk = signal_price - stop_loss
-            reward = take_profit - signal_price
+        if entry_price is not None and stop_loss is not None and take_profit is not None:
+            risk = entry_price - stop_loss
+            reward = take_profit - entry_price
             if risk > 0 and reward > 0:
                 rr_ratio = reward / risk
         prior = priors.get(str(ticker).upper(), neutral_prior())
+        fill_probability = _finite(row.get("fill_probability"))
+        if fill_probability is None and signal_price is not None:
+            fill_probability = 1.0
         row.update({
             "entry_lens": row.get("entry_lens") or "replay_close",
-            "entry_price": signal_price,
-            "entry_method": "replay_close",
-            "entry_stance": _replay_entry_stance(row),
-            "fill_probability": 1.0 if signal_price is not None else None,
+            "entry_price": entry_price,
+            "entry_method": row.get("entry_method") or "replay_close",
+            "entry_stance": row.get("entry_stance") or _replay_entry_stance(row),
+            "fill_probability": fill_probability,
             "planned_position_weight": float(getattr(config, "READY_STRONG_BUY_MIN_POSITION_WEIGHT", 0.005)) * 2.0,
             "planned_risk_amount": None,
             "position_sizing_method": "replay_fixed_fraction",
@@ -970,6 +1168,7 @@ def run_replay(
     start: str,
     end: str,
     tickers: Iterable[str] | None = None,
+    candidate_metadata_by_ticker: Mapping[str, Mapping] | None = None,
     max_tickers: int | None = None,
     batch_size: int | None = None,
     frequency: str = "monthly",
@@ -1022,7 +1221,17 @@ def run_replay(
             if not pfeat:
                 skipped_no_price += 1
                 continue
+            metadata = None
+            if candidate_metadata_by_ticker:
+                metadata = candidate_metadata_by_ticker.get(ticker) or candidate_metadata_by_ticker.get(ticker.upper())
             enriched = _replay_factor_payload(ticker, as_of, pfeat)
+            execution = _replay_execution_fields(
+                ticker=ticker,
+                frame=frame,
+                as_of=as_of,
+                price_features=pfeat,
+                candidate_metadata=metadata,
+            )
             fund_score = enriched.get("fundamental_score")
             tech_score = pfeat.get("technical_score") or 0.0
             aggregate = 0.65 * tech_score + 0.35 * (fund_score if fund_score is not None else 0.0)
@@ -1040,8 +1249,7 @@ def run_replay(
                 "action": action,
                 "sentiment_score": None,
                 "forecast_score": None,
-                "take_profit": pfeat["signal_price"] + 2.0 * (pfeat.get("atr") or pfeat["signal_price"] * 0.08),
-                "stop_loss": pfeat["signal_price"] - 1.0 * (pfeat.get("atr") or pfeat["signal_price"] * 0.08),
+                **execution,
             }
             replay_rows[ticker] = row
             if frame is not None:

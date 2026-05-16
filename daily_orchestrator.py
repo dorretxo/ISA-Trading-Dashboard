@@ -525,6 +525,38 @@ def _historical_ready_contract_calibration() -> dict:
     }
 
 
+def _parity_live_row_from_candidate(
+    *,
+    ticker: str,
+    candidate: dict | None,
+    persisted_row: dict | None,
+    fallback_run_date: str | None = None,
+) -> dict:
+    """Build the live parity row from the fresh screener candidate.
+
+    ``signal_backtest`` may not contain every cached discovery candidate, and
+    some rows can be older than the latest state cache. Parity should compare
+    replay against the artifact being promoted, so DB values are only a
+    fallback for missing cached fields and metadata.
+    """
+    row = dict(persisted_row or {})
+    persisted_run_date = row.get("run_date")
+    if candidate:
+        row.update(dict(candidate))
+        row["source"] = "cached_discovery"
+    row["ticker"] = str(ticker or row.get("ticker") or "").upper().strip()
+    if candidate:
+        row["run_date"] = (
+            candidate.get("run_date")
+            or fallback_run_date
+            or persisted_run_date
+            or row.get("run_date")
+        )
+    else:
+        row["run_date"] = row.get("run_date") or fallback_run_date
+    return row
+
+
 def _write_replay_live_parity_report(candidates: list[dict]) -> None:
     """Compare latest live discovery ML features against PIT replay features."""
     try:
@@ -546,11 +578,15 @@ def _write_replay_live_parity_report(candidates: list[dict]) -> None:
         comparison_scope = "core_factor_cols"
     tickers = []
     seen = set()
+    candidate_by_ticker: dict[str, dict] = {}
     for candidate in candidates or []:
         ticker = str(candidate.get("ticker") or "").upper().strip()
         if ticker and ticker not in seen:
             tickers.append(ticker)
             seen.add(ticker)
+            payload = dict(candidate)
+            payload["ticker"] = ticker
+            candidate_by_ticker[ticker] = payload
     if not tickers:
         atomic_write_json(
             _REPLAY_LIVE_PARITY_REPORT,
@@ -561,6 +597,11 @@ def _write_replay_live_parity_report(candidates: list[dict]) -> None:
 
     tolerance = float(getattr(config, "REPLAY_LIVE_PARITY_TOLERANCE", 0.15))
     max_date_gap_days = int(getattr(config, "REPLAY_LIVE_PARITY_MAX_DATE_GAP_DAYS", 7))
+    fallback_live_run_date = None
+    try:
+        fallback_live_run_date = load_state().get("last_discovery_run")
+    except Exception:
+        fallback_live_run_date = None
     rows_out: list[dict] = []
     drift_counts: Counter[str] = Counter()
     missing_counts: Counter[str] = Counter()
@@ -607,16 +648,22 @@ def _write_replay_live_parity_report(candidates: list[dict]) -> None:
                     """,
                     (ticker,),
                 ).fetchone()
-                if not live or not replay:
+                live_candidate = candidate_by_ticker.get(ticker)
+                if (not live_candidate and not live) or not replay:
                     if not replay:
                         missing_replay += 1
                     rows_out.append({
                         "ticker": ticker,
                         "available": False,
-                        "reason": "missing live discovery row" if not live else "missing replay_pit_v1 row",
+                        "reason": "missing live discovery row" if (not live_candidate and not live) else "missing replay_pit_v1 row",
                     })
                     continue
-                live_d = dict(live)
+                live_d = _parity_live_row_from_candidate(
+                    ticker=ticker,
+                    candidate=live_candidate,
+                    persisted_row=dict(live) if live else None,
+                    fallback_run_date=fallback_live_run_date,
+                )
                 replay_d = dict(replay)
                 date_gap_days = None
                 try:

@@ -518,6 +518,7 @@ def refresh_replay_parity(
         days = int(getattr(config, "HISTORICAL_REPLAY_FRESH_DEFAULT_DAYS", 7))
     candidates, as_of = latest_discovery_cohort(limit=top_n)
     tickers = [candidate["ticker"] for candidate in candidates]
+    candidate_metadata = {candidate["ticker"]: dict(candidate) for candidate in candidates}
     start, end = replay_window(as_of, frequency=frequency, days=days)
     fundamental_refresh_payload = None
     if refresh_fundamentals:
@@ -535,6 +536,7 @@ def refresh_replay_parity(
         start=start,
         end=end,
         tickers=tickers,
+        candidate_metadata_by_ticker=candidate_metadata,
         batch_size=batch_size,
         frequency=frequency,
         include_forward_labels=include_forward_labels,
