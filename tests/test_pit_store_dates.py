@@ -53,3 +53,34 @@ def test_record_snapshot_tags_source(tmp_path: Path):
 
     assert visible is not None
     assert visible["_source"] == "yfinance_quarterly"
+
+
+def test_latest_as_of_prefers_recent_rich_statement_over_thin_live_capture(tmp_path: Path):
+    path = tmp_path / "pit.json"
+    record_snapshot(
+        "NOKIA.HE",
+        "2025-12-31",
+        {
+            "gross_profit": 10.0,
+            "total_assets": 100.0,
+            "net_income": 4.0,
+            "revenue": 40.0,
+        },
+        accepted_date="2026-03-05",
+        source="sec_edgar",
+        path=path,
+    )
+    record_snapshot(
+        "NOKIA.HE",
+        "2026-05-16",
+        {"total_assets": 110.0},
+        source="yfinance_info",
+        path=path,
+    )
+
+    visible, report_date = latest_as_of("NOKIA.HE", "2026-05-17", path=path)
+
+    assert visible is not None
+    assert report_date == "2025-12-31"
+    assert visible["_source"] == "sec_edgar"
+    assert visible["gross_profit"] == 10.0

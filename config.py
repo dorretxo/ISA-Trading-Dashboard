@@ -633,6 +633,36 @@ HF_TOKEN = (
     or os.environ.get("HUGGINGFACEHUB_API_TOKEN", "")
     or os.environ.get("HUGGING_FACE_HUB_TOKEN", "")
 )
+
+# Alpha Vantage Token (legacy free-tier fallback for global coverage and technicals if FMP is unavailable)
+
+AV_TOKEN = (
+    os.environ.get("AV_API_KEY", "")
+    or os.environ.get("ALPHA_VANTAGE_API_KEY", "")
+)
+# Finnhub Token (legacy free-tier fallback for global coverage and technicals if FMP is unavailable)
+FH_TOKEN = (
+    os.environ.get("FH_API_KEY", "")
+    or os.environ.get("FINNHUB_API_KEY", "")
+)
+
+# TwelveData Token (legacy free-tier fallback for global coverage and technicals if FMP is unavailable)
+TWELVEDATA_TOKEN = (
+    os.environ.get("TWELVEDATA_API_KEY", "")
+    or os.environ.get("TWELVE_DATA_API_KEY", "")
+)
+
+
+ALPHA_VANTAGE_ADR_FALLBACK_ENABLED = os.environ.get("ALPHA_VANTAGE_ADR_FALLBACK_ENABLED", "0").strip() == "1"
+ALPHA_VANTAGE_ADR_DAILY_CALL_BUDGET = int(os.environ.get("ALPHA_VANTAGE_ADR_DAILY_CALL_BUDGET", "12") or 12)
+ALPHA_VANTAGE_ADR_SLEEP_SECONDS = float(os.environ.get("ALPHA_VANTAGE_ADR_SLEEP_SECONDS", "13") or 13)
+ALPHA_VANTAGE_ADR_FETCH_CASHFLOW = os.environ.get("ALPHA_VANTAGE_ADR_FETCH_CASHFLOW", "1").strip() != "0"
+ALPHA_VANTAGE_ADR_ATTEMPT_LEDGER_PATH = os.environ.get(
+    "ALPHA_VANTAGE_ADR_ATTEMPT_LEDGER_PATH",
+    "feature_cache/alpha_vantage_adr_attempts.json",
+)
+ADR_MAPPING_TABLE_PATH = os.environ.get("ADR_MAPPING_TABLE_PATH", "data/adr_mappings.csv")
+
 FMP_CACHE_TTL_DAILY = 3600        # 1h — technicals, news
 FMP_CACHE_TTL_CALENDAR = 43200    # 12h — earnings calendar
 

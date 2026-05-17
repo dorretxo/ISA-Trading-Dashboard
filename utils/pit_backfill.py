@@ -12,6 +12,7 @@ happen after this store has broad coverage.
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import logging
 import math
@@ -22,6 +23,7 @@ from typing import Iterable, Mapping
 
 import numpy as np
 import pandas as pd
+import requests
 import yfinance as yf
 
 import config
@@ -31,11 +33,144 @@ from engine.factors import compute_factor_scores_from_result
 from engine.paper_trading import _connect
 from utils.atomic_io import atomic_write_json
 from utils import fmp_client
-from utils.pit_store import _available_date, _coerce_date, _load_store, record_snapshot
+from utils.pit_store import (
+    _available_date,
+    _coerce_date,
+    _load_store,
+    _select_best_available_snapshot,
+    record_snapshot,
+)
 from utils.price_store import download_price_history, get_price_history
 
 logger = logging.getLogger(__name__)
 _PIT_STORE_CACHE: dict | None = None
+
+_SEC_COMPANY_TICKERS_EXCHANGE_URL = "https://www.sec.gov/files/company_tickers_exchange.json"
+_SEC_COMPANYFACTS_URL = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik:010d}.json"
+_ALPHA_VANTAGE_QUERY_URL = "https://www.alphavantage.co/query"
+_ADR_MAPPING_PATH = Path(getattr(config, "ADR_MAPPING_TABLE_PATH", "data/adr_mappings.csv"))
+_ALPHA_ATTEMPT_LEDGER_PATH = Path(
+    getattr(config, "ALPHA_VANTAGE_ADR_ATTEMPT_LEDGER_PATH", "feature_cache/alpha_vantage_adr_attempts.json")
+)
+_SEC_COMPANY_TICKER_CACHE: dict[str, dict] | None = None
+_SEC_COMPANYFACTS_CACHE: dict[int, dict] = {}
+_ADR_MAPPING_TABLE_CACHE: dict[str, dict] | None = None
+
+# Local-listing -> ADR mappings used only for fundamentals enrichment.  Keeping
+# these local avoids changing trading/cross-listing behaviour elsewhere.
+_SEC_EDGAR_ADR_OVERRIDES: dict[str, str] = {
+    "ASML.AS": "ASML",
+    "DGE.L": "DEO",
+    "NOKIA.HE": "NOK",
+}
+
+_ALPHA_FIELD_MAPS: dict[str, dict[str, tuple[str, ...]]] = {
+    "income": {
+        "net_income": ("netIncome", "netIncomeFromContinuingOperations"),
+        "gross_profit": ("grossProfit",),
+        "revenue": ("totalRevenue", "reportedCurrencyTotalRevenue"),
+        "cost_of_revenue": ("costOfRevenue", "costofGoodsAndServicesSold"),
+        "ebit": ("ebit", "operatingIncome"),
+        "ebitda": ("ebitda",),
+    },
+    "balance": {
+        "total_assets": ("totalAssets",),
+        "cash": ("cashAndCashEquivalentsAtCarryingValue", "cashAndShortTermInvestments"),
+        "long_term_debt": ("longTermDebt", "longTermDebtNoncurrent"),
+        "short_term_debt": ("shortTermDebt", "currentDebt"),
+        "total_debt": ("shortLongTermDebtTotal", "totalDebt"),
+        "current_assets": ("totalCurrentAssets",),
+        "current_liabilities": ("totalCurrentLiabilities",),
+        "shares_outstanding": ("commonStockSharesOutstanding",),
+    },
+    "cashflow": {
+        "operating_cashflow": ("operatingCashflow", "netCashProvidedByOperatingActivities"),
+        "capital_expenditure": ("capitalExpenditures",),
+    },
+}
+
+_SEC_FORMS = {"10-K", "10-Q", "20-F", "40-F", "6-K"}
+_SEC_TAXONOMIES = ("ifrs-full", "us-gaap")
+_SEC_CURRENCY_UNITS_EXCLUDE = {"shares", "pure"}
+
+_SEC_FIELD_TAGS: dict[str, tuple[str, ...]] = {
+    "gross_profit": ("GrossProfit", "GrossProfitLoss"),
+    "revenue": (
+        "Revenue",
+        "Revenues",
+        "RevenueFromContractWithCustomerExcludingAssessedTax",
+        "RevenueFromContractWithCustomerIncludingAssessedTax",
+    ),
+    "cost_of_revenue": ("CostOfSales", "CostOfRevenue", "CostOfGoodsAndServicesSold"),
+    "net_income": ("ProfitLoss", "NetIncomeLoss"),
+    "operating_cashflow": (
+        "CashFlowsFromUsedInOperatingActivities",
+        "NetCashProvidedByUsedInOperatingActivities",
+        "NetCashProvidedByUsedInOperatingActivitiesContinuingOperations",
+    ),
+    "capital_expenditure": (
+        "PaymentsToAcquirePropertyPlantAndEquipment",
+        "PaymentsToAcquirePropertyPlantAndEquipmentClassifiedAsInvestingActivities",
+        "PaymentsToAcquireProductiveAssets",
+    ),
+    "ebit": ("ProfitLossFromOperatingActivities", "OperatingIncomeLoss"),
+    "ebitda": ("EarningsBeforeInterestTaxesDepreciationAndAmortization",),
+    "total_assets": ("Assets",),
+    "cash": ("CashAndCashEquivalents", "CashAndCashEquivalentsAtCarryingValue"),
+    "total_debt": (
+        "Borrowings",
+        "DebtCurrentAndNoncurrent",
+        "LongTermDebtAndFinanceLeaseObligationsCurrentAndNoncurrent",
+    ),
+    "current_assets": ("AssetsCurrent",),
+    "current_liabilities": ("LiabilitiesCurrent",),
+    "shares_outstanding": ("EntityCommonStockSharesOutstanding",),
+}
+
+_SEC_INSTANT_FIELDS = {
+    "total_assets",
+    "cash",
+    "total_debt",
+    "current_assets",
+    "current_liabilities",
+    "shares_outstanding",
+}
+
+_YAHOO_TIMESERIES_TYPES: tuple[str, ...] = (
+    "quarterlyGrossProfit",
+    "quarterlyTotalAssets",
+    "quarterlyNetIncome",
+    "quarterlyOperatingCashFlow",
+    "quarterlyCapitalExpenditure",
+    "quarterlyTotalDebt",
+    "quarterlyCashAndCashEquivalents",
+    "quarterlyTotalRevenue",
+    "quarterlyEBIT",
+    "quarterlyEBITDA",
+    "trailingGrossProfit",
+    "trailingTotalAssets",
+    "trailingNetIncome",
+    "trailingOperatingCashFlow",
+    "trailingTotalRevenue",
+)
+
+_YAHOO_TIMESERIES_FIELD_MAP: dict[str, str] = {
+    "quarterlyGrossProfit": "gross_profit",
+    "trailingGrossProfit": "gross_profit",
+    "quarterlyTotalAssets": "total_assets",
+    "trailingTotalAssets": "total_assets",
+    "quarterlyNetIncome": "net_income",
+    "trailingNetIncome": "net_income",
+    "quarterlyOperatingCashFlow": "operating_cashflow",
+    "trailingOperatingCashFlow": "operating_cashflow",
+    "quarterlyCapitalExpenditure": "capital_expenditure",
+    "quarterlyTotalDebt": "total_debt",
+    "quarterlyCashAndCashEquivalents": "cash",
+    "quarterlyTotalRevenue": "revenue",
+    "trailingTotalRevenue": "revenue",
+    "quarterlyEBIT": "ebit",
+    "quarterlyEBITDA": "ebitda",
+}
 
 
 def _float(value):
@@ -132,6 +267,561 @@ def backfill_ticker(ticker: str, *, limit: int | None = None) -> int:
     return written
 
 
+def _http_user_agent() -> str:
+    return str(
+        getattr(
+            config,
+            "SEC_EDGAR_USER_AGENT",
+            "TradingApp/1.0 contact@example.com",
+        )
+    )
+
+
+def _sec_get_json(url: str, *, timeout: int = 20) -> dict | None:
+    headers = {
+        "User-Agent": _http_user_agent(),
+        "Accept-Encoding": "gzip, deflate",
+    }
+    for attempt in range(3):
+        try:
+            response = requests.get(url, headers=headers, timeout=timeout)
+            if response.status_code in {429, 500, 502, 503, 504} and attempt < 2:
+                time.sleep(0.5 * (attempt + 1))
+                continue
+            if response.status_code != 200:
+                logger.debug("SEC EDGAR request %s returned status %s", url, response.status_code)
+                return None
+            return response.json()
+        except Exception as exc:
+            if attempt >= 2:
+                logger.debug("SEC EDGAR request failed for %s: %s", url, exc)
+                return None
+            time.sleep(0.5 * (attempt + 1))
+    return None
+
+
+def _sec_company_ticker_map() -> dict[str, dict]:
+    global _SEC_COMPANY_TICKER_CACHE
+    if _SEC_COMPANY_TICKER_CACHE is not None:
+        return _SEC_COMPANY_TICKER_CACHE
+    payload = _sec_get_json(_SEC_COMPANY_TICKERS_EXCHANGE_URL) or {}
+    fields = payload.get("fields") or []
+    rows = payload.get("data") or []
+    try:
+        indexes = {name: fields.index(name) for name in ("cik", "name", "ticker", "exchange")}
+    except ValueError:
+        _SEC_COMPANY_TICKER_CACHE = {}
+        return _SEC_COMPANY_TICKER_CACHE
+    out: dict[str, dict] = {}
+    for row in rows:
+        try:
+            ticker = str(row[indexes["ticker"]]).upper().strip()
+            if not ticker:
+                continue
+            out[ticker] = {
+                "cik": int(row[indexes["cik"]]),
+                "name": str(row[indexes["name"]]),
+                "ticker": ticker,
+                "exchange": str(row[indexes["exchange"]]),
+            }
+        except Exception:
+            continue
+    _SEC_COMPANY_TICKER_CACHE = out
+    return out
+
+
+def _sec_companyfacts(cik: int) -> dict | None:
+    cik = int(cik)
+    if cik in _SEC_COMPANYFACTS_CACHE:
+        return _SEC_COMPANYFACTS_CACHE[cik]
+    payload = _sec_get_json(_SEC_COMPANYFACTS_URL.format(cik=cik))
+    if payload:
+        _SEC_COMPANYFACTS_CACHE[cik] = payload
+    return payload
+
+
+def _load_adr_mapping_table(path: Path | None = None) -> dict[str, dict]:
+    """Load local-listing -> ADR metadata from the maintainable CSV artifact."""
+    global _ADR_MAPPING_TABLE_CACHE
+    target = Path(path or _ADR_MAPPING_PATH)
+    if path is None and _ADR_MAPPING_TABLE_CACHE is not None:
+        return _ADR_MAPPING_TABLE_CACHE
+    if not target.exists():
+        if path is None:
+            _ADR_MAPPING_TABLE_CACHE = {}
+        return {}
+    out: dict[str, dict] = {}
+    try:
+        with open(target, "r", encoding="utf-8-sig", newline="") as handle:
+            for row in csv.DictReader(handle):
+                local = str(row.get("local_symbol") or "").upper().strip()
+                adr = str(row.get("adr_symbol") or "").upper().strip()
+                if not local or not adr:
+                    continue
+                out[local] = {
+                    "local_symbol": local,
+                    "adr_symbol": adr,
+                    "adr_exchange": str(row.get("adr_exchange") or "").upper().strip(),
+                    "sec_cik": str(row.get("sec_cik") or "").strip(),
+                    "notes": str(row.get("notes") or "").strip(),
+                }
+    except Exception as exc:
+        logger.warning("ADR mapping table read failed for %s: %s", target, exc)
+        out = {}
+    if path is None:
+        _ADR_MAPPING_TABLE_CACHE = out
+    return out
+
+
+def _adr_mapping_row_for_ticker(ticker: str) -> dict | None:
+    symbol = str(ticker or "").upper().strip()
+    if not symbol or "." not in symbol:
+        return None
+    mapping: dict[str, dict] = {}
+    try:
+        from utils.global_universe import ADR_MAPPING
+
+        mapping.update(
+            {
+                str(k).upper(): {"local_symbol": str(k).upper(), "adr_symbol": str(v).upper()}
+                for k, v in ADR_MAPPING.items()
+            }
+        )
+    except Exception:
+        pass
+    mapping.update(_load_adr_mapping_table())
+    mapping.update(
+        {
+            str(k).upper(): {"local_symbol": str(k).upper(), "adr_symbol": str(v).upper()}
+            for k, v in _SEC_EDGAR_ADR_OVERRIDES.items()
+        }
+    )
+    config_overrides = getattr(config, "SEC_EDGAR_ADR_MAPPING_OVERRIDES", {}) or {}
+    if isinstance(config_overrides, Mapping):
+        mapping.update(
+            {
+                str(k).upper(): {"local_symbol": str(k).upper(), "adr_symbol": str(v).upper()}
+                for k, v in config_overrides.items()
+            }
+        )
+    row = mapping.get(symbol)
+    if not row:
+        return None
+    adr = str(row.get("adr_symbol") or "").upper().strip()
+    return dict(row, local_symbol=symbol, adr_symbol=adr) if adr else None
+
+
+def _sec_adr_symbol_for_ticker(ticker: str) -> str | None:
+    row = _adr_mapping_row_for_ticker(ticker)
+    return str(row.get("adr_symbol") or "").upper() if row else None
+
+
+def _snapshot_has_qmj_minimum(snapshot: Mapping | None) -> bool:
+    if not isinstance(snapshot, Mapping):
+        return False
+    gross_profit = _finite(snapshot.get("gross_profit"))
+    total_assets = _finite(snapshot.get("total_assets"))
+    return gross_profit is not None and total_assets is not None and total_assets > 0
+
+
+def _latest_snapshot_has_qmj_minimum(ticker: str, *, as_of: str | date | datetime | None = None) -> bool:
+    store = _load_store()
+    entries = store.get("tickers", {}).get(str(ticker or "").upper().strip())
+    if not entries:
+        return False
+    cutoff = _coerce_date(as_of) or date.today()
+    candidates: list[tuple[date, str, dict]] = []
+    lag_days = int(getattr(config, "PIT_FUNDAMENTAL_LAG_DAYS", 45))
+    for rd_str, payload in entries.items():
+        try:
+            rd = date.fromisoformat(str(rd_str)[:10])
+        except ValueError:
+            continue
+        if _available_date(payload, rd, lag_days) <= cutoff:
+            candidates.append((rd, rd_str, payload))
+    best = _select_best_available_snapshot(candidates)
+    if best is None:
+        return False
+    return _snapshot_has_qmj_minimum(entries.get(best[1]))
+
+
+def _existing_snapshot_for_report_date(ticker: str, report_date: str) -> dict | None:
+    store = _load_store()
+    payload = (
+        store.get("tickers", {})
+        .get(str(ticker or "").upper().strip(), {})
+        .get(str(report_date or "")[:10])
+    )
+    return dict(payload) if isinstance(payload, Mapping) else None
+
+
+
+def _sec_fact_value(record: Mapping | None) -> float | None:
+    if not isinstance(record, Mapping):
+        return None
+    return _float(record.get("val"))
+
+
+def _sec_fact_duration_days(record: Mapping | None) -> int | None:
+    if not isinstance(record, Mapping):
+        return None
+    start = _coerce_date(record.get("start"))
+    end = _coerce_date(record.get("end"))
+    if start is None or end is None:
+        return None
+    return (end - start).days
+
+
+def _sec_fact_score(record: Mapping, *, instant: bool) -> tuple:
+    form = str(record.get("form") or "").upper()
+    fp = str(record.get("fp") or "").upper()
+    filed = str(record.get("filed") or "")
+    duration = _sec_fact_duration_days(record)
+    form_score = {
+        "20-F": 5,
+        "40-F": 5,
+        "10-K": 4,
+        "10-Q": 3,
+        "6-K": 2,
+    }.get(form, 0)
+    if instant:
+        duration_score = 0
+    elif duration is None:
+        duration_score = -1
+    elif 250 <= duration <= 460:
+        duration_score = 3
+    elif 70 <= duration <= 120:
+        duration_score = 2
+    else:
+        duration_score = 0
+    return (
+        form_score,
+        1 if fp == "FY" else 0,
+        duration_score,
+        filed,
+    )
+
+
+def _iter_sec_concept_facts(companyfacts: Mapping, field: str) -> Iterable[Mapping]:
+    facts = companyfacts.get("facts") if isinstance(companyfacts, Mapping) else None
+    if not isinstance(facts, Mapping):
+        return []
+    tags = _SEC_FIELD_TAGS.get(field, ())
+    unit_kind = "shares" if field == "shares_outstanding" else "currency"
+    records: list[Mapping] = []
+    for taxonomy in _SEC_TAXONOMIES:
+        taxonomy_facts = facts.get(taxonomy) or {}
+        if not isinstance(taxonomy_facts, Mapping):
+            continue
+        for tag in tags:
+            concept = taxonomy_facts.get(tag)
+            if not isinstance(concept, Mapping):
+                continue
+            units = concept.get("units") or {}
+            if not isinstance(units, Mapping):
+                continue
+            for unit, values in units.items():
+                unit_norm = str(unit or "").lower()
+                if unit_kind == "shares":
+                    if unit_norm != "shares":
+                        continue
+                elif unit_norm in _SEC_CURRENCY_UNITS_EXCLUDE:
+                    continue
+                if not isinstance(values, list):
+                    continue
+                for record in values:
+                    if not isinstance(record, Mapping):
+                        continue
+                    if str(record.get("form") or "").upper() not in _SEC_FORMS:
+                        continue
+                    if _sec_fact_value(record) is None:
+                        continue
+                    if not record.get("end"):
+                        continue
+                    records.append(record)
+    return records
+
+
+def _sec_best_facts_by_end(companyfacts: Mapping, field: str) -> dict[str, Mapping]:
+    instant = field in _SEC_INSTANT_FIELDS
+    best: dict[str, Mapping] = {}
+    for record in _iter_sec_concept_facts(companyfacts, field):
+        end = str(record.get("end") or "")[:10]
+        if not end:
+            continue
+        existing = best.get(end)
+        if existing is None or _sec_fact_score(record, instant=instant) > _sec_fact_score(existing, instant=instant):
+            best[end] = record
+    return best
+
+
+def _derive_gross_profit(snapshot: dict) -> None:
+    if snapshot.get("gross_profit") is not None:
+        snapshot["_gross_profit_source"] = "direct_sec_xbrl"
+        return
+    revenue = _finite(snapshot.get("revenue"))
+    cost = _finite(snapshot.get("cost_of_revenue"))
+    if revenue is None or cost is None:
+        return
+    snapshot["gross_profit"] = revenue + cost if cost < 0 else revenue - cost
+    snapshot["_gross_profit_source"] = "revenue_minus_cost_of_revenue"
+
+
+def _snapshots_from_sec_companyfacts(
+    companyfacts: Mapping,
+    *,
+    adr_symbol: str,
+    cik: int | None = None,
+    entity_name: str | None = None,
+    limit: int | None = None,
+) -> list[tuple[str, dict, str | None]]:
+    """Normalize SEC companyfacts XBRL into PIT snapshots.
+
+    Returns ``(period_end, snapshot, filed_date)`` rows.  The snapshot is
+    source-tagged by ``record_snapshot(..., source='sec_edgar')`` at write time.
+    """
+    by_date: dict[str, dict] = {}
+    filed_dates: dict[str, list[str]] = {}
+    for field in _SEC_FIELD_TAGS:
+        best = _sec_best_facts_by_end(companyfacts, field)
+        for period_date, record in best.items():
+            value = _sec_fact_value(record)
+            if value is None:
+                continue
+            row = by_date.setdefault(period_date, {})
+            row[field] = value
+            filed = str(record.get("filed") or "")[:10]
+            if filed:
+                filed_dates.setdefault(period_date, []).append(filed)
+
+    rows: list[tuple[str, dict, str | None]] = []
+    for period_date in sorted(by_date, reverse=True):
+        snapshot = dict(by_date[period_date])
+        _derive_gross_profit(snapshot)
+        snapshot.pop("cost_of_revenue", None)
+        if not snapshot:
+            continue
+        snapshot["_sec_adr_symbol"] = str(adr_symbol).upper()
+        if cik is not None:
+            snapshot["_sec_cik"] = str(int(cik))
+        if entity_name:
+            snapshot["_sec_entity_name"] = str(entity_name)
+        accepted = max(filed_dates.get(period_date) or []) if filed_dates.get(period_date) else None
+        rows.append((period_date, snapshot, accepted))
+    max_rows = int(limit or 0)
+    return rows[:max_rows] if max_rows > 0 else rows
+
+
+def backfill_via_sec_edgar(
+    tickers: Iterable[str],
+    *,
+    limit: int | None = None,
+    sleep_seconds: float = 0.1,
+) -> dict[str, int]:
+    """Backfill local non-US tickers from SEC companyfacts through ADR mapping.
+
+    Snapshots are written under the local ticker and tagged ``source='sec_edgar'``.
+    This is intentionally mapping-gated: plain US tickers continue to use FMP,
+    while local listings only use SEC when we have an explicit ADR relationship.
+    """
+    limit = int(limit or 16)
+    company_map = _sec_company_ticker_map()
+    results: dict[str, int] = {}
+    for ticker in tickers:
+        symbol = str(ticker or "").upper().strip()
+        if not symbol:
+            continue
+        adr = _sec_adr_symbol_for_ticker(symbol)
+        if not adr:
+            results[symbol] = 0
+            continue
+        listing = company_map.get(adr.upper())
+        if not listing:
+            results[symbol] = 0
+            continue
+        cik = int(listing["cik"])
+        payload = _sec_companyfacts(cik)
+        if not payload:
+            results[symbol] = 0
+            continue
+        written = 0
+        rows = _snapshots_from_sec_companyfacts(
+            payload,
+            adr_symbol=adr,
+            cik=cik,
+            entity_name=payload.get("entityName") or listing.get("name"),
+            limit=limit,
+        )
+        for period_date, snapshot, accepted_date in rows:
+            # Avoid writing SEC rows that cannot at least anchor a balance sheet.
+            if _finite(snapshot.get("total_assets")) is None:
+                continue
+            record_snapshot(
+                symbol,
+                period_date,
+                snapshot,
+                accepted_date=accepted_date,
+                source="sec_edgar",
+            )
+            written += 1
+        results[symbol] = written
+        if sleep_seconds > 0:
+            time.sleep(sleep_seconds)
+    return results
+
+
+def _yahoo_timeseries_url(ticker: str) -> str:
+    symbol = str(ticker or "").upper().strip()
+    return f"https://query2.finance.yahoo.com/ws/fundamentals-timeseries/v1/finance/timeseries/{symbol}"
+
+
+def _fetch_yahoo_timeseries(ticker: str, *, years: int = 6) -> dict | None:
+    end = int(time.time())
+    start = end - int(max(1, years) * 365.25 * 24 * 3600)
+    params = {
+        "symbol": str(ticker or "").upper().strip(),
+        "type": ",".join(_YAHOO_TIMESERIES_TYPES),
+        "period1": start,
+        "period2": end,
+        "lang": "en-US",
+        "region": "US",
+    }
+    headers = {"User-Agent": "TradingApp/1.0 fundamentals-timeseries probe"}
+    for attempt in range(2):
+        try:
+            response = requests.get(_yahoo_timeseries_url(ticker), params=params, headers=headers, timeout=15)
+            if response.status_code in {429, 500, 502, 503, 504} and attempt == 0:
+                time.sleep(0.5)
+                continue
+            if response.status_code != 200:
+                logger.debug("Yahoo timeseries %s returned status %s", ticker, response.status_code)
+                return None
+            return response.json()
+        except Exception as exc:
+            if attempt:
+                logger.debug("Yahoo timeseries failed for %s: %s", ticker, exc)
+                return None
+            time.sleep(0.5)
+    return None
+
+
+def _reported_value(entry: Mapping) -> float | None:
+    reported = entry.get("reportedValue") if isinstance(entry, Mapping) else None
+    if isinstance(reported, Mapping):
+        return _float(reported.get("raw"))
+    return None
+
+
+def _snapshots_from_yahoo_timeseries_payload(
+    payload: Mapping,
+    *,
+    limit: int | None = None,
+) -> list[tuple[str, dict]]:
+    result = ((payload.get("timeseries") or {}).get("result") or []) if isinstance(payload, Mapping) else []
+    by_date: dict[str, dict] = {}
+    type_by_field: dict[str, set[str]] = {}
+    if not isinstance(result, list):
+        return []
+    for block in result:
+        if not isinstance(block, Mapping):
+            continue
+        typelist = (block.get("meta") or {}).get("type") or []
+        if isinstance(typelist, str):
+            typelist = [typelist]
+        for yahoo_type in typelist:
+            field = _YAHOO_TIMESERIES_FIELD_MAP.get(str(yahoo_type))
+            if not field:
+                continue
+            values = block.get(str(yahoo_type)) or []
+            if not isinstance(values, list):
+                continue
+            for entry in values:
+                if not isinstance(entry, Mapping):
+                    continue
+                period_date = str(entry.get("asOfDate") or "")[:10]
+                value = _reported_value(entry)
+                if not period_date or value is None:
+                    continue
+                row = by_date.setdefault(period_date, {})
+                # Prefer trailing profitability/flow fields when available:
+                # annualized gross profit over point-in-time assets is the
+                # Novy-Marx-style GPA measure we need for QMJ.
+                field_key = f"{period_date}:{field}"
+                existing_types = type_by_field.get(field_key, set())
+                has_trailing = any(str(item).startswith("trailing") for item in existing_types)
+                if has_trailing and not str(yahoo_type).startswith("trailing"):
+                    continue
+                row[field] = value
+                type_by_field.setdefault(field_key, set()).add(str(yahoo_type))
+
+    instant_fields = {"total_assets", "cash", "total_debt"}
+    last_instants: dict[str, tuple[float, str]] = {}
+    for period_date in sorted(by_date):
+        row = by_date[period_date]
+        carried_from: set[str] = set()
+        for field in instant_fields:
+            if field not in row and field in last_instants:
+                value, source_date = last_instants[field]
+                row[field] = value
+                carried_from.add(f"{field}:{source_date}")
+        if carried_from:
+            row["_yahoo_instant_fields_carried_forward_from"] = ",".join(sorted(carried_from))
+        for field in instant_fields:
+            value = _finite(row.get(field))
+            if value is not None:
+                last_instants[field] = (value, period_date)
+
+    rows: list[tuple[str, dict]] = []
+    for period_date in sorted(by_date, reverse=True):
+        snapshot = dict(by_date[period_date])
+        if not snapshot:
+            continue
+        snapshot["_yahoo_timeseries_types"] = ",".join(
+            sorted(
+                {
+                    typ
+                    for key, types in type_by_field.items()
+                    if key.startswith(f"{period_date}:")
+                    for typ in types
+                }
+            )
+        )
+        rows.append((period_date, snapshot))
+    max_rows = int(limit or 0)
+    return rows[:max_rows] if max_rows > 0 else rows
+
+
+def backfill_via_yahoo_timeseries(
+    tickers: Iterable[str],
+    *,
+    limit: int | None = None,
+    sleep_seconds: float = 0.0,
+) -> dict[str, int]:
+    """Best-effort non-US PIT widening from Yahoo fundamentals-timeseries.
+
+    Yahoo does not provide accepted filing dates through this endpoint, so
+    snapshots intentionally rely on the PIT store's ``report_date + lag`` rule.
+    """
+    limit = int(limit or 16)
+    results: dict[str, int] = {}
+    for ticker in tickers:
+        symbol = str(ticker or "").upper().strip()
+        if not symbol:
+            continue
+        payload = _fetch_yahoo_timeseries(symbol)
+        written = 0
+        if payload:
+            for period_date, snapshot in _snapshots_from_yahoo_timeseries_payload(payload, limit=limit):
+                if not snapshot:
+                    continue
+                record_snapshot(symbol, period_date, snapshot, source="yahoo_timeseries")
+                written += 1
+        results[symbol] = written
+        if sleep_seconds > 0:
+            time.sleep(sleep_seconds)
+    return results
+
+
 def _yf_statement_value(df: pd.DataFrame | None, period, names: tuple[str, ...]) -> float | None:
     if df is None or df.empty:
         return None
@@ -219,6 +909,332 @@ def backfill_via_yfinance_quarterly(
     return results
 
 
+def _alpha_get_json(
+    function: str,
+    symbol: str,
+    *,
+    api_key: str | None = None,
+    session=None,
+) -> dict | None:
+    token = api_key if api_key is not None else str(getattr(config, "AV_TOKEN", "") or "")
+    if not token:
+        return {"_error": "missing_api_key"}
+    client = session or requests
+    try:
+        response = client.get(
+            _ALPHA_VANTAGE_QUERY_URL,
+            params={"function": function, "symbol": symbol, "apikey": token},
+            timeout=25,
+        )
+        if response.status_code != 200:
+            return {"_error": f"http_{response.status_code}", "_http_status": response.status_code}
+        payload = response.json()
+    except Exception as exc:
+        return {"_error": f"request_failed: {exc}"}
+    return payload if isinstance(payload, dict) else {"_error": "non_object_payload"}
+
+
+def _alpha_payload_status(payload: Mapping | None) -> str | None:
+    if not isinstance(payload, Mapping):
+        return "missing_payload"
+    if payload.get("_error"):
+        return str(payload.get("_error"))
+    if payload.get("Information") or payload.get("Note"):
+        return "rate_limited"
+    if payload.get("Error Message"):
+        return "symbol_error"
+    return None
+
+
+def _alpha_reports_by_date(payload: Mapping | None) -> dict[str, Mapping]:
+    if not isinstance(payload, Mapping):
+        return {}
+    rows: dict[str, Mapping] = {}
+    for section in ("quarterlyReports", "annualReports"):
+        reports = payload.get(section) or []
+        if not isinstance(reports, list):
+            continue
+        for report in reports:
+            if not isinstance(report, Mapping):
+                continue
+            period_date = str(report.get("fiscalDateEnding") or "")[:10]
+            if not period_date:
+                continue
+            enriched = dict(report)
+            enriched["_alpha_report_section"] = section
+            rows.setdefault(period_date, enriched)
+    return rows
+
+
+def _alpha_report_value(row: Mapping | None, names: tuple[str, ...]) -> float | None:
+    if not isinstance(row, Mapping):
+        return None
+    for name in names:
+        value = _float(row.get(name))
+        if value is not None:
+            return value
+    return None
+
+
+def _snapshot_from_alpha_reports(
+    income: Mapping | None,
+    balance: Mapping | None = None,
+    cashflow: Mapping | None = None,
+) -> dict:
+    snapshot: dict[str, float | str] = {}
+    for section, row in (("income", income), ("balance", balance), ("cashflow", cashflow)):
+        for field, names in _ALPHA_FIELD_MAPS[section].items():
+            value = _alpha_report_value(row, names)
+            if value is not None:
+                snapshot[field] = value
+    short_debt = _finite(snapshot.get("short_term_debt"))
+    long_debt = _finite(snapshot.get("long_term_debt"))
+    if snapshot.get("total_debt") is None and (short_debt is not None or long_debt is not None):
+        snapshot["total_debt"] = (short_debt or 0.0) + (long_debt or 0.0)
+    revenue = _finite(snapshot.get("revenue"))
+    cost = _finite(snapshot.get("cost_of_revenue"))
+    if snapshot.get("gross_profit") is None and revenue is not None and cost is not None:
+        snapshot["gross_profit"] = revenue + cost if cost < 0 else revenue - cost
+        snapshot["_gross_profit_source"] = "alpha_revenue_minus_cost_of_revenue"
+    elif snapshot.get("gross_profit") is not None:
+        snapshot["_gross_profit_source"] = "direct_alpha_vantage"
+    sections = sorted(
+        {
+            str(row.get("_alpha_report_section"))
+            for row in (income, balance, cashflow)
+            if isinstance(row, Mapping) and row.get("_alpha_report_section")
+        }
+    )
+    if sections:
+        snapshot["_alpha_vantage_report_sections"] = ",".join(sections)
+    return {k: v for k, v in snapshot.items() if v is not None}
+
+
+def _snapshots_from_alpha_vantage_payloads(
+    income_payload: Mapping | None,
+    balance_payload: Mapping | None = None,
+    cashflow_payload: Mapping | None = None,
+    *,
+    adr_symbol: str,
+    limit: int | None = None,
+) -> list[tuple[str, dict]]:
+    income_by_date = _alpha_reports_by_date(income_payload)
+    balance_by_date = _alpha_reports_by_date(balance_payload)
+    cashflow_by_date = _alpha_reports_by_date(cashflow_payload)
+    dates = sorted(
+        set(income_by_date) | set(balance_by_date) | set(cashflow_by_date),
+        reverse=True,
+    )
+    rows: list[tuple[str, dict]] = []
+    for period_date in dates:
+        snapshot = _snapshot_from_alpha_reports(
+            income_by_date.get(period_date),
+            balance_by_date.get(period_date),
+            cashflow_by_date.get(period_date),
+        )
+        if not snapshot:
+            continue
+        snapshot["_alpha_vantage_adr_symbol"] = str(adr_symbol or "").upper()
+        rows.append((period_date, snapshot))
+    max_rows = int(limit or 0)
+    return rows[:max_rows] if max_rows > 0 else rows
+
+
+def _merge_alpha_snapshot(base: Mapping | None, supplement: Mapping) -> tuple[dict, int]:
+    merged = dict(base or {})
+    additions = 0
+    for key, value in supplement.items():
+        if key.startswith("_"):
+            continue
+        if value is not None and merged.get(key) is None:
+            merged[key] = value
+            additions += 1
+    metadata = {
+        "_alpha_vantage_adr_symbol": supplement.get("_alpha_vantage_adr_symbol"),
+        "_alpha_vantage_report_sections": supplement.get("_alpha_vantage_report_sections"),
+        "_gross_profit_source": supplement.get("_gross_profit_source") or merged.get("_gross_profit_source"),
+        "_alpha_vantage_base_source": (base or {}).get("_source") if isinstance(base, Mapping) else None,
+    }
+    for key, value in metadata.items():
+        if value:
+            merged[key] = value
+    return merged, additions
+
+
+def _load_alpha_attempt_ledger(path: str | Path | None = None) -> dict:
+    target = Path(path or _ALPHA_ATTEMPT_LEDGER_PATH)
+    if not target.exists():
+        return {"version": 1, "daily_calls": {}, "tickers": {}}
+    try:
+        data = json.loads(target.read_text(encoding="utf-8"))
+    except Exception:
+        return {"version": 1, "daily_calls": {}, "tickers": {}}
+    if not isinstance(data, dict):
+        return {"version": 1, "daily_calls": {}, "tickers": {}}
+    data.setdefault("version", 1)
+    data.setdefault("daily_calls", {})
+    data.setdefault("tickers", {})
+    return data
+
+
+def _write_alpha_attempt_ledger(ledger: Mapping, path: str | Path | None = None) -> None:
+    target = Path(path or _ALPHA_ATTEMPT_LEDGER_PATH)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(target, dict(ledger), indent=2)
+
+
+def _alpha_cooldown_active(record: Mapping | None, now: datetime) -> bool:
+    if not isinstance(record, Mapping):
+        return False
+    cooldown_until = _coerce_date(record.get("cooldown_until"))
+    return bool(cooldown_until and cooldown_until > now.date())
+
+
+def _alpha_cooldown_days(status: str) -> int:
+    if status in {"rate_limited", "missing_api_key"}:
+        return 1
+    if status.startswith("http_") or status in {"symbol_error", "no_income_reports", "no_usable_reports"}:
+        return 30
+    return 7
+
+
+def backfill_via_alpha_vantage_adr(
+    tickers: Iterable[str],
+    *,
+    limit: int | None = None,
+    sleep_seconds: float | None = None,
+    daily_call_budget: int | None = None,
+    attempt_ledger_path: str | Path | None = None,
+    api_key: str | None = None,
+    session=None,
+    fetch_cashflow: bool | None = None,
+) -> dict[str, int]:
+    """Last-resort ADR supplement for residual non-US QMJ concept gaps.
+
+    Alpha Vantage is intentionally not a broad non-US provider here.  The free
+    tier is too small for that.  This path only runs for explicit local->ADR
+    mappings, only when the current PIT record still lacks the QMJ minimum, and
+    it records every attempt in a daily-call ledger.
+    """
+    limit = int(limit or 16)
+    budget = int(
+        daily_call_budget
+        if daily_call_budget is not None
+        else getattr(config, "ALPHA_VANTAGE_ADR_DAILY_CALL_BUDGET", 12)
+    )
+    sleep = (
+        float(sleep_seconds)
+        if sleep_seconds is not None
+        else float(getattr(config, "ALPHA_VANTAGE_ADR_SLEEP_SECONDS", 13.0))
+    )
+    should_fetch_cashflow = (
+        bool(fetch_cashflow)
+        if fetch_cashflow is not None
+        else bool(getattr(config, "ALPHA_VANTAGE_ADR_FETCH_CASHFLOW", True))
+    )
+    ledger = _load_alpha_attempt_ledger(attempt_ledger_path)
+    calls_by_day = ledger.setdefault("daily_calls", {})
+    records = ledger.setdefault("tickers", {})
+    today_key = date.today().isoformat()
+    calls_used = int(calls_by_day.get(today_key, 0) or 0)
+    now = datetime.now()
+    results: dict[str, int] = {}
+
+    for ticker in tickers:
+        symbol = str(ticker or "").upper().strip()
+        if not symbol:
+            continue
+        results.setdefault(symbol, 0)
+        mapping = _adr_mapping_row_for_ticker(symbol)
+        if not mapping:
+            continue
+        adr_symbol = str(mapping.get("adr_symbol") or "").upper().strip()
+        if not adr_symbol or _latest_snapshot_has_qmj_minimum(symbol):
+            continue
+        record = records.get(symbol, {}) if isinstance(records.get(symbol), Mapping) else {}
+        if _alpha_cooldown_active(record, now):
+            continue
+        if calls_used >= budget:
+            break
+
+        payloads: dict[str, Mapping | None] = {}
+        status: str | None = None
+        calls_for_ticker = 0
+        for function, key in (
+            ("INCOME_STATEMENT", "income"),
+            ("BALANCE_SHEET", "balance"),
+            ("CASH_FLOW", "cashflow"),
+        ):
+            if key == "cashflow" and not should_fetch_cashflow:
+                continue
+            if calls_used >= budget:
+                status = "budget_exhausted"
+                break
+            payload = _alpha_get_json(function, adr_symbol, api_key=api_key, session=session)
+            calls_used += 1
+            calls_for_ticker += 1
+            payloads[key] = payload
+            status = _alpha_payload_status(payload)
+            if status:
+                break
+            if key == "income" and not _alpha_reports_by_date(payload):
+                status = "no_income_reports"
+                break
+            if sleep > 0 and calls_used < budget:
+                time.sleep(sleep)
+
+        written = 0
+        if not status or status == "budget_exhausted":
+            rows = _snapshots_from_alpha_vantage_payloads(
+                payloads.get("income"),
+                payloads.get("balance"),
+                payloads.get("cashflow"),
+                adr_symbol=adr_symbol,
+                limit=limit,
+            )
+            for period_date, supplement in rows:
+                base = _existing_snapshot_for_report_date(symbol, period_date)
+                merged, additions = _merge_alpha_snapshot(base, supplement)
+                merged["_alpha_vantage_local_symbol"] = symbol
+                merged["_alpha_vantage_supplemented_fields"] = additions
+                if not base and not _snapshot_has_qmj_minimum(merged):
+                    continue
+                if base and additions <= 0 and not _snapshot_has_qmj_minimum(merged):
+                    continue
+                record_snapshot(
+                    symbol,
+                    period_date,
+                    merged,
+                    accepted_date=(base or {}).get("_accepted_date") if isinstance(base, Mapping) else None,
+                    source="alpha_vantage_adr",
+                )
+                written += 1
+            if written <= 0:
+                status = "no_usable_reports"
+            else:
+                status = "written"
+
+        results[symbol] = written
+        cooldown_until = (now.date() + timedelta(days=_alpha_cooldown_days(status))).isoformat()
+        records[symbol] = {
+            **dict(record),
+            "ticker": symbol,
+            "adr_symbol": adr_symbol,
+            "last_attempted_at": now.isoformat(timespec="seconds"),
+            "last_status": status,
+            "last_snapshots_written": written,
+            "last_calls_used": calls_for_ticker,
+            "cooldown_until": cooldown_until,
+        }
+        calls_by_day[today_key] = calls_used
+        if status == "rate_limited":
+            break
+
+    calls_by_day[today_key] = calls_used
+    _write_alpha_attempt_ledger(ledger, attempt_ledger_path)
+    return results
+
+
 def backfill_tickers(tickers: Iterable[str], *, limit: int | None = None, sleep_seconds: float = 0.0) -> dict[str, int]:
     results: dict[str, int] = {}
     for ticker in tickers:
@@ -243,14 +1259,23 @@ def refresh_queue_tickers(
     max_tickers: int | None = None,
     limit: int | None = None,
     sleep_seconds: float = 0.0,
+    sec_edgar_fallback: bool = True,
+    yahoo_timeseries_fallback: bool = True,
     yfinance_fallback: bool = True,
+    alpha_vantage_adr_fallback: bool | None = None,
+    alpha_vantage_adr_daily_call_budget: int | None = None,
     fmp_only: bool = False,
     write_results: bool = True,
 ) -> dict:
     """Backfill PIT fundamentals for tickers in the finalist refresh queue.
 
-    FMP is tried for plain US-style tickers. yfinance quarterly statements are
-    used for non-US tickers and as a fallback when FMP writes no snapshots.
+    Provider order is intentionally conservative:
+
+    * FMP for plain US-style tickers.
+    * SEC EDGAR for explicit local->ADR mappings.
+    * Yahoo fundamentals-timeseries for broad non-US coverage.
+    * yfinance quarterly statements as the final best-effort fallback.
+    * Alpha Vantage ADR supplement only for mapped residual QMJ gaps.
     """
     path = Path(queue_path or getattr(config, "DISCOVERY_FUNDAMENTAL_REFRESH_QUEUE_PATH", "feature_cache/fundamental_refresh_queue.json"))
     if not path.exists():
@@ -278,8 +1303,16 @@ def refresh_queue_tickers(
     tickers = [str(row.get("ticker")).upper().strip() for row in selected_rows if row.get("ticker")]
 
     fmp_results: dict[str, int] = {}
+    sec_edgar_results: dict[str, int] = {}
+    yahoo_timeseries_results: dict[str, int] = {}
     yf_results: dict[str, int] = {}
+    alpha_vantage_adr_results: dict[str, int] = {}
     fallback_tickers: list[str] = []
+    alpha_enabled = (
+        bool(getattr(config, "ALPHA_VANTAGE_ADR_FALLBACK_ENABLED", False))
+        if alpha_vantage_adr_fallback is None
+        else bool(alpha_vantage_adr_fallback)
+    )
     for ticker in tickers:
         written = 0
         if _is_fmp_statement_candidate(ticker):
@@ -289,6 +1322,35 @@ def refresh_queue_tickers(
                 logger.warning("Refresh queue FMP backfill failed for %s: %s", ticker, exc)
                 written = 0
             fmp_results[ticker] = written
+
+        if (
+            not fmp_only
+            and sec_edgar_fallback
+            and written <= 0
+            and _sec_adr_symbol_for_ticker(ticker)
+        ):
+            try:
+                sec_written = backfill_via_sec_edgar([ticker], limit=limit or 16, sleep_seconds=0.0).get(ticker, 0)
+            except Exception as exc:
+                logger.warning("Refresh queue SEC EDGAR backfill failed for %s: %s", ticker, exc)
+                sec_written = 0
+            sec_edgar_results[ticker] = sec_written
+            written += sec_written
+
+        if (
+            not fmp_only
+            and yahoo_timeseries_fallback
+            and written <= 0
+            and "." in ticker
+        ):
+            try:
+                yahoo_written = backfill_via_yahoo_timeseries([ticker], limit=limit or 16, sleep_seconds=0.0).get(ticker, 0)
+            except Exception as exc:
+                logger.warning("Refresh queue Yahoo timeseries backfill failed for %s: %s", ticker, exc)
+                yahoo_written = 0
+            yahoo_timeseries_results[ticker] = yahoo_written
+            written += yahoo_written
+
         if yfinance_fallback and written <= 0:
             fallback_tickers.append(ticker)
         if sleep_seconds > 0:
@@ -301,20 +1363,51 @@ def refresh_queue_tickers(
             sleep_seconds=sleep_seconds,
         )
 
+    if alpha_enabled and not fmp_only:
+        alpha_candidates = [
+            ticker for ticker in tickers
+            if _adr_mapping_row_for_ticker(ticker) and not _latest_snapshot_has_qmj_minimum(ticker)
+        ]
+        if alpha_candidates:
+            alpha_vantage_adr_results = backfill_via_alpha_vantage_adr(
+                alpha_candidates,
+                limit=limit or 16,
+                daily_call_budget=alpha_vantage_adr_daily_call_budget,
+            )
+
     refreshed = {
-        ticker: (fmp_results.get(ticker, 0) or 0) + (yf_results.get(ticker, 0) or 0)
+        ticker: (
+            (fmp_results.get(ticker, 0) or 0)
+            + (sec_edgar_results.get(ticker, 0) or 0)
+            + (yahoo_timeseries_results.get(ticker, 0) or 0)
+            + (yf_results.get(ticker, 0) or 0)
+            + (alpha_vantage_adr_results.get(ticker, 0) or 0)
+        )
         for ticker in tickers
     }
     payload = {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "queue_path": str(path),
         "fmp_only": bool(fmp_only),
+        "sec_edgar_fallback": bool(sec_edgar_fallback and not fmp_only),
+        "yahoo_timeseries_fallback": bool(yahoo_timeseries_fallback and not fmp_only),
         "yfinance_fallback": bool(yfinance_fallback),
+        "alpha_vantage_adr_fallback": bool(alpha_enabled and not fmp_only),
+        "provider_order": [
+            "fmp",
+            "sec_edgar",
+            "yahoo_timeseries",
+            "yfinance_quarterly",
+            "alpha_vantage_adr",
+        ],
         "selected": len(tickers),
         "refreshed": sum(1 for value in refreshed.values() if value > 0),
         "snapshots_written": sum(refreshed.values()),
         "fmp_results": fmp_results,
+        "sec_edgar_results": sec_edgar_results,
+        "yahoo_timeseries_results": yahoo_timeseries_results,
         "yfinance_results": yf_results,
+        "alpha_vantage_adr_results": alpha_vantage_adr_results,
         "refreshed_snapshots": refreshed,
         "unrefreshed": [ticker for ticker, value in refreshed.items() if value <= 0],
     }
@@ -372,14 +1465,15 @@ def _latest_as_of_cached(ticker: str, as_of: str, *, lag_days: int) -> tuple[dic
     if not entries:
         return None, None
     cutoff = _coerce_date(as_of) or date.today()
-    best: tuple[date, str] | None = None
+    candidates: list[tuple[date, str, dict]] = []
     for rd_str, payload in entries.items():
         try:
             rd = date.fromisoformat(str(rd_str)[:10])
         except ValueError:
             continue
-        if _available_date(payload, rd, lag_days) <= cutoff and (best is None or rd > best[0]):
-            best = (rd, rd_str)
+        if _available_date(payload, rd, lag_days) <= cutoff:
+            candidates.append((rd, rd_str, payload))
+    best = _select_best_available_snapshot(candidates)
     if best is None:
         return None, None
     return dict(entries[best[1]]), best[1]
@@ -856,11 +1950,18 @@ def _main() -> None:
     parser.add_argument("--from-signal-db", action="store_true", help="Use distinct tickers in signal_backtest")
     parser.add_argument("--max-tickers", type=int, default=None)
     parser.add_argument("--yfinance-quarterly", action="store_true", help="Use yfinance quarterly statements and tag snapshots as yfinance_quarterly")
+    parser.add_argument("--sec-edgar", action="store_true", help="Use SEC EDGAR companyfacts via local->ADR mapping")
+    parser.add_argument("--yahoo-timeseries", action="store_true", help="Use Yahoo fundamentals-timeseries and tag snapshots as yahoo_timeseries")
+    parser.add_argument("--alpha-vantage-adr", action="store_true", help="Use quota-budgeted Alpha Vantage ADR supplement")
     parser.add_argument("--backfill-factor-snapshot", action="store_true", help="Backfill PIT-safe factor snapshots into signal_backtest")
     parser.add_argument("--backfill-replay-sleeves", action="store_true", help="Backfill sleeve scalar columns from signal-time factor rows")
     parser.add_argument("--refresh-queue", action="store_true", help="Backfill PIT fundamentals for feature_cache/fundamental_refresh_queue.json")
     parser.add_argument("--queue-path", default=None, help="Override fundamental refresh queue path")
+    parser.add_argument("--no-sec-edgar-fallback", action="store_true", help="Disable SEC EDGAR ADR fallback for refresh queue")
+    parser.add_argument("--no-yahoo-timeseries-fallback", action="store_true", help="Disable Yahoo fundamentals-timeseries fallback for refresh queue")
     parser.add_argument("--no-yfinance-fallback", action="store_true", help="Disable yfinance quarterly fallback for refresh queue")
+    parser.add_argument("--alpha-vantage-adr-fallback", action="store_true", help="Enable Alpha Vantage ADR supplement in refresh queue")
+    parser.add_argument("--alpha-vantage-budget", type=int, default=None, help="Max Alpha Vantage calls to spend today")
     parser.add_argument("--source-like", default="replay%", help="SQL LIKE pattern for sleeve backfill source rows")
     parser.add_argument("--min-date", default=None)
     parser.add_argument("--max-date", default=None)
@@ -903,7 +2004,11 @@ def _main() -> None:
             max_tickers=args.max_tickers,
             limit=args.limit,
             sleep_seconds=args.sleep,
+            sec_edgar_fallback=not args.no_sec_edgar_fallback,
+            yahoo_timeseries_fallback=not args.no_yahoo_timeseries_fallback,
             yfinance_fallback=not args.no_yfinance_fallback,
+            alpha_vantage_adr_fallback=args.alpha_vantage_adr_fallback,
+            alpha_vantage_adr_daily_call_budget=args.alpha_vantage_budget,
             fmp_only=args.no_yfinance_fallback,
             write_results=True,
         )
@@ -919,6 +2024,17 @@ def _main() -> None:
 
     if args.yfinance_quarterly:
         results = backfill_via_yfinance_quarterly(tickers, limit=args.limit, sleep_seconds=args.sleep)
+    elif args.sec_edgar:
+        results = backfill_via_sec_edgar(tickers, limit=args.limit, sleep_seconds=args.sleep)
+    elif args.yahoo_timeseries:
+        results = backfill_via_yahoo_timeseries(tickers, limit=args.limit, sleep_seconds=args.sleep)
+    elif args.alpha_vantage_adr:
+        results = backfill_via_alpha_vantage_adr(
+            tickers,
+            limit=args.limit,
+            sleep_seconds=args.sleep if args.sleep > 0 else None,
+            daily_call_budget=args.alpha_vantage_budget,
+        )
     else:
         results = backfill_tickers(tickers, limit=args.limit, sleep_seconds=args.sleep)
     total = sum(results.values())

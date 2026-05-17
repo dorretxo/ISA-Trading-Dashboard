@@ -15,7 +15,9 @@ from typing import Any
 from engine.fscore_utils import is_f_score_actionable
 
 
-YFINANCE_PIT_SOURCES = {"yfinance_info", "yfinance_quarterly", "yfinance"}
+YFINANCE_PIT_SOURCES = {"yfinance_info", "yfinance_quarterly", "yfinance", "yahoo_timeseries"}
+SEC_EDGAR_PIT_SOURCES = {"sec_edgar"}
+ALPHA_VANTAGE_ADR_PIT_SOURCES = {"alpha_vantage_adr"}
 QMJ_LITE_FULL_EVIDENCE_COMPONENTS = 2
 
 
@@ -92,6 +94,10 @@ def classify_evidence(
 
     if fmp_like:
         return "fmp_full" if components >= QMJ_LITE_FULL_EVIDENCE_COMPONENTS else "fmp_partial"
+    if source in SEC_EDGAR_PIT_SOURCES:
+        return "sec_edgar_full" if components >= QMJ_LITE_FULL_EVIDENCE_COMPONENTS else "sec_edgar_partial"
+    if source in ALPHA_VANTAGE_ADR_PIT_SOURCES:
+        return "alpha_vantage_adr_full" if components >= QMJ_LITE_FULL_EVIDENCE_COMPONENTS else "alpha_vantage_adr_partial"
     if yf_like:
         if components <= 1:
             return "yfinance_balance_only"

@@ -587,7 +587,10 @@ def _record_fundamental_attempts(
     }
     results = {}
     results.update(refresh_payload.get("fmp_results") or {})
+    results.update(refresh_payload.get("sec_edgar_results") or {})
+    results.update(refresh_payload.get("yahoo_timeseries_results") or {})
     results.update(refresh_payload.get("yfinance_results") or {})
+    results.update(refresh_payload.get("alpha_vantage_adr_results") or {})
     attempted: list[str] = []
     for ticker, written in results.items():
         symbol = str(ticker or "").upper().strip()

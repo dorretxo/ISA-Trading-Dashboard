@@ -50,6 +50,9 @@ logger = logging.getLogger(__name__)
 _DEFAULT_PATH = Path("feature_cache") / "pit_fundamentals.json"
 _SCHEMA_VERSION = 1
 _DEFAULT_REPORT_LAG_DAYS = 45  # SEC 10-Q filing deadline for accelerated filers
+_RICH_STATEMENT_SOURCES = {"fmp", "sec_edgar", "yahoo_timeseries", "yfinance_quarterly", "alpha_vantage_adr"}
+_LIVE_CAPTURE_SOURCES = {"yfinance_info"}
+_RICH_SNAPSHOT_MAX_STALENESS_DAYS = 550
 
 
 def _load_store(path: Path = _DEFAULT_PATH) -> dict:
@@ -132,7 +135,7 @@ def latest_as_of(
 
     cutoff = _coerce_date(as_of) or date.today()
 
-    best: tuple[date, str] | None = None
+    candidates: list[tuple[date, str, dict]] = []
     for rd_str, payload in t.items():
         try:
             rd = date.fromisoformat(rd_str)
@@ -140,11 +143,59 @@ def latest_as_of(
             continue
         available_date = _available_date(payload, rd, lag_days)
         if available_date <= cutoff:
-            if best is None or rd > best[0]:
-                best = (rd, rd_str)
+            candidates.append((rd, rd_str, payload))
+    best = _select_best_available_snapshot(candidates)
     if best is None:
         return None, None
     return dict(t[best[1]]), best[1]
+
+
+def _snapshot_evidence_score(payload: Mapping | None) -> int:
+    if not isinstance(payload, Mapping):
+        return 0
+    source = str(payload.get("_source") or "").lower()
+    score = 0
+    if payload.get("total_assets") is not None:
+        score += 1
+    if payload.get("gross_profit") is not None and payload.get("total_assets") is not None:
+        score += 4
+    if payload.get("net_income") is not None or payload.get("operating_cashflow") is not None:
+        score += 1
+    if payload.get("revenue") is not None:
+        score += 1
+    if payload.get("current_assets") is not None or payload.get("current_liabilities") is not None:
+        score += 1
+    if source in _RICH_STATEMENT_SOURCES and score > 0:
+        score += 1
+    if source in _LIVE_CAPTURE_SOURCES and payload.get("gross_profit") is None:
+        score -= 1
+    return score
+
+
+def _select_best_available_snapshot(
+    candidates: list[tuple[date, str, Mapping]],
+    *,
+    max_staleness_days: int = _RICH_SNAPSHOT_MAX_STALENESS_DAYS,
+) -> tuple[date, str] | None:
+    """Select the PIT snapshot with enough evidence to be useful.
+
+    Live yfinance captures are dated at the capture date, not the fiscal report
+    period.  Once better statement-level sources are available, a balance-only
+    live capture should not suppress a recent SEC/FMP/Yahoo statement snapshot.
+    The staleness guard keeps very old rich statements from dominating forever.
+    """
+    if not candidates:
+        return None
+    latest = max(candidates, key=lambda item: item[0])
+    latest_score = _snapshot_evidence_score(latest[2])
+    best_rich = max(
+        candidates,
+        key=lambda item: (_snapshot_evidence_score(item[2]), item[0]),
+    )
+    best_score = _snapshot_evidence_score(best_rich[2])
+    if best_score >= latest_score + 2 and (latest[0] - best_rich[0]).days <= max_staleness_days:
+        return best_rich[0], best_rich[1]
+    return latest[0], latest[1]
 
 
 def prior_snapshot(
