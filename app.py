@@ -3288,61 +3288,64 @@ with tab_analytics:
                 ticker_select_w = st.selectbox("Choose holding:", list(weight_data.keys()), key="weight_ticker")
 
                 if ticker_select_w:
-                    w_series = weight_df[ticker_select_w].dropna().sort_values(ascending=False)
+                    w_series = pd.to_numeric(weight_df[ticker_select_w], errors="coerce").dropna().sort_values(ascending=False)
 
-                    # Bar chart
-                    weights_plot_df = pd.DataFrame({
-                        "Model": w_series.index,
-                        "Influence": w_series.values,
-                    })
-                    fig_w = px.bar(
-                        weights_plot_df,
-                        x="Model", y="Influence",
-                        color="Influence",
-                        color_continuous_scale=[[0, "#6b7280"], [1, "#3b82f6"]],
-                    )
-                    fig_w.update_layout(
-                        **_PLOTLY_LAYOUT, height=300,
-                        xaxis_title="", yaxis_title="Influence %",
-                        coloraxis_showscale=False,
-                        title=dict(text=f"Model influence - {ticker_select_w}", font=dict(size=14)),
-                    )
-                    st.plotly_chart(
-                        fig_w,
-                        width="stretch",
-                        config={"displayModeBar": False},
-                        key="forecast_weight_bar_chart",
-                    )
+                    if w_series.empty:
+                        st.info("No model weights available for the selected holding.")
+                    else:
+                        # Bar chart
+                        weights_plot_df = pd.DataFrame({
+                            "Model": w_series.index,
+                            "Influence": w_series.values,
+                        })
+                        fig_w = px.bar(
+                            weights_plot_df,
+                            x="Model", y="Influence",
+                            color="Influence",
+                            color_continuous_scale=[[0, "#6b7280"], [1, "#3b82f6"]],
+                        )
+                        fig_w.update_layout(
+                            **_PLOTLY_LAYOUT, height=300,
+                            xaxis_title="", yaxis_title="Influence %",
+                            coloraxis_showscale=False,
+                            title=dict(text=f"Model influence - {ticker_select_w}", font=dict(size=14)),
+                        )
+                        st.plotly_chart(
+                            fig_w,
+                            width="stretch",
+                            config={"displayModeBar": False},
+                            key="forecast_weight_bar_chart",
+                        )
 
-                    # Radar chart
-                    radar_experts = list(w_series.index)
-                    radar_weights = list(w_series.values)
-                    radar_weights.append(radar_weights[0])
-                    radar_experts_closed = radar_experts + [radar_experts[0]]
+                        # Radar chart
+                        radar_experts = list(w_series.index)
+                        radar_weights = list(w_series.values)
+                        radar_weights.append(radar_weights[0])
+                        radar_experts_closed = radar_experts + [radar_experts[0]]
 
-                    fig_radar_w = go.Figure(go.Scatterpolar(
-                        r=radar_weights,
-                        theta=radar_experts_closed,
-                        fill="toself",
-                        fillcolor="rgba(59,130,246,0.15)",
-                        line=dict(color="#3b82f6", width=2),
-                    ))
-                    fig_radar_w.update_layout(
-                        **_PLOTLY_LAYOUT, height=300,
-                        polar=dict(
-                            radialaxis=dict(visible=True, gridcolor="rgba(128,128,128,0.2)"),
-                            angularaxis=dict(gridcolor="rgba(128,128,128,0.2)"),
-                            bgcolor="rgba(0,0,0,0)",
-                        ),
-                        showlegend=False,
-                        title=dict(text=f"Influence profile - {ticker_select_w}", font=dict(size=14)),
-                    )
-                    st.plotly_chart(
-                        fig_radar_w,
-                        width="stretch",
-                        config={"displayModeBar": False},
-                        key="forecast_weight_radar_chart",
-                    )
+                        fig_radar_w = go.Figure(go.Scatterpolar(
+                            r=radar_weights,
+                            theta=radar_experts_closed,
+                            fill="toself",
+                            fillcolor="rgba(59,130,246,0.15)",
+                            line=dict(color="#3b82f6", width=2),
+                        ))
+                        fig_radar_w.update_layout(
+                            **_PLOTLY_LAYOUT, height=300,
+                            polar=dict(
+                                radialaxis=dict(visible=True, gridcolor="rgba(128,128,128,0.2)"),
+                                angularaxis=dict(gridcolor="rgba(128,128,128,0.2)"),
+                                bgcolor="rgba(0,0,0,0)",
+                            ),
+                            showlegend=False,
+                            title=dict(text=f"Influence profile - {ticker_select_w}", font=dict(size=14)),
+                        )
+                        st.plotly_chart(
+                            fig_radar_w,
+                            width="stretch",
+                            config={"displayModeBar": False},
+                            key="forecast_weight_radar_chart",
+                        )
 
                 with st.expander("Full model mix table (%)"):
                     st.dataframe(weight_df, width="stretch")
