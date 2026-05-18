@@ -3374,58 +3374,64 @@ with tab_analytics:
                     impact_data[ticker_short] = col
 
             if impact_data:
-                impact_df = pd.DataFrame(impact_data)
+                impact_df = pd.DataFrame(impact_data).apply(pd.to_numeric, errors="coerce")
 
                 ticker_select_i = st.selectbox("Choose holding:", list(impact_data.keys()), key="impact_ticker")
 
                 if ticker_select_i:
                     impact_series = impact_df[ticker_select_i].dropna().sort_values()
 
-                    # Diverging bar chart
-                    colors = ["#10b981" if v < 0 else "#ef4444" for v in impact_series.values]
-                    fig_impact = go.Figure(go.Bar(
-                        x=impact_series.values,
-                        y=impact_series.index,
-                        orientation="h",
-                        marker=dict(color=colors),
-                        hovertemplate="%{y}: %{x:+.2f} vs ensemble<extra></extra>",
-                    ))
-                    fig_impact.add_vline(x=0, line_dash="dash", line_color="rgba(128,128,128,0.5)")
-                    fig_impact.update_layout(
-                        **_PLOTLY_LAYOUT, height=300,
-                        xaxis_title="Average miss vs blended forecast",
-                        title=dict(text=f"What helped - {ticker_select_i}", font=dict(size=14)),
-                    )
-                    st.plotly_chart(
-                        fig_impact,
-                        width="stretch",
-                        config={"displayModeBar": False},
-                        key="forecast_signal_impact_chart",
-                    )
+                    if impact_series.empty:
+                        st.info("No model-impact history available for the selected holding.")
+                    else:
+                        # Diverging bar chart
+                        colors = ["#10b981" if v < 0 else "#ef4444" for v in impact_series.values]
+                        fig_impact = go.Figure(go.Bar(
+                            x=impact_series.values,
+                            y=impact_series.index,
+                            orientation="h",
+                            marker=dict(color=colors),
+                            hovertemplate="%{y}: %{x:+.2f} vs ensemble<extra></extra>",
+                        ))
+                        fig_impact.add_vline(x=0, line_dash="dash", line_color="rgba(128,128,128,0.5)")
+                        fig_impact.update_layout(
+                            **_PLOTLY_LAYOUT, height=300,
+                            xaxis_title="Average miss vs blended forecast",
+                            title=dict(text=f"What helped - {ticker_select_i}", font=dict(size=14)),
+                        )
+                        st.plotly_chart(
+                            fig_impact,
+                            width="stretch",
+                            config={"displayModeBar": False},
+                            key="forecast_signal_impact_chart",
+                        )
 
-                    best_expert = impact_series.idxmin()
-                    worst_expert = impact_series.idxmax()
-                    bcol, wcol = st.columns(2)
-                    bcol.metric("Most helpful", best_expert, f"{impact_series[best_expert]:+.2f} vs blend")
-                    wcol.metric("Least helpful", worst_expert, f"{impact_series[worst_expert]:+.2f} vs blend", delta_color="inverse")
+                        best_expert = impact_series.idxmin()
+                        worst_expert = impact_series.idxmax()
+                        bcol, wcol = st.columns(2)
+                        bcol.metric("Most helpful", best_expert, f"{impact_series[best_expert]:+.2f} vs blend")
+                        wcol.metric("Least helpful", worst_expert, f"{impact_series[worst_expert]:+.2f} vs blend", delta_color="inverse")
 
                 with st.expander("Full model-impact table"):
                     st.dataframe(impact_df, width="stretch")
 
                 st.markdown("---")
                 st.markdown("**Model ranking across the portfolio**")
-                avg_impact = impact_df.mean(axis=1).sort_values()
-                summary_df = pd.DataFrame({
-                    "Model": avg_impact.index,
-                    "Avg miss vs blend": [f"{v:+.2f}" for v in avg_impact.values],
-                    "Verdict": [
-                        "Helps" if v < -0.5
-                        else "Neutral" if abs(v) <= 0.5
-                        else "Hurts"
-                        for v in avg_impact.values
-                    ],
-                })
-                st.dataframe(summary_df, hide_index=True, width="stretch")
+                avg_impact = impact_df.mean(axis=1).dropna().sort_values()
+                if avg_impact.empty:
+                    st.info("No portfolio-wide model-impact history available yet.")
+                else:
+                    summary_df = pd.DataFrame({
+                        "Model": avg_impact.index,
+                        "Avg miss vs blend": [f"{v:+.2f}" for v in avg_impact.values],
+                        "Verdict": [
+                            "Helps" if v < -0.5
+                            else "Neutral" if abs(v) <= 0.5
+                            else "Hurts"
+                            for v in avg_impact.values
+                        ],
+                    })
+                    st.dataframe(summary_df, hide_index=True, width="stretch")
 
         # ── Tab 4: Weight Optimization ──
         with tab_backtest:
