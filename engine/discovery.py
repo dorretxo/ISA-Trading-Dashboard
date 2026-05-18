@@ -5041,24 +5041,55 @@ def _stage_full_scoring(
     def _fallback_scored_item(item: dict, reason: str) -> dict:
         return _attach_score_metadata(item, _build_partial_score_result(item, reason))
 
+    def _analyse_holding_with_deadline(item: dict, timeout: int) -> dict:
+        """Run deep scoring behind a real wall-clock deadline."""
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        future = pool.submit(analyse_holding, item["holding"])
+        try:
+            result = future.result(timeout=timeout)
+        except concurrent.futures.TimeoutError:
+            future.cancel()
+            pool.shutdown(wait=False, cancel_futures=True)
+            raise
+        except Exception:
+            pool.shutdown(wait=False, cancel_futures=True)
+            raise
+        pool.shutdown(wait=False, cancel_futures=True)
+        return result
+
     def _score_one(item: dict) -> dict | None:
         """Score a single candidate with timeout. Returns result or None."""
         symbol = item["holding"]["ticker"]
         _t0 = time.time()
 
         try:
-            result = analyse_holding(item["holding"])
+            result = _analyse_holding_with_deadline(item, _per_ticker_timeout)
             if not isinstance(result, dict):
                 raise TypeError(f"analyse_holding returned {type(result).__name__}")
             _dur = time.time() - _t0
             if _dur > 60:
                 logger.warning("Slow scoring: %s took %.1fs", symbol, _dur)
+                result["_stage6_slow_seconds"] = round(_dur, 1)
             return _attach_score_metadata(item, result)
+        except concurrent.futures.TimeoutError:
+            _dur = time.time() - _t0
+            logger.warning(
+                "Hard timeout scoring %s after %.1fs (limit %ds) - using partial fallback",
+                symbol,
+                _dur,
+                _per_ticker_timeout,
+            )
+            fallback = _fallback_scored_item(item, f"Timeout after {_per_ticker_timeout}s")
+            fallback["_stage6_timeout"] = True
+            fallback["_stage6_slow_seconds"] = round(_dur, 1)
+            return fallback
         except Exception as e:
             _dur = time.time() - _t0
             logger.warning("Failed to score %s after %.1fs: %s: %s",
                            symbol, _dur, type(e).__name__, e)
-            return _fallback_scored_item(item, str(e))
+            fallback = _fallback_scored_item(item, str(e))
+            fallback["_stage6_error"] = True
+            return fallback
 
     logger.info("Stage 6: scoring %d candidates with %d workers (checkpoint every %d, timeout %ds/ticker)",
                 len(work_items), _SCORING_WORKERS, _CHECKPOINT_INTERVAL, _per_ticker_timeout)
@@ -5080,6 +5111,13 @@ def _stage_full_scoring(
                 result = future.result(timeout=_per_ticker_timeout)
                 if result is not None:
                     results.append(result)
+                    if result.get("_stage6_timeout"):
+                        _timeout_count += 1
+                        _slow_tickers.append(symbol)
+                    elif result.get("_stage6_error"):
+                        _error_count += 1
+                    elif result.get("_stage6_slow_seconds") is not None:
+                        _slow_tickers.append(symbol)
 
                     if progress_callback:
                         progress_callback(

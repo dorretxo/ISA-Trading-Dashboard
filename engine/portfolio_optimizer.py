@@ -361,7 +361,7 @@ def _estimate_expected_returns_v2(
     nan_mask = np.isnan(mu)
     if nan_mask.any():
         logger.warning(
-            "v2 μ: NaN for %s — replacing with 0",
+            "v2 mu: NaN for %s - replacing with 0",
             [tickers[i] for i in np.where(nan_mask)[0]],
         )
         mu = np.nan_to_num(mu, nan=0.0)
@@ -1816,7 +1816,7 @@ def optimize_portfolio(
     try:
         mu = _james_stein_shrink(mu, alpha_max=OPTIMIZER_MU_SHRINKAGE_MAX, cov=cov)
     except Exception as _js_e:
-        logger.debug("μ_mvp-shrinkage failed (%s) — keeping grand-mean target", _js_e)
+        logger.debug("mu_mvp shrinkage failed (%s) - keeping grand-mean target", _js_e)
 
     # Bounds / sector groups / per-ticker cost
     bounds = _build_bounds(tickers, results)

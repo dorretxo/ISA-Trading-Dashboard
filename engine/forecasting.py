@@ -48,6 +48,34 @@ _forecast_cache = PersistentAnalysisCache("forecast")
 _FORECAST_PERSISTENT_TTL = getattr(config, "FORECAST_PERSISTENT_CACHE_TTL", 21600)
 
 
+def _clean_price_history(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
+    """Return price history with a finite, positive Close column."""
+    if df is None or df.empty or "Close" not in df:
+        return pd.DataFrame()
+
+    cleaned = df.copy()
+    close_col = cleaned["Close"]
+    if isinstance(close_col, pd.DataFrame):
+        close_col = close_col.iloc[:, 0]
+    close = pd.to_numeric(close_col, errors="coerce")
+    values = close.to_numpy(dtype=float)
+    mask = np.isfinite(values) & (values > 0)
+    dropped = int(len(cleaned) - mask.sum())
+    if dropped:
+        logger.debug("Forecast: dropped %d invalid close rows for %s", dropped, ticker)
+
+    cleaned = cleaned.loc[mask].copy()
+    if cleaned.empty:
+        return cleaned
+    cleaned["Close"] = close.loc[mask].astype(float)
+    return cleaned
+
+
+def _finite_positive_array(values: np.ndarray | list[float]) -> np.ndarray:
+    arr = np.asarray(values, dtype=float)
+    return arr[np.isfinite(arr) & (arr > 0)]
+
+
 # ---------------------------------------------------------------------------
 # Expert Models
 # ---------------------------------------------------------------------------
@@ -171,6 +199,12 @@ def _macro_expert_generic(
 
     If invert=True, a rising macro indicator is bearish for the stock (e.g. VIX, bond yields).
     """
+    closes = _finite_positive_array(closes)
+    macro_closes = _finite_positive_array(macro_closes)
+    if len(closes) < 20 or len(macro_closes) < 20:
+        current = float(closes[-1]) if len(closes) else 0.01
+        return ExpertForecast(name, current, max(current * 0.95, 0.01), current * 1.05)
+
     current = closes[-1]
 
     stock_returns = np.diff(closes) / closes[:-1]
@@ -409,7 +443,7 @@ def _evaluate_past_predictions(store: dict) -> dict:
             continue
 
         ticker = pred["ticker"]
-        df = get_price_history(ticker)
+        df = _clean_price_history(get_price_history(ticker), ticker)
         if df.empty:
             continue
 
@@ -517,6 +551,10 @@ def warmup_backtest(ticker: str, store: dict, df: pd.DataFrame, horizon: int) ->
         if any(len(v) >= BACKTEST_DAYS for v in existing.values()):
             return store
 
+    df = _clean_price_history(df, ticker)
+    if df.empty:
+        return store
+
     closes_all = df["Close"].values.astype(float)
     dates_all = df.index
 
@@ -591,7 +629,7 @@ def forecast(ticker: str, horizon_days: int | None = None) -> EnsembleForecast:
         logger.debug("Forecast persistent cache hit for %s (%sd)", ticker, horizon_days)
         return _deserialize_ensemble(cached)
 
-    df = get_price_history(ticker)
+    df = _clean_price_history(get_price_history(ticker), ticker)
     if df.empty or len(df) < 20:
         raise ValueError(f"Insufficient price data for {ticker}")
 
