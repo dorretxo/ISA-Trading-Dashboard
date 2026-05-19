@@ -654,12 +654,14 @@ def _get_earnings_dates(ticker: str):
     """Fetch earnings dates for a ticker, cached for 1 hour."""
     try:
         from utils.global_universe import is_excluded_ticker, resolve_yahoo_ticker
+        from utils.data_fetch import quiet_yfinance_errors
 
         symbol = resolve_yahoo_ticker(ticker)
         if is_excluded_ticker(symbol):
             return None
         t = yf.Ticker(symbol)
-        ed = t.earnings_dates
+        with quiet_yfinance_errors():
+            ed = t.earnings_dates
         if ed is not None and not ed.empty:
             return ed
     except Exception:

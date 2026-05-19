@@ -4,6 +4,7 @@ import json
 import logging
 import socket
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from threading import Lock
 
@@ -33,6 +34,18 @@ _info_stats: dict[str, int] = {
     "timeout": 0,
     "skipped_cache_only": 0,
 }
+
+
+@contextmanager
+def quiet_yfinance_errors():
+    """Suppress provider log noise around optional Yahoo metadata calls."""
+    yf_logger = logging.getLogger("yfinance")
+    previous_level = yf_logger.level
+    yf_logger.setLevel(logging.CRITICAL)
+    try:
+        yield
+    finally:
+        yf_logger.setLevel(previous_level)
 
 
 def _portfolio_path() -> Path:
@@ -257,7 +270,8 @@ def get_ticker_info(ticker: str, timeout: int = 30, *, allow_network: bool | Non
     import concurrent.futures
 
     def _fetch():
-        return yf.Ticker(yahoo_key).info or {}
+        with quiet_yfinance_errors():
+            return yf.Ticker(yahoo_key).info or {}
 
     pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
     try:
@@ -537,9 +551,13 @@ def get_insider_transactions(ticker: str) -> dict:
     Returns dict with buys, sells, net_label, and recent transaction list.
     """
     try:
-        t = yf.Ticker(ticker)
-        # yfinance provides insider_purchases (aggregated) and insider_transactions (detailed)
-        txns = getattr(t, "insider_transactions", None)
+        yahoo_key = _resolve_yahoo_symbol(ticker)
+        if _is_blocked_symbol(yahoo_key):
+            return {"buys": 0, "sells": 0, "net_label": "N/A", "recent": []}
+        with quiet_yfinance_errors():
+            t = yf.Ticker(yahoo_key)
+            # yfinance provides insider_purchases (aggregated) and insider_transactions (detailed)
+            txns = getattr(t, "insider_transactions", None)
         if txns is None or (hasattr(txns, "empty") and txns.empty):
             return {"buys": 0, "sells": 0, "net_label": "N/A", "recent": []}
 

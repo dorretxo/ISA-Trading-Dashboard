@@ -23,7 +23,13 @@ from dataclasses import dataclass
 from datetime import datetime
 
 import config
-from utils.data_fetch import get_cached_ticker_info, get_price_history, get_ticker_info
+from utils.data_fetch import (
+    get_cached_ticker_info,
+    get_price_history,
+    get_ticker_info,
+    quiet_yfinance_errors,
+)
+from utils.global_universe import is_excluded_ticker, resolve_yahoo_ticker
 
 logger = logging.getLogger(__name__)
 _post_earnings_cache: dict[str, tuple[tuple[bool, int | None, bool, float | None], float]] = {}
@@ -260,20 +266,28 @@ def _check_post_earnings(
     try:
         import yfinance as yf
 
-        t = yf.Ticker(ticker)
+        yahoo_ticker = resolve_yahoo_ticker(ticker)
+        if is_excluded_ticker(yahoo_ticker):
+            output = (False, None, False, None)
+            _post_earnings_cache[ticker] = (output, now)
+            return output
+
+        t = yf.Ticker(yahoo_ticker)
         today = datetime.now().date()
 
         # Try to get earnings dates from calendar
         cal = None
         try:
-            cal = t.calendar
+            with quiet_yfinance_errors():
+                cal = t.calendar
         except Exception:
             pass
 
         # Try earnings_dates for historical data
         earnings_dates = None
         try:
-            earnings_dates = t.earnings_dates
+            with quiet_yfinance_errors():
+                earnings_dates = t.earnings_dates
         except Exception:
             pass
 

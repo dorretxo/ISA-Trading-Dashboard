@@ -76,3 +76,40 @@ def test_risk_overlay_uses_fmp_earnings_when_yahoo_disabled(monkeypatch):
     assert overlay.post_earnings_recent is True
     assert overlay.earnings_miss is True
     assert overlay.earnings_miss_pct == -20.0
+
+
+def test_risk_overlay_resolves_yahoo_alias_for_earnings(monkeypatch):
+    from engine import risk_overlay
+
+    risk_overlay._post_earnings_cache.clear()
+    prices = pd.DataFrame({"Close": [100.0] * 80})
+    seen = []
+    today = pd.Timestamp.today().normalize()
+    earnings = pd.DataFrame(
+        {"Reported EPS": [1.1], "EPS Estimate": [1.0]},
+        index=pd.DatetimeIndex([today]),
+    )
+
+    class FakeTicker:
+        def __init__(self, ticker):
+            seen.append(ticker)
+
+        @property
+        def calendar(self):
+            return None
+
+        @property
+        def earnings_dates(self):
+            return earnings
+
+    monkeypatch.setattr(risk_overlay, "get_price_history", lambda _ticker: prices)
+    monkeypatch.setattr("yfinance.Ticker", FakeTicker)
+
+    overlay = risk_overlay.apply_risk_overlay(
+        {"market_cap": 1_000_000_000},
+        "GFRD",
+        allow_yahoo_earnings=True,
+    )
+
+    assert seen == ["GFRD.L"]
+    assert overlay.post_earnings_recent is True
