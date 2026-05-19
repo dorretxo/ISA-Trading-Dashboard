@@ -38,3 +38,23 @@ def test_normalise_price_frame_selects_requested_ticker_from_multiindex():
 
     assert list(normalised.columns) == ["Close", "Open"]
     assert normalised["Close"].iloc[-1] == 21.0
+
+
+def test_get_ticker_info_resolves_yahoo_alias_before_network(monkeypatch):
+    data_fetch._info_cache.clear()
+    data_fetch.reset_ticker_info_stats()
+    seen = []
+
+    class FakeTicker:
+        def __init__(self, ticker):
+            seen.append(ticker)
+
+        @property
+        def info(self):
+            return {"sector": "Industrials"}
+
+    monkeypatch.setattr(data_fetch.yf, "Ticker", FakeTicker)
+
+    assert data_fetch.get_ticker_info("GFRD", timeout=1) == {"sector": "Industrials"}
+    assert seen == ["GFRD.L"]
+    assert data_fetch.get_cached_ticker_info("GFRD.L") == {"sector": "Industrials"}

@@ -64,6 +64,7 @@ def test_static_universe_resolves_yahoo_aliases_and_deduplicates():
     assert resolve_yahoo_ticker("BAE.L") == "BA.L"
     assert resolve_yahoo_ticker("CMC.L") == "CMCX.L"
     assert resolve_yahoo_ticker("DSM.AS") == "DSFIR.AS"
+    assert resolve_yahoo_ticker("GFRD") == "GFRD.L"
 
     tickers = [entry.ticker.upper() for entry in get_full_universe()]
     assert len(tickers) == len(set(tickers))

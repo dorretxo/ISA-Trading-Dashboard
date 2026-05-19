@@ -50,6 +50,111 @@ import config
 
 logger = logging.getLogger(__name__)
 
+
+def _resolve_yahoo_symbol(ticker: str) -> str:
+    symbol = str(ticker or "").upper().strip()
+    if not symbol:
+        return ""
+    try:
+        from utils.global_universe import resolve_yahoo_ticker
+
+        return resolve_yahoo_ticker(symbol)
+    except Exception:
+        return symbol
+
+
+def _is_blocked_symbol(ticker: str) -> bool:
+    if not ticker:
+        return True
+    try:
+        from utils.global_universe import is_excluded_ticker
+
+        return is_excluded_ticker(ticker)
+    except Exception:
+        return False
+
+
+def _yahoo_download_map(tickers: list[str]) -> tuple[list[str], dict[str, list[str]]]:
+    symbol_to_originals: dict[str, list[str]] = {}
+    for raw in tickers:
+        original = str(raw or "").upper().strip()
+        symbol = _resolve_yahoo_symbol(original)
+        if not symbol or _is_blocked_symbol(symbol):
+            continue
+        symbol_to_originals.setdefault(symbol, []).append(original)
+    return sorted(symbol_to_originals), symbol_to_originals
+
+
+def _extract_close_series(data: pd.DataFrame, symbol: str, batch_len: int) -> pd.Series | None:
+    if data is None or data.empty:
+        return None
+    symbol_key = str(symbol or "").upper().strip()
+    if not isinstance(data.columns, pd.MultiIndex):
+        if "Close" not in data.columns:
+            return None
+        close = data["Close"]
+        if isinstance(close, pd.DataFrame):
+            if symbol in close.columns:
+                return close[symbol]
+            if batch_len == 1 and len(close.columns):
+                return close.iloc[:, 0]
+            return None
+        return close
+
+    for level in range(data.columns.nlevels):
+        raw_values = list(data.columns.get_level_values(level))
+        upper_values = [str(v).upper().strip() for v in raw_values]
+        if symbol_key not in upper_values:
+            continue
+        matched = raw_values[upper_values.index(symbol_key)]
+        try:
+            sliced = data.xs(matched, axis=1, level=level, drop_level=True)
+        except Exception:
+            continue
+        if isinstance(sliced, pd.DataFrame) and "Close" in sliced.columns:
+            close = sliced["Close"]
+            return close.iloc[:, 0] if isinstance(close, pd.DataFrame) else close
+        if isinstance(sliced, pd.Series):
+            return sliced
+
+    for level in range(data.columns.nlevels):
+        raw_values = list(data.columns.get_level_values(level))
+        upper_values = [str(v).upper().strip() for v in raw_values]
+        if "CLOSE" not in upper_values:
+            continue
+        matched = raw_values[upper_values.index("CLOSE")]
+        try:
+            close = data.xs(matched, axis=1, level=level, drop_level=True)
+        except Exception:
+            continue
+        if isinstance(close, pd.DataFrame):
+            col_lookup = {str(col).upper().strip(): col for col in close.columns}
+            if symbol_key in col_lookup:
+                return close[col_lookup[symbol_key]]
+            if batch_len == 1 and len(close.columns):
+                return close.iloc[:, 0]
+        elif isinstance(close, pd.Series):
+            return close
+    return None
+
+
+def _close_frame_from_yahoo_download(
+    data: pd.DataFrame,
+    download_symbols: list[str],
+    symbol_to_originals: dict[str, list[str]],
+) -> pd.DataFrame:
+    closes: dict[str, pd.Series] = {}
+    for symbol in download_symbols:
+        series = _extract_close_series(data, symbol, len(download_symbols))
+        if series is None:
+            continue
+        series = pd.to_numeric(series, errors="coerce").dropna()
+        if series.empty:
+            continue
+        for original in symbol_to_originals.get(symbol, [symbol]):
+            closes[original] = series
+    return pd.DataFrame(closes)
+
 # ---------------------------------------------------------------------------
 # Configuration defaults (override via config.py)
 # ---------------------------------------------------------------------------
@@ -281,7 +386,10 @@ def _estimate_expected_returns_legacy(
         score_90d = agg * 0.15
 
         try:
-            data = yf.download(ticker, period="120d", progress=False, auto_adjust=True, timeout=30)
+            yahoo_ticker = _resolve_yahoo_symbol(ticker)
+            if _is_blocked_symbol(yahoo_ticker):
+                raise ValueError("excluded/quarantined ticker")
+            data = yf.download(yahoo_ticker, period="120d", progress=False, auto_adjust=True, timeout=30)
             if data is not None and len(data) >= 60:
                 if isinstance(data.columns, pd.MultiIndex):
                     data.columns = data.columns.get_level_values(0)
@@ -585,14 +693,16 @@ def _estimate_covariance(
     FALLBACK_VAR = 0.30 ** 2
 
     try:
-        data = yf.download(tickers, period=f"{LOOKBACK_DAYS}d", progress=False, auto_adjust=True)
+        download_symbols, symbol_to_originals = _yahoo_download_map(tickers)
+        if not download_symbols:
+            raise ValueError("No active Yahoo symbols after alias/quarantine filtering")
+        data = yf.download(download_symbols, period=f"{LOOKBACK_DAYS}d", progress=False, auto_adjust=True)
         if data is None or data.empty:
             raise ValueError("No price data")
 
-        if n == 1:
-            closes = data["Close"].to_frame(tickers[0])
-        else:
-            closes = data["Close"]
+        closes = _close_frame_from_yahoo_download(data, download_symbols, symbol_to_originals)
+        if closes.empty:
+            raise ValueError("No close price data")
 
         available = [t for t in tickers if t in closes.columns and not closes[t].isna().all()]
         missing = [t for t in tickers if t not in available]
@@ -737,7 +847,9 @@ def _get_sectors(results: list[dict], tickers: list[str]) -> dict[str, str]:
         sector = r.get("sector")
         if not sector:
             try:
-                info = yf.Ticker(ticker).info
+                from utils.data_fetch import get_ticker_info
+
+                info = get_ticker_info(ticker)
                 sector = info.get("sector", "Unknown")
             except Exception:
                 sector = "Unknown"
@@ -1464,8 +1576,12 @@ def _backfill_realised_sharpe(history: dict, *, min_age_days: int = 90) -> bool:
             rec["realised_90d"] = {}
             continue
         try:
+            download_symbols, symbol_to_originals = _yahoo_download_map(tickers)
+            if not download_symbols:
+                rec["realised_90d"] = {}
+                continue
             px = _yf.download(
-                tickers, start=run_dt.date(),
+                download_symbols, start=run_dt.date(),
                 end=(run_dt + timedelta(days=min_age_days + 5)).date(),
                 progress=False, auto_adjust=True, group_by="ticker",
             )
@@ -1475,14 +1591,13 @@ def _backfill_realised_sharpe(history: dict, *, min_age_days: int = 90) -> bool:
             continue
 
         closes = {}
+        close_frame = _close_frame_from_yahoo_download(px, download_symbols, symbol_to_originals)
         for t in tickers:
-            try:
-                s = px[t]["Close"] if (t in px.columns.get_level_values(0)) else None
-            except Exception:
-                s = None
-            if s is None or s.dropna().empty:
+            if t not in close_frame:
                 continue
-            closes[t] = s.dropna()
+            s = close_frame[t].dropna()
+            if not s.empty:
+                closes[t] = s
         if not closes:
             continue
 

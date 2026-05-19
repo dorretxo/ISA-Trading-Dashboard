@@ -24,13 +24,36 @@ PRICE_CACHE_DIR = Path(getattr(config, "HISTORICAL_PRICE_CACHE_DIR", "feature_ca
 _PRICE_COLUMNS = ["Open", "High", "Low", "Close", "Adj Close", "Volume"]
 
 
+def _resolve_yahoo_symbol(ticker: str) -> str:
+    symbol = str(ticker or "").upper().strip()
+    if not symbol:
+        return ""
+    try:
+        from utils.global_universe import resolve_yahoo_ticker
+
+        return resolve_yahoo_ticker(symbol)
+    except Exception:
+        return symbol
+
+
+def _is_blocked_symbol(ticker: str) -> bool:
+    if not ticker:
+        return True
+    try:
+        from utils.global_universe import is_excluded_ticker
+
+        return is_excluded_ticker(ticker)
+    except Exception:
+        return False
+
+
 def _safe_ticker_key(ticker: str) -> str:
     key = str(ticker or "").upper().strip()
     return re.sub(r"[^A-Z0-9._=-]+", "_", key)
 
 
 def _cache_path(ticker: str, cache_dir: Path = PRICE_CACHE_DIR) -> Path:
-    return cache_dir / f"{_safe_ticker_key(ticker)}.pkl"
+    return cache_dir / f"{_safe_ticker_key(_resolve_yahoo_symbol(ticker) or ticker)}.pkl"
 
 
 def _coerce_ts(value) -> pd.Timestamp | None:
@@ -57,6 +80,9 @@ def _normalize_frame(frame: pd.DataFrame | None) -> pd.DataFrame:
 
 
 def load_price_history(ticker: str, *, cache_dir: Path = PRICE_CACHE_DIR) -> pd.DataFrame:
+    symbol = _resolve_yahoo_symbol(ticker)
+    if _is_blocked_symbol(symbol):
+        return pd.DataFrame()
     path = _cache_path(ticker, cache_dir)
     if not path.exists():
         return pd.DataFrame()
@@ -68,6 +94,9 @@ def load_price_history(ticker: str, *, cache_dir: Path = PRICE_CACHE_DIR) -> pd.
 
 
 def save_price_history(ticker: str, frame: pd.DataFrame, *, cache_dir: Path = PRICE_CACHE_DIR) -> None:
+    symbol = _resolve_yahoo_symbol(ticker)
+    if _is_blocked_symbol(symbol):
+        return
     frame = _normalize_frame(frame)
     if frame.empty:
         return
@@ -147,7 +176,20 @@ def download_price_history(
     cache_dir: Path = PRICE_CACHE_DIR,
 ) -> dict[str, pd.DataFrame]:
     """Download/update cached OHLCV history and return frames by ticker."""
-    clean = sorted({str(t).upper().strip() for t in tickers if str(t or "").strip()})
+    requested = sorted({str(t).upper().strip() for t in tickers if str(t or "").strip()})
+    if not requested:
+        return {}
+    requests_by_symbol: dict[str, list[str]] = {}
+    skipped = 0
+    for original in requested:
+        symbol = _resolve_yahoo_symbol(original)
+        if not symbol or _is_blocked_symbol(symbol):
+            skipped += 1
+            continue
+        requests_by_symbol.setdefault(symbol, []).append(original)
+    if skipped:
+        logger.info("Price cache skipped %d excluded/quarantined tickers before Yahoo download", skipped)
+    clean = sorted(requests_by_symbol)
     if not clean:
         return {}
     batch_size = int(batch_size or getattr(config, "PRICE_CACHE_BATCH_SIZE", 75))
@@ -160,10 +202,14 @@ def download_price_history(
     for ticker in clean:
         cached = load_price_history(ticker, cache_dir=cache_dir)
         if not force and not cached.empty and cached.index.min() <= start_ts and cached.index.max() >= end_ts - pd.Timedelta(days=3):
-            results[ticker] = get_price_history(ticker, start=start_ts, end=end_ts, cache_dir=cache_dir)
+            frame = get_price_history(ticker, start=start_ts, end=end_ts, cache_dir=cache_dir)
+            for original in requests_by_symbol.get(ticker, [ticker]):
+                results[original] = frame
         else:
             if not cached.empty:
-                results[ticker] = get_price_history(ticker, start=start_ts, end=end_ts, cache_dir=cache_dir)
+                frame = get_price_history(ticker, start=start_ts, end=end_ts, cache_dir=cache_dir)
+                for original in requests_by_symbol.get(ticker, [ticker]):
+                    results[original] = frame
             missing.append(ticker)
 
     for offset in range(0, len(missing), batch_size):
@@ -187,7 +233,9 @@ def download_price_history(
                 continue
             merged = _merge_frames(load_price_history(ticker, cache_dir=cache_dir), downloaded)
             save_price_history(ticker, merged, cache_dir=cache_dir)
-            results[ticker] = get_price_history(ticker, start=start_ts, end=end_ts, cache_dir=cache_dir)
+            frame = get_price_history(ticker, start=start_ts, end=end_ts, cache_dir=cache_dir)
+            for original in requests_by_symbol.get(ticker, [ticker]):
+                results[original] = frame
         logger.info("Price cache: processed %d-%d/%d", offset + 1, min(offset + batch_size, len(missing)), len(missing))
 
     return results

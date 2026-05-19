@@ -653,7 +653,12 @@ _HELP_TEXT = {
 def _get_earnings_dates(ticker: str):
     """Fetch earnings dates for a ticker, cached for 1 hour."""
     try:
-        t = yf.Ticker(ticker)
+        from utils.global_universe import is_excluded_ticker, resolve_yahoo_ticker
+
+        symbol = resolve_yahoo_ticker(ticker)
+        if is_excluded_ticker(symbol):
+            return None
+        t = yf.Ticker(symbol)
         ed = t.earnings_dates
         if ed is not None and not ed.empty:
             return ed

@@ -43,6 +43,27 @@ class PortfolioOptimizerTests(unittest.TestCase):
         self.assertTrue(np.allclose(cov, cov.T))
         self.assertGreaterEqual(float(np.min(np.linalg.eigvalsh(cov))), -1e-8)
 
+    @mock.patch("engine.portfolio_optimizer.yf.download")
+    def test_covariance_resolves_portfolio_alias_before_download(self, mock_download):
+        dates = pd.date_range("2024-01-01", periods=90, freq="B")
+        close = pd.DataFrame(
+            {
+                "AAA": np.linspace(100.0, 121.0, len(dates)),
+                "GFRD.L": np.linspace(500.0, 540.0, len(dates)),
+            },
+            index=dates,
+        )
+        mock_download.return_value = pd.concat({"Close": close}, axis=1)
+
+        cov = portfolio_optimizer._estimate_covariance(
+            ["AAA", "GFRD"],
+            regime_label="NEUTRAL",
+            method="gerber",
+        )
+
+        self.assertEqual(mock_download.call_args.args[0], ["AAA", "GFRD.L"])
+        self.assertEqual(cov.shape, (2, 2))
+
     def test_black_litterman_posterior_reverts_to_prior_with_wide_omega(self):
         cov = np.array(
             [

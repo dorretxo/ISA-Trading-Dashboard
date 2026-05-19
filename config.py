@@ -734,6 +734,7 @@ DISCOVERY_TICKER_ALIASES = {
     "BAE.L": "BA.L",        # BAE Systems
     "CMC.L": "CMCX.L",      # CMC Markets
     "DSM.AS": "DSFIR.AS",   # dsm-firmenich after DSM/Firmenich merger
+    "GFRD": "GFRD.L",       # Galliford Try portfolio symbol needs LSE suffix
 }
 DISCOVERY_TICKER_QUARANTINE = {
     # Current Yahoo no-data symbols from `python -m utils.validate_universe`

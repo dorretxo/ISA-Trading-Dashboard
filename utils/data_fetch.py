@@ -46,6 +46,29 @@ def load_portfolio() -> list[dict]:
     return data["holdings"]
 
 
+def _resolve_yahoo_symbol(ticker: str) -> str:
+    symbol = str(ticker or "").upper().strip()
+    if not symbol:
+        return ""
+    try:
+        from utils.global_universe import resolve_yahoo_ticker
+
+        return resolve_yahoo_ticker(symbol)
+    except Exception:
+        return symbol
+
+
+def _is_blocked_symbol(ticker: str) -> bool:
+    if not ticker:
+        return True
+    try:
+        from utils.global_universe import is_excluded_ticker
+
+        return is_excluded_ticker(ticker)
+    except Exception:
+        return False
+
+
 def load_portfolio_full() -> dict:
     """Load the full portfolio file including trade_history."""
     with open(_portfolio_path(), "r") as f:
@@ -132,8 +155,17 @@ def get_price_history(ticker: str) -> pd.DataFrame:
     back through to the on-disk cache so subsequent replay reads see the
     same series.  Failures return an empty frame, matching the prior contract.
     """
-    if ticker in _price_cache:
-        return _price_cache[ticker]
+    ticker_key = str(ticker or "").upper().strip()
+    yahoo_key = _resolve_yahoo_symbol(ticker_key)
+    if ticker_key in _price_cache:
+        return _price_cache[ticker_key]
+    if yahoo_key in _price_cache:
+        _price_cache[ticker_key] = _price_cache[yahoo_key]
+        return _price_cache[yahoo_key]
+    if _is_blocked_symbol(yahoo_key):
+        df = pd.DataFrame()
+        _price_cache[ticker_key] = df
+        return df
 
     df = pd.DataFrame()
     try:
@@ -147,7 +179,7 @@ def get_price_history(ticker: str) -> pd.DataFrame:
 
         # ensure_price_history checks cache freshness inside download_price_history
         # and only triggers a yfinance batch when the cache is missing or stale.
-        df = price_store.ensure_price_history(ticker, start=start, end=end)
+        df = price_store.ensure_price_history(ticker_key, start=start, end=end)
 
         # Preserve the prior normalisation: drop trailing NaN-Close rows so
         # downstream technical analysis doesn't divide by NaN.
@@ -159,10 +191,12 @@ def get_price_history(ticker: str) -> pd.DataFrame:
             else:
                 df = pd.DataFrame()
     except Exception as exc:
-        logger.debug("get_price_history(%s) failed: %s", ticker, exc)
+        logger.debug("get_price_history(%s) failed: %s", ticker_key, exc)
         df = pd.DataFrame()
 
-    _price_cache[ticker] = df
+    _price_cache[ticker_key] = df
+    if yahoo_key and yahoo_key != ticker_key:
+        _price_cache[yahoo_key] = df
     return df
 
 
@@ -188,7 +222,11 @@ def set_cached_ticker_info(ticker: str, info: dict | None) -> None:
     """Seed the session metadata cache without making a Yahoo request."""
     if not ticker or not isinstance(info, dict):
         return
-    _info_cache[str(ticker).upper()] = dict(info)
+    ticker_key = str(ticker).upper().strip()
+    _info_cache[ticker_key] = dict(info)
+    yahoo_key = _resolve_yahoo_symbol(ticker_key)
+    if yahoo_key and yahoo_key != ticker_key:
+        _info_cache[yahoo_key] = dict(info)
 
 
 def get_ticker_info(ticker: str, timeout: int = 30, *, allow_network: bool | None = None) -> dict:
@@ -197,10 +235,20 @@ def get_ticker_info(ticker: str, timeout: int = 30, *, allow_network: bool | Non
     Uses a thread pool to enforce a hard timeout on yfinance .info calls,
     which can hang indefinitely on delisted or problematic tickers.
     """
-    ticker_key = str(ticker or "").upper()
+    ticker_key = str(ticker or "").upper().strip()
+    yahoo_key = _resolve_yahoo_symbol(ticker_key)
     if ticker_key in _info_cache:
         _record_info_stat("cache")
         return _info_cache[ticker_key]
+    if yahoo_key in _info_cache:
+        _record_info_stat("cache")
+        _info_cache[ticker_key] = _info_cache[yahoo_key]
+        return _info_cache[yahoo_key]
+
+    if _is_blocked_symbol(yahoo_key):
+        _record_info_stat("skipped_cache_only")
+        _info_cache[ticker_key] = {}
+        return {}
 
     if allow_network is False:
         _record_info_stat("skipped_cache_only")
@@ -209,7 +257,7 @@ def get_ticker_info(ticker: str, timeout: int = 30, *, allow_network: bool | Non
     import concurrent.futures
 
     def _fetch():
-        return yf.Ticker(ticker_key).info or {}
+        return yf.Ticker(yahoo_key).info or {}
 
     pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
     try:
@@ -231,12 +279,16 @@ def get_ticker_info(ticker: str, timeout: int = 30, *, allow_network: bool | Non
         info = {}
 
     _info_cache[ticker_key] = info
+    if yahoo_key and yahoo_key != ticker_key:
+        _info_cache[yahoo_key] = info
     return info
 
 
 def get_cached_ticker_info(ticker: str) -> dict:
     """Return cached ticker info without making a network call."""
-    return _info_cache.get(str(ticker or "").upper(), {})
+    ticker_key = str(ticker or "").upper().strip()
+    yahoo_key = _resolve_yahoo_symbol(ticker_key)
+    return _info_cache.get(ticker_key) or _info_cache.get(yahoo_key, {})
 
 
 def _normalise_price_frame(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
