@@ -492,6 +492,10 @@ SIGNAL_QUALITY_BACKFILL_REPORT_PATH = "feature_cache/signal_quality_backfill_rep
 VALUE_CAP_SHADOW_EVENT_LEDGER_ENABLED = True
 VALUE_CAP_SHADOW_ANALOGUE_HISTORY_LIMIT = 5000
 VALUE_CAP_SHADOW_PROMOTION_MIN_LIVE_N = 25
+# Read-only diagnostics for deciding how to populate missing non-US QMJ inputs.
+NON_US_FUNDAMENTAL_COVERAGE_AUDIT_PATH = "feature_cache/non_us_fundamental_coverage_audit.json"
+NON_US_FUNDAMENTAL_FILING_PROBE_PATH = "feature_cache/non_us_fundamental_filing_probe.json"
+NON_US_FUNDAMENTAL_ESEF_EXTRACT_PROBE_PATH = "feature_cache/non_us_fundamental_esef_extract_probe.json"
 STRONG_BUY_VALUATION_QUALITY_OVERRIDE_ENABLED = False  # Live-off; evaluated only by the shadow report unless flipped.
 STRONG_BUY_VALUATION_QUALITY_OVERRIDE_SHADOW = True
 STRONG_BUY_VALUATION_OVERRIDE_QMJ_FLOOR = 0.80          # Top-quintile QMJ required to override rich multiples.

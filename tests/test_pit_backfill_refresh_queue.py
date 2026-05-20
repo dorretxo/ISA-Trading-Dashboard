@@ -31,6 +31,7 @@ def test_refresh_queue_uses_fmp_for_plain_ticker_and_yf_for_suffix(tmp_path, mon
         max_tickers=10,
         limit=4,
         sec_edgar_fallback=False,
+        esef_ixbrl_fallback=False,
         yahoo_timeseries_fallback=False,
         write_results=False,
     )
@@ -66,11 +67,8 @@ def test_refresh_queue_uses_sec_before_yahoo_for_mapped_adr(tmp_path, monkeypatc
         "backfill_via_sec_edgar",
         lambda tickers, limit=None, sleep_seconds=0.0: {ticker: 2 for ticker in tickers},
     )
-    monkeypatch.setattr(
-        pit_backfill,
-        "backfill_via_yahoo_timeseries",
-        lambda tickers, limit=None, sleep_seconds=0.0: {ticker: 3 for ticker in tickers},
-    )
+    monkeypatch.setattr(pit_backfill, "backfill_via_esef_ixbrl", lambda tickers, limit=None, sleep_seconds=0.0: {ticker: 0 for ticker in tickers})
+    monkeypatch.setattr(pit_backfill, "backfill_via_yahoo_timeseries", lambda tickers, limit=None, sleep_seconds=0.0: {ticker: 3 for ticker in tickers})
 
     def fail_yfinance(*args, **kwargs):
         raise AssertionError("yfinance should not run when SEC/Yahoo already wrote snapshots")
@@ -80,6 +78,7 @@ def test_refresh_queue_uses_sec_before_yahoo_for_mapped_adr(tmp_path, monkeypatc
     stats = pit_backfill.refresh_queue_tickers(queue_path=queue, max_tickers=10, write_results=False)
 
     assert stats["sec_edgar_results"] == {"NOKIA.HE": 2}
+    assert stats["esef_ixbrl_results"] == {"TCAP.L": 0}
     assert stats["yahoo_timeseries_results"] == {"TCAP.L": 3}
     assert stats["yfinance_results"] == {}
     assert stats["refreshed_snapshots"] == {"NOKIA.HE": 2, "TCAP.L": 3}
@@ -92,6 +91,7 @@ def test_refresh_queue_runs_alpha_adr_only_for_residual_qmj_gap(tmp_path, monkey
 
     monkeypatch.setattr(pit_backfill, "_adr_mapping_row_for_ticker", lambda ticker: {"adr_symbol": "BHP"})
     monkeypatch.setattr(pit_backfill, "backfill_via_sec_edgar", lambda tickers, limit=None, sleep_seconds=0.0: {ticker: 0 for ticker in tickers})
+    monkeypatch.setattr(pit_backfill, "backfill_via_esef_ixbrl", lambda tickers, limit=None, sleep_seconds=0.0: {ticker: 0 for ticker in tickers})
     monkeypatch.setattr(pit_backfill, "backfill_via_yahoo_timeseries", lambda tickers, limit=None, sleep_seconds=0.0: {ticker: 0 for ticker in tickers})
     monkeypatch.setattr(pit_backfill, "backfill_via_yfinance_quarterly", lambda tickers, limit=None, sleep_seconds=0.0: {ticker: 1 for ticker in tickers})
     monkeypatch.setattr(pit_backfill, "_latest_snapshot_has_qmj_minimum", lambda ticker: False)
@@ -112,6 +112,27 @@ def test_refresh_queue_runs_alpha_adr_only_for_residual_qmj_gap(tmp_path, monkey
     assert stats["alpha_vantage_adr_results"] == {"BHP.AX": 2}
     assert stats["refreshed_snapshots"] == {"BHP.AX": 3}
     assert stats["snapshots_written"] == 3
+
+
+def test_refresh_queue_uses_esef_before_yahoo_for_london_names(tmp_path, monkeypatch):
+    queue = tmp_path / "queue.json"
+    queue.write_text(json.dumps({"items": [{"ticker": "GRG.L", "priority": 5}]}), encoding="utf-8")
+
+    monkeypatch.setattr(pit_backfill, "_sec_adr_symbol_for_ticker", lambda ticker: None)
+    monkeypatch.setattr(pit_backfill, "backfill_via_esef_ixbrl", lambda tickers, limit=None, sleep_seconds=0.0: {ticker: 2 for ticker in tickers})
+
+    def fail_yahoo(*args, **kwargs):
+        raise AssertionError("Yahoo should not run after ESEF writes snapshots")
+
+    monkeypatch.setattr(pit_backfill, "backfill_via_yahoo_timeseries", fail_yahoo)
+    monkeypatch.setattr(pit_backfill, "backfill_via_yfinance_quarterly", fail_yahoo)
+
+    stats = pit_backfill.refresh_queue_tickers(queue_path=queue, max_tickers=10, write_results=False)
+
+    assert stats["esef_ixbrl_results"] == {"GRG.L": 2}
+    assert stats["yahoo_timeseries_results"] == {}
+    assert stats["refreshed_snapshots"] == {"GRG.L": 2}
+    assert stats["provider_order"][:3] == ["fmp", "sec_edgar", "esef_ixbrl"]
 
 
 def test_refresh_queue_falls_back_to_yfinance_when_fmp_writes_zero(tmp_path, monkeypatch):

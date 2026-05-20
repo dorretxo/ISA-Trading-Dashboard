@@ -50,7 +50,14 @@ logger = logging.getLogger(__name__)
 _DEFAULT_PATH = Path("feature_cache") / "pit_fundamentals.json"
 _SCHEMA_VERSION = 1
 _DEFAULT_REPORT_LAG_DAYS = 45  # SEC 10-Q filing deadline for accelerated filers
-_RICH_STATEMENT_SOURCES = {"fmp", "sec_edgar", "yahoo_timeseries", "yfinance_quarterly", "alpha_vantage_adr"}
+_RICH_STATEMENT_SOURCES = {
+    "fmp",
+    "sec_edgar",
+    "esef_ixbrl",
+    "yahoo_timeseries",
+    "yfinance_quarterly",
+    "alpha_vantage_adr",
+}
 _LIVE_CAPTURE_SOURCES = {"yfinance_info"}
 _RICH_SNAPSHOT_MAX_STALENESS_DAYS = 550
 

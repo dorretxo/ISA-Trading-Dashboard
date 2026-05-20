@@ -1,4 +1,5 @@
 from utils import pit_backfill
+from utils import non_us_fundamental_coverage as coverage
 from utils.pit_backfill import _snapshot_from_rows
 
 
@@ -234,6 +235,87 @@ def test_yahoo_timeseries_payload_prefers_trailing_quality_fields():
             },
         )
     ]
+
+
+def test_esef_ixbrl_backfill_writes_pit_snapshot_with_provenance(monkeypatch):
+    writes = []
+
+    monkeypatch.setattr(
+        coverage,
+        "map_openfigi",
+        lambda items, sleep_seconds=0.0: [
+            {
+                "ticker": "GRG.L",
+                "status": "mapped",
+                "figi": "BBG000BDKLH1",
+                "name": "GREGGS PLC",
+                "security_type": "Common Stock",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        coverage,
+        "find_filings_xbrl_filings",
+        lambda name, limit=4: {
+            "status": "entity_found",
+            "entity_name": "GREGGS PLC",
+            "entity_identifier": "213800I71QMUFJ64IW20",
+            "filings": [
+                {
+                    "period_end": "2025-12-27",
+                    "processed": "2026-04-15 16:40:36",
+                    "country": "GB",
+                    "error_count": 0,
+                    "warning_count": 0,
+                    "package_url": "https://filings.xbrl.org/package.zip",
+                    "report_url": "https://filings.xbrl.org/report.xhtml",
+                    "json_url": "https://filings.xbrl.org/report.json",
+                }
+            ],
+        },
+    )
+
+    class Response:
+        status_code = 200
+        content = b"zip-bytes"
+
+    monkeypatch.setattr(pit_backfill.requests, "get", lambda *args, **kwargs: Response())
+    monkeypatch.setattr(
+        coverage,
+        "extract_esef_ixbrl_snapshot",
+        lambda content, period_end=None: {
+            "status": "extracted",
+            "report_name": "report.xhtml",
+            "fact_count": 100,
+            "has_qmj_minimum": True,
+            "missing_qmj_fields": [],
+            "fields": {
+                "revenue": 1000.0,
+                "gross_profit": 600.0,
+                "net_income": 120.0,
+                "total_assets": 2000.0,
+            },
+            "field_sources": {
+                "gross_profit": {"concept": "ifrs-full:GrossProfit", "context_ref": "dur"}
+            },
+        },
+    )
+    monkeypatch.setattr(
+        pit_backfill,
+        "record_snapshot",
+        lambda ticker, report_date, snapshot, **kwargs: writes.append((ticker, report_date, snapshot, kwargs)),
+    )
+
+    results = pit_backfill.backfill_via_esef_ixbrl(["GRG.L"], limit=1, sleep_seconds=0)
+
+    assert results == {"GRG.L": 1}
+    assert writes[0][0] == "GRG.L"
+    assert writes[0][1] == "2025-12-27"
+    assert writes[0][2]["gross_profit"] == 600.0
+    assert writes[0][2]["_esef_entity_identifier"] == "213800I71QMUFJ64IW20"
+    assert writes[0][2]["_esef_field_sources"]["gross_profit"]["concept"] == "ifrs-full:GrossProfit"
+    assert writes[0][3]["accepted_date"] == "2026-04-15"
+    assert writes[0][3]["source"] == "esef_ixbrl"
 
 
 def test_yahoo_timeseries_carries_prior_instant_assets_forward():

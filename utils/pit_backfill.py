@@ -670,6 +670,140 @@ def backfill_via_sec_edgar(
     return results
 
 
+def _iso_date_prefix(value: object) -> str | None:
+    text = str(value or "").strip()
+    if len(text) >= 10:
+        candidate = text[:10]
+        try:
+            datetime.fromisoformat(candidate)
+            return candidate
+        except ValueError:
+            return None
+    return None
+
+
+def backfill_via_esef_ixbrl(
+    tickers: Iterable[str],
+    *,
+    limit: int | None = None,
+    sleep_seconds: float = 0.2,
+    include_sector_specific: bool = False,
+    require_qmj_minimum: bool = True,
+) -> dict[str, int]:
+    """Backfill PIT snapshots from public ESEF inline-XBRL packages.
+
+    The path is intentionally conservative:
+
+    * local symbol -> issuer name via OpenFIGI
+    * issuer name -> public ESEF filings via filings.xbrl.org
+    * standard IFRS concepts only; extension taxonomy mapping is out-of-scope
+    * filing ``processed`` date is recorded as the PIT accepted date
+    """
+    from utils import non_us_fundamental_coverage as esef
+
+    limit = max(1, int(limit or 4))
+    symbols = [str(ticker or "").upper().strip() for ticker in tickers if str(ticker or "").strip()]
+    results: dict[str, int] = {symbol: 0 for symbol in symbols}
+    eligible_symbols = [
+        symbol for symbol in symbols
+        if esef.ticker_suffix(symbol) in getattr(esef, "ESEF_SUFFIXES", set())
+    ]
+    if not eligible_symbols:
+        return results
+    items = [
+        {
+            "ticker": symbol,
+            "suffix": esef.ticker_suffix(symbol),
+            "instrument_class": "operating_company",
+        }
+        for symbol in eligible_symbols
+    ]
+    mapped_rows = {
+        str(row.get("ticker") or "").upper(): row
+        for row in esef.map_openfigi(items, sleep_seconds=0.0)
+    }
+
+    for symbol in eligible_symbols:
+        figi_row = mapped_rows.get(symbol) or {"status": "not_found"}
+        if figi_row.get("status") != "mapped":
+            results[symbol] = 0
+            continue
+
+        item = {"ticker": symbol, "suffix": esef.ticker_suffix(symbol)}
+        refined_class = esef.refined_instrument_class(item, figi_row)
+        contract_family = esef.qmj_contract_family(refined_class)
+        if contract_family == "sector_specific_quality" and not include_sector_specific:
+            results[symbol] = 0
+            continue
+
+        filing_lookup = esef.find_filings_xbrl_filings(str(figi_row.get("name") or ""), limit=limit)
+        filings = filing_lookup.get("filings") or []
+        if not filings:
+            results[symbol] = 0
+            continue
+
+        written = 0
+        for filing in filings[:limit]:
+            report_date = _iso_date_prefix(filing.get("period_end"))
+            package_url = filing.get("package_url")
+            if not report_date or not package_url:
+                continue
+            try:
+                response = requests.get(
+                    str(package_url),
+                    timeout=30.0,
+                    headers={"User-Agent": getattr(esef, "USER_AGENT", "TradingDashboardCoverageAudit/1.0")},
+                )
+                if response.status_code != 200:
+                    continue
+                extracted = esef.extract_esef_ixbrl_snapshot(response.content, period_end=report_date)
+            except Exception as exc:
+                logger.debug("ESEF extraction failed for %s %s: %s", symbol, report_date, exc)
+                continue
+            if extracted.get("status") != "extracted":
+                continue
+            if require_qmj_minimum and not extracted.get("has_qmj_minimum"):
+                continue
+            fields = dict(extracted.get("fields") or {})
+            if not fields:
+                continue
+            fields.update(
+                {
+                    "_esef_entity_name": filing_lookup.get("entity_name"),
+                    "_esef_entity_identifier": filing_lookup.get("entity_identifier"),
+                    "_esef_openfigi_name": figi_row.get("name"),
+                    "_esef_openfigi_figi": figi_row.get("figi"),
+                    "_esef_openfigi_security_type": figi_row.get("security_type"),
+                    "_esef_refined_instrument_class": refined_class,
+                    "_esef_contract_family": contract_family,
+                    "_esef_package_url": package_url,
+                    "_esef_report_url": filing.get("report_url"),
+                    "_esef_json_url": filing.get("json_url"),
+                    "_esef_processed": filing.get("processed"),
+                    "_esef_country": filing.get("country"),
+                    "_esef_error_count": filing.get("error_count"),
+                    "_esef_warning_count": filing.get("warning_count"),
+                    "_esef_report_name": extracted.get("report_name"),
+                    "_esef_fact_count": extracted.get("fact_count"),
+                    "_esef_field_sources": extracted.get("field_sources"),
+                    "_esef_missing_qmj_fields": extracted.get("missing_qmj_fields"),
+                    "_esef_has_qmj_minimum": bool(extracted.get("has_qmj_minimum")),
+                }
+            )
+            record_snapshot(
+                symbol,
+                report_date,
+                fields,
+                accepted_date=_iso_date_prefix(filing.get("processed")),
+                source="esef_ixbrl",
+            )
+            written += 1
+        results[symbol] = written
+        if sleep_seconds > 0:
+            time.sleep(sleep_seconds)
+    return results
+
+
 def _yahoo_timeseries_url(ticker: str) -> str:
     symbol = str(ticker or "").upper().strip()
     return f"https://query2.finance.yahoo.com/ws/fundamentals-timeseries/v1/finance/timeseries/{symbol}"
@@ -1260,6 +1394,7 @@ def refresh_queue_tickers(
     limit: int | None = None,
     sleep_seconds: float = 0.0,
     sec_edgar_fallback: bool = True,
+    esef_ixbrl_fallback: bool = True,
     yahoo_timeseries_fallback: bool = True,
     yfinance_fallback: bool = True,
     alpha_vantage_adr_fallback: bool | None = None,
@@ -1273,6 +1408,7 @@ def refresh_queue_tickers(
 
     * FMP for plain US-style tickers.
     * SEC EDGAR for explicit local->ADR mappings.
+    * ESEF inline-XBRL for mapped European/UK local listings.
     * Yahoo fundamentals-timeseries for broad non-US coverage.
     * yfinance quarterly statements as the final best-effort fallback.
     * Alpha Vantage ADR supplement only for mapped residual QMJ gaps.
@@ -1304,6 +1440,7 @@ def refresh_queue_tickers(
 
     fmp_results: dict[str, int] = {}
     sec_edgar_results: dict[str, int] = {}
+    esef_ixbrl_results: dict[str, int] = {}
     yahoo_timeseries_results: dict[str, int] = {}
     yf_results: dict[str, int] = {}
     alpha_vantage_adr_results: dict[str, int] = {}
@@ -1336,6 +1473,24 @@ def refresh_queue_tickers(
                 sec_written = 0
             sec_edgar_results[ticker] = sec_written
             written += sec_written
+
+        if (
+            not fmp_only
+            and esef_ixbrl_fallback
+            and written <= 0
+            and "." in ticker
+        ):
+            try:
+                esef_written = backfill_via_esef_ixbrl(
+                    [ticker],
+                    limit=limit or 4,
+                    sleep_seconds=0.0,
+                ).get(ticker, 0)
+            except Exception as exc:
+                logger.warning("Refresh queue ESEF iXBRL backfill failed for %s: %s", ticker, exc)
+                esef_written = 0
+            esef_ixbrl_results[ticker] = esef_written
+            written += esef_written
 
         if (
             not fmp_only
@@ -1379,6 +1534,7 @@ def refresh_queue_tickers(
         ticker: (
             (fmp_results.get(ticker, 0) or 0)
             + (sec_edgar_results.get(ticker, 0) or 0)
+            + (esef_ixbrl_results.get(ticker, 0) or 0)
             + (yahoo_timeseries_results.get(ticker, 0) or 0)
             + (yf_results.get(ticker, 0) or 0)
             + (alpha_vantage_adr_results.get(ticker, 0) or 0)
@@ -1390,12 +1546,14 @@ def refresh_queue_tickers(
         "queue_path": str(path),
         "fmp_only": bool(fmp_only),
         "sec_edgar_fallback": bool(sec_edgar_fallback and not fmp_only),
+        "esef_ixbrl_fallback": bool(esef_ixbrl_fallback and not fmp_only),
         "yahoo_timeseries_fallback": bool(yahoo_timeseries_fallback and not fmp_only),
         "yfinance_fallback": bool(yfinance_fallback),
         "alpha_vantage_adr_fallback": bool(alpha_enabled and not fmp_only),
         "provider_order": [
             "fmp",
             "sec_edgar",
+            "esef_ixbrl",
             "yahoo_timeseries",
             "yfinance_quarterly",
             "alpha_vantage_adr",
@@ -1405,6 +1563,7 @@ def refresh_queue_tickers(
         "snapshots_written": sum(refreshed.values()),
         "fmp_results": fmp_results,
         "sec_edgar_results": sec_edgar_results,
+        "esef_ixbrl_results": esef_ixbrl_results,
         "yahoo_timeseries_results": yahoo_timeseries_results,
         "yfinance_results": yf_results,
         "alpha_vantage_adr_results": alpha_vantage_adr_results,
@@ -1951,6 +2110,7 @@ def _main() -> None:
     parser.add_argument("--max-tickers", type=int, default=None)
     parser.add_argument("--yfinance-quarterly", action="store_true", help="Use yfinance quarterly statements and tag snapshots as yfinance_quarterly")
     parser.add_argument("--sec-edgar", action="store_true", help="Use SEC EDGAR companyfacts via local->ADR mapping")
+    parser.add_argument("--esef-ixbrl", action="store_true", help="Use public ESEF inline-XBRL packages via OpenFIGI issuer mapping")
     parser.add_argument("--yahoo-timeseries", action="store_true", help="Use Yahoo fundamentals-timeseries and tag snapshots as yahoo_timeseries")
     parser.add_argument("--alpha-vantage-adr", action="store_true", help="Use quota-budgeted Alpha Vantage ADR supplement")
     parser.add_argument("--backfill-factor-snapshot", action="store_true", help="Backfill PIT-safe factor snapshots into signal_backtest")
@@ -1958,6 +2118,7 @@ def _main() -> None:
     parser.add_argument("--refresh-queue", action="store_true", help="Backfill PIT fundamentals for feature_cache/fundamental_refresh_queue.json")
     parser.add_argument("--queue-path", default=None, help="Override fundamental refresh queue path")
     parser.add_argument("--no-sec-edgar-fallback", action="store_true", help="Disable SEC EDGAR ADR fallback for refresh queue")
+    parser.add_argument("--no-esef-ixbrl-fallback", action="store_true", help="Disable ESEF inline-XBRL fallback for refresh queue")
     parser.add_argument("--no-yahoo-timeseries-fallback", action="store_true", help="Disable Yahoo fundamentals-timeseries fallback for refresh queue")
     parser.add_argument("--no-yfinance-fallback", action="store_true", help="Disable yfinance quarterly fallback for refresh queue")
     parser.add_argument("--alpha-vantage-adr-fallback", action="store_true", help="Enable Alpha Vantage ADR supplement in refresh queue")
@@ -2005,6 +2166,7 @@ def _main() -> None:
             limit=args.limit,
             sleep_seconds=args.sleep,
             sec_edgar_fallback=not args.no_sec_edgar_fallback,
+            esef_ixbrl_fallback=not args.no_esef_ixbrl_fallback,
             yahoo_timeseries_fallback=not args.no_yahoo_timeseries_fallback,
             yfinance_fallback=not args.no_yfinance_fallback,
             alpha_vantage_adr_fallback=args.alpha_vantage_adr_fallback,
@@ -2026,6 +2188,8 @@ def _main() -> None:
         results = backfill_via_yfinance_quarterly(tickers, limit=args.limit, sleep_seconds=args.sleep)
     elif args.sec_edgar:
         results = backfill_via_sec_edgar(tickers, limit=args.limit, sleep_seconds=args.sleep)
+    elif args.esef_ixbrl:
+        results = backfill_via_esef_ixbrl(tickers, limit=args.limit, sleep_seconds=args.sleep)
     elif args.yahoo_timeseries:
         results = backfill_via_yahoo_timeseries(tickers, limit=args.limit, sleep_seconds=args.sleep)
     elif args.alpha_vantage_adr:

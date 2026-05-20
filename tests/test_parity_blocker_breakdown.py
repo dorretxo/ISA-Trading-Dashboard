@@ -79,6 +79,16 @@ def test_evidence_classification_distinguishes_yfinance_balance_only():
         pit_source="fmp",
         qmj_components=1,
     ) == "fmp_partial"
+    assert breakdown.classify_evidence(
+        ticker="GRG.L",
+        pit_source="esef_ixbrl",
+        qmj_components=2,
+    ) == "esef_ixbrl_full"
+    assert breakdown.classify_evidence(
+        ticker="GRG.L",
+        pit_source="esef_ixbrl",
+        qmj_components=1,
+    ) == "esef_ixbrl_partial"
 
 
 def test_quality_score_source_flags_opaque_live_fallbacks():
