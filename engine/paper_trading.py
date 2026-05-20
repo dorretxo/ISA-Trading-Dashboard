@@ -19,6 +19,8 @@ from pathlib import Path
 import yfinance as yf
 
 import config
+from utils.data_fetch import quiet_yfinance_errors
+from utils.global_universe import is_excluded_ticker, resolve_yahoo_ticker
 
 logger = logging.getLogger("paper_trading")
 
@@ -184,9 +186,19 @@ def _get_next_open(ticker: str, signal_date: str) -> float | None:
 
         start = start_dt.strftime("%Y-%m-%d")
         end = query_end.strftime("%Y-%m-%d")
-        df = yf.download(ticker, start=start, end=end, progress=False, auto_adjust=True)
+        yahoo_ticker = resolve_yahoo_ticker(ticker)
+        if is_excluded_ticker(yahoo_ticker):
+            return None
+        with quiet_yfinance_errors():
+            df = yf.download(yahoo_ticker, start=start, end=end, progress=False, auto_adjust=True)
         if df is not None and not df.empty:
-            open_price = float(df["Open"].iloc[0])
+            open_series = df["Open"]
+            if hasattr(open_series, "ndim") and open_series.ndim > 1:
+                open_series = open_series.iloc[:, 0]
+            open_series = open_series.dropna()
+            if open_series.empty:
+                return None
+            open_price = float(open_series.iloc[0])
             return open_price
     except Exception as e:
         logger.warning("Failed to fetch next open for %s: %s", ticker, e)

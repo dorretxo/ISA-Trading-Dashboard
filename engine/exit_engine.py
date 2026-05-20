@@ -49,6 +49,7 @@ import yfinance as yf
 import config
 from engine.paper_trading import _connect
 from engine.discovery_backtest import init_backtest_db
+from utils.data_fetch import get_price_history
 
 logger = logging.getLogger(__name__)
 
@@ -671,7 +672,7 @@ def assess_exits(results: list[dict], holdings: list[dict]) -> list[ExitSignal]:
 
         # ── 1. Chandelier Exit (LeBeau) ──────────────────────────────
         try:
-            data = yf.download(ticker, period="1y", progress=False, auto_adjust=True)
+            data = get_price_history(ticker)
             if data is not None and len(data) >= 30:
                 highs_full = data["High"].values.flatten().astype(float)
                 lows_full = data["Low"].values.flatten().astype(float)

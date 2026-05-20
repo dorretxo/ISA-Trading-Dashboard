@@ -3947,7 +3947,9 @@ def _stage_correlation_filter(
                      len(existing_returns), len(missing_holdings))
         for ticker in missing_holdings:
             try:
-                data = yf.download(ticker, period="90d", progress=False, auto_adjust=True, timeout=30)
+                from utils.data_fetch import get_price_history
+
+                data = get_price_history(ticker)
                 if data is not None and len(data) > 20:
                     close_data = data["Close"]
                     if isinstance(close_data, pd.DataFrame):

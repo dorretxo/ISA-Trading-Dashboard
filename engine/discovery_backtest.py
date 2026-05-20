@@ -469,7 +469,9 @@ def init_backtest_db():
 def _compute_prior_momentum(ticker: str) -> tuple[float | None, float | None, float | None, float | None]:
     """Compute 10d, 30d, 90d prior returns and 20d vol at signal time."""
     try:
-        data = yf.download(ticker, period="120d", progress=False, auto_adjust=True)
+        from utils.data_fetch import get_price_history
+
+        data = get_price_history(ticker)
         if data is None or len(data) < 20:
             return None, None, None, None
         closes = data["Close"]
@@ -478,7 +480,7 @@ def _compute_prior_momentum(ticker: str) -> tuple[float | None, float | None, fl
         ret_10d = float(closes.iloc[-1] / closes.iloc[-min(10, len(closes))] - 1) * 100 if len(closes) >= 10 else None
         ret_30d = float(closes.iloc[-1] / closes.iloc[-min(30, len(closes))] - 1) * 100 if len(closes) >= 30 else None
         ret_90d = float(closes.iloc[-1] / closes.iloc[-min(90, len(closes))] - 1) * 100 if len(closes) >= 90 else None
-        vol_20d = float(closes.pct_change().tail(20).std() * np.sqrt(252) * 100) if len(closes) >= 20 else None
+        vol_20d = float(closes.pct_change(fill_method=None).tail(20).std() * np.sqrt(252) * 100) if len(closes) >= 20 else None
         return ret_10d, ret_30d, ret_90d, vol_20d
     except Exception:
         return None, None, None, None
@@ -1364,7 +1366,9 @@ def record_discovery_picks(candidates: list) -> int:
                     pass
             if signal_price <= 0:
                 try:
-                    data = yf.download(ticker, period="5d", progress=False, auto_adjust=True, timeout=30)
+                    from utils.data_fetch import get_price_history
+
+                    data = get_price_history(ticker)
                     if data is not None and not data.empty:
                         raw = float(data["Close"].iloc[-1].item() if hasattr(data["Close"].iloc[-1], "item") else data["Close"].iloc[-1])
                         signal_price = raw if not math.isnan(raw) else 0
